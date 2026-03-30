@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exported_at": "2026-03-30T04:43:22.371Z",
+  "exported_at": "2026-03-30T04:47:17.006Z",
   "milestones": [
     {
       "id": "M001",
@@ -149,19 +149,24 @@
       "milestone_id": "M001",
       "slice_id": "S01",
       "id": "T02",
-      "title": "Build project and verify Cmd-key interception compiles cleanly",
-      "status": "pending",
-      "one_liner": "",
-      "narrative": "",
-      "verification_result": "",
+      "title": "Built PocketShaver Xcode project targeting iOS Simulator — BUILD SUCCEEDED with no compilation errors or warnings in the modified SDLKey.swift and OverlayViewController.swift files",
+      "status": "complete",
+      "one_liner": "Built PocketShaver Xcode project targeting iOS Simulator — BUILD SUCCEEDED with no compilation errors or warnings in the modified SDLKey.swift and OverlayViewController.swift files",
+      "narrative": "Ran xcodebuild for the PocketShaver scheme targeting the iPad Air 11-inch (M3) simulator (the task plan specified iPad 10th gen, which doesn't exist in the installed Xcode 17/iOS 26.2 SDK). The build succeeded on the first attempt with exit code 0 — no compilation fixes were needed. The T01 code (UIKeyboardHIDUsage→SDLKey failable initializer, pressesBegan/pressesEnded/keyCommands overrides, Cmd+Shift+Q exit path) integrates cleanly with the existing codebase including the SDL2 xcframework, C++ bridge, and Obj-C++ ADB layer. Verified all 6 slice-level grep checks pass and confirmed all static integration points.",
+      "verification_result": "xcodebuild BUILD SUCCEEDED (exit 0) with no warnings in modified files. All 6 slice-level grep checks pass: pressesBegan, pressesEnded, keyCommands in OverlayViewController.swift; isiOSAppOnMac ≥2 matches; fromHIDUsage/UIKeyboardHIDUsage in SDLKey.swift; exit(0) in OverlayViewController.swift. All static integration points confirmed.",
       "duration": "",
-      "completed_at": null,
+      "completed_at": "2026-03-30T04:47:17.000Z",
       "blocker_discovered": false,
-      "deviations": "",
-      "known_issues": "",
-      "key_files": [],
-      "key_decisions": [],
-      "full_summary_md": "",
+      "deviations": "Changed simulator destination from iPad (10th generation) to iPad Air 11-inch (M3) — the former is unavailable in Xcode 17/iOS 26.2 SDK.",
+      "known_issues": "None.",
+      "key_files": [
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift",
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift"
+      ],
+      "key_decisions": [
+        "Used iPad Air 11-inch (M3) simulator destination since iPad (10th generation) is not available in the installed Xcode 17 SDK (iOS 26.2)"
+      ],
+      "full_summary_md": "---\nid: T02\nparent: S01\nmilestone: M001\nkey_files:\n  - SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift\n  - SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift\nkey_decisions:\n  - Used iPad Air 11-inch (M3) simulator destination since iPad (10th generation) is not available in the installed Xcode 17 SDK (iOS 26.2)\nduration: \"\"\nverification_result: passed\ncompleted_at: 2026-03-30T04:47:17.000Z\nblocker_discovered: false\n---\n\n# T02: Built PocketShaver Xcode project targeting iOS Simulator — BUILD SUCCEEDED with no compilation errors or warnings in the modified SDLKey.swift and OverlayViewController.swift files\n\n**Built PocketShaver Xcode project targeting iOS Simulator — BUILD SUCCEEDED with no compilation errors or warnings in the modified SDLKey.swift and OverlayViewController.swift files**\n\n## What Happened\n\nRan xcodebuild for the PocketShaver scheme targeting the iPad Air 11-inch (M3) simulator (the task plan specified iPad 10th gen, which doesn't exist in the installed Xcode 17/iOS 26.2 SDK). The build succeeded on the first attempt with exit code 0 — no compilation fixes were needed. The T01 code (UIKeyboardHIDUsage→SDLKey failable initializer, pressesBegan/pressesEnded/keyCommands overrides, Cmd+Shift+Q exit path) integrates cleanly with the existing codebase including the SDL2 xcframework, C++ bridge, and Obj-C++ ADB layer. Verified all 6 slice-level grep checks pass and confirmed all static integration points.\n\n## Verification\n\nxcodebuild BUILD SUCCEEDED (exit 0) with no warnings in modified files. All 6 slice-level grep checks pass: pressesBegan, pressesEnded, keyCommands in OverlayViewController.swift; isiOSAppOnMac ≥2 matches; fromHIDUsage/UIKeyboardHIDUsage in SDLKey.swift; exit(0) in OverlayViewController.swift. All static integration points confirmed.\n\n## Verification Evidence\n\n| # | Command | Exit Code | Verdict | Duration |\n|---|---------|-----------|---------|----------|\n| 1 | `xcodebuild ... build 2>&1 | grep -q 'BUILD SUCCEEDED'` | 0 | ✅ pass | 22000ms |\n| 2 | `grep warnings in SDLKey/OverlayViewController` | 0 | ✅ pass | 100ms |\n| 3 | `grep -q 'pressesBegan' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 4 | `grep -q 'pressesEnded' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 5 | `grep -q 'keyCommands' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 6 | `grep -c 'isiOSAppOnMac' ...OverlayViewController.swift → 3 (≥2)` | 0 | ✅ pass | 50ms |\n| 7 | `grep -q 'fromHIDUsage|UIKeyboardHIDUsage' ...SDLKey.swift` | 0 | ✅ pass | 50ms |\n| 8 | `grep -q 'exit(0)' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n\n\n## Deviations\n\nChanged simulator destination from iPad (10th generation) to iPad Air 11-inch (M3) — the former is unavailable in Xcode 17/iOS 26.2 SDK.\n\n## Known Issues\n\nNone.\n\n## Files Created/Modified\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift`\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift`\n",
       "description": "Build the PocketShaver Xcode project to prove the new code integrates with the existing codebase (SDL2 xcframework, C++ bridge, Obj-C++ ADB layer). Fix any compilation errors.\n\n## Steps\n\n1. **Run `xcodebuild` for the PocketShaver scheme targeting iOS Simulator.**\n   Execute: `xcodebuild -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad (10th generation)' -configuration Debug build 2>&1 | tail -30`\n   The simulator destination avoids code-signing issues. The build must succeed (exit code 0, \"BUILD SUCCEEDED\" in output).\n\n2. **If build fails, diagnose and fix.**\n   Common issues:\n   - `UIKeyboardHIDUsage` requires `import UIKit` (already present in both files, but verify)\n   - `UIPress.Key` property `.keyCode` is `UIKeyboardHIDUsage` type — ensure the mapping function's parameter type matches\n   - `inputInteractionModel` is a `lazy var` on OverlayViewController — the press handler accesses it as `self.inputInteractionModel` which is fine\n   - `@MainActor` isolation — `InputInteractionModel` is `@MainActor`, and `pressesBegan`/`pressesEnded` are called on the main thread, but if the compiler complains, may need `@MainActor` annotation or `Task { @MainActor in ... }` wrapper\n   - `exit(0)` — this is a C function available via Foundation, no import needed\n   Fix any issues in the source files and re-run `xcodebuild` until build succeeds.\n\n3. **Run static verification checks.**\n   Confirm key integration points:\n   - `pressesBegan` and `pressesEnded` both reference `inputInteractionModel.handle`\n   - `pressesBegan` contains `exit(0)` for the Cmd+Shift+Q path\n   - `canBecomeFirstResponder` references `isiOSAppOnMac`\n   - Non-Cmd presses call `super.pressesBegan` / `super.pressesEnded`\n   - `keyCommands` returns `[]`\n\n## Must-Haves\n\n- [ ] `xcodebuild` exits with code 0 and output contains `BUILD SUCCEEDED`\n- [ ] No compiler warnings in the modified files related to the new code\n\n## Verification\n\n- `xcodebuild -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad (10th generation)' -configuration Debug build 2>&1 | grep -q 'BUILD SUCCEEDED'`\n\n## Inputs\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — T01 output: HID mapping extension\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — T01 output: press interception overrides\n\n## Expected Output\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — compiles cleanly (may have minor fixes)\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — compiles cleanly (may have minor fixes)",
       "estimate": "30m",
       "files": [
@@ -263,6 +268,94 @@
       "verdict": "✅ pass",
       "duration_ms": 50,
       "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 7,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "xcodebuild ... build 2>&1 | grep -q 'BUILD SUCCEEDED'",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 22000,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 8,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep warnings in SDLKey/OverlayViewController",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 100,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 9,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'pressesBegan' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 10,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'pressesEnded' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 11,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'keyCommands' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 12,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -c 'isiOSAppOnMac' ...OverlayViewController.swift → 3 (≥2)",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 13,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'fromHIDUsage|UIKeyboardHIDUsage' ...SDLKey.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
+    },
+    {
+      "id": 14,
+      "task_id": "T02",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'exit(0)' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:47:17.000Z"
     }
   ]
 }

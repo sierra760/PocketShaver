@@ -55,7 +55,7 @@
   - Estimate: 1h
   - Files: SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift, SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift
   - Verify: grep -q 'pressesBegan' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'pressesEnded' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'keyCommands' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'fromHIDUsage\|UIKeyboardHIDUsage' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift && grep -q 'exit(0)' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && echo 'All checks passed'
-- [ ] **T02: Build project and verify Cmd-key interception compiles cleanly** — Build the PocketShaver Xcode project to prove the new code integrates with the existing codebase (SDL2 xcframework, C++ bridge, Obj-C++ ADB layer). Fix any compilation errors.
+- [x] **T02: Built PocketShaver Xcode project targeting iOS Simulator — BUILD SUCCEEDED with no compilation errors or warnings in the modified SDLKey.swift and OverlayViewController.swift files** — Build the PocketShaver Xcode project to prove the new code integrates with the existing codebase (SDL2 xcframework, C++ bridge, Obj-C++ ADB layer). Fix any compilation errors.
 
 ## Steps
 
