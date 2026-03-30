@@ -238,14 +238,14 @@ public class OverlayViewController: UIViewController {
 			performanceLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
 		])
 
-		if UIDevice.isSimulator {
+		if UIDevice.isSimulator || UIDevice.isiOSAppOnMac {
 			becomeFirstResponder()
 		}
 	}
 
 	public override var canBecomeFirstResponder: Bool {
 		get {
-			return UIDevice.isSimulator
+			return UIDevice.isSimulator || UIDevice.isiOSAppOnMac
 		}
 	}
 
@@ -675,6 +675,85 @@ public class OverlayViewController: UIViewController {
 
 extension OverlayViewController {
 	
+	// MARK: - Cmd+key interception (Designed for iPad on Mac)
+
+	/// Return an empty array so SDL2's internal UIKeyCommand registrations
+	/// don't intercept Cmd+key combos via the responder chain before
+	/// `pressesBegan` fires.
+	public override var keyCommands: [UIKeyCommand]? { [] }
+
+	/// Set of HID usage codes that are bare modifier keys.
+	/// We use this to distinguish "Cmd held while pressing a letter" from
+	/// "Cmd key pressed alone".
+	private static let modifierHIDCodes: Set<UIKeyboardHIDUsage> = [
+		.keyboardLeftGUI, .keyboardRightGUI,
+		.keyboardLeftShift, .keyboardRightShift,
+		.keyboardLeftAlt, .keyboardRightAlt,
+		.keyboardLeftControl, .keyboardRightControl,
+	]
+
+	public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+		for press in presses {
+			guard let key = press.key else { continue }
+
+			let code = key.keyCode
+
+			// Bare Cmd key down → forward .cmd ADB key-down
+			if code == .keyboardLeftGUI || code == .keyboardRightGUI {
+				inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)
+				continue  // consumed — don't call super for this press
+			}
+
+			// Cmd-modified non-modifier key
+			if key.modifierFlags.contains(.command),
+			   !Self.modifierHIDCodes.contains(code) {
+
+				// Cmd+Shift+Q → quit PocketShaver
+				if key.modifierFlags.contains(.shift), code == .keyboardQ {
+					exit(0)
+				}
+
+				// Forward Cmd + mapped key as ADB events
+				if let mappedKey = SDLKey(fromHIDUsage: code) {
+					inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)
+					inputInteractionModel.handle(mappedKey, isDown: true, hapticAllowed: false)
+				}
+				continue  // consumed
+			}
+
+			// Everything else → default responder chain (SDL / soft keyboard / etc.)
+			super.pressesBegan(Set([press]), with: event)
+		}
+	}
+
+	public override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+		for press in presses {
+			guard let key = press.key else { continue }
+
+			let code = key.keyCode
+
+			// Bare Cmd key up
+			if code == .keyboardLeftGUI || code == .keyboardRightGUI {
+				inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)
+				continue
+			}
+
+			// Cmd-modified non-modifier key up
+			if key.modifierFlags.contains(.command),
+			   !Self.modifierHIDCodes.contains(code) {
+
+				if let mappedKey = SDLKey(fromHIDUsage: code) {
+					inputInteractionModel.handle(mappedKey, isDown: false, hapticAllowed: false)
+					inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)
+				}
+				continue
+			}
+
+			// Everything else
+			super.pressesEnded(Set([press]), with: event)
+		}
+	}
+
 	public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
 		// Intercept Cmd+W (performClose:) to prevent the app from closing.
 		// The emulator will receive the keyboard event normally.

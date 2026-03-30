@@ -1,0 +1,268 @@
+{
+  "version": 1,
+  "exported_at": "2026-03-30T04:43:22.371Z",
+  "milestones": [
+    {
+      "id": "M001",
+      "title": "Command-Key Interception & Window Resize Lock",
+      "status": "active",
+      "depends_on": [],
+      "created_at": "2026-03-30T04:28:52.692Z",
+      "completed_at": null,
+      "vision": "Fix the \"Designed for iPad\" on macOS experience so all Cmd+key shortcuts are forwarded to the emulated Mac OS 9 instead of being consumed by the host, Cmd+Shift+Q is the app quit chord, and iOS 26 window resizing is disabled to prevent accidental resize when using the Mac OS 9 menu bar.",
+      "success_criteria": [
+        "All Cmd+key combos (Cmd+Q, Cmd+C, Cmd+V, etc.) are forwarded to the emulated Mac as ADB key events",
+        "Cmd+Shift+Q is the only keyboard shortcut that quits PocketShaver",
+        "Window edges do not trigger drag-to-resize handles on iOS 26 or DFiP on macOS",
+        "Existing touch, gamepad, and soft keyboard input works unchanged"
+      ],
+      "key_risks": [
+        {
+          "risk": "SDL2's internal UIKit keyboard handling may consume Cmd+key events before OverlayViewController sees them",
+          "whyItMatters": "If SDL intercepts Cmd-modified presses first, the overlay's pressesBegan/pressesEnded overrides won't fire and the interception strategy fails"
+        },
+        {
+          "risk": "Some Cmd+key combos may be system-reserved by macOS at a level below UIKit",
+          "whyItMatters": "Cmd+Tab and possibly Cmd+Space may be uninterceptable, which limits what we can promise"
+        },
+        {
+          "risk": "UIRequiresFullScreen may not prevent iOS 26 resize behavior",
+          "whyItMatters": "If the existing plist key is insufficient, we need to use the new iOS 26 windowing APIs which require Xcode 26 SDK"
+        }
+      ],
+      "proof_strategy": [
+        {
+          "riskOrUnknown": "SDL2 responder chain ordering",
+          "retireIn": "S01",
+          "whatWillBeProven": "pressesBegan on OverlayViewController fires for Cmd+key combos and can suppress default handling"
+        },
+        {
+          "riskOrUnknown": "iOS 26 resize prevention",
+          "retireIn": "S02",
+          "whatWillBeProven": "Info.plist key or windowScene API disables resize handles on iOS 26"
+        }
+      ],
+      "verification_contract": "Build succeeds with no warnings in the modified files. Cmd+key interception code exists in OverlayViewController. Resize prevention configuration is present in Info.plist or scene delegate.",
+      "verification_integration": "Cmd+Q in a running Mac OS 9 session closes the Mac OS 9 window, not PocketShaver. Cmd+Shift+Q terminates PocketShaver. Window edges on iOS 26 do not show resize handles.",
+      "verification_operational": "None — no service lifecycle concerns.",
+      "verification_uat": "User runs PocketShaver on macOS DFiP, opens a Mac OS 9 app, presses Cmd+Q and confirms the Mac OS 9 app closes. User presses Cmd+Shift+Q and confirms PocketShaver quits. User moves cursor to window edges and confirms no resize handles appear.",
+      "definition_of_done": [
+        "All Cmd+key combos forwarded to emulated Mac via ADB",
+        "Cmd+Shift+Q quits PocketShaver",
+        "Existing Cmd-W interception subsumed by general approach",
+        "iOS 26 window resize disabled",
+        "Existing input paths (touch, gamepad, soft keyboard) unaffected",
+        "Project builds cleanly"
+      ],
+      "requirement_coverage": "Covers: R001, R002, R003, R004, R005. Partially covers: none. Leaves for later: none. Orphan risks: none.",
+      "boundary_map_markdown": "### S01 → S02\\n\\nProduces:\\n- `OverlayViewController.swift` → `pressesBegan`/`pressesEnded` overrides intercepting all Cmd+key combos\\n- `OverlayViewController.swift` → Cmd+Shift+Q detection triggering app termination\\n- `InputInteractionModel.swift` → existing `handle(_:isDown:hapticAllowed:)` used for ADB forwarding (no changes needed)\\n\\nConsumes:\\n- nothing (S01 is independent)\\n\\n### S02\\n\\nProduces:\\n- Info.plist or scene delegate configuration disabling iOS 26 window resize\\n\\nConsumes:\\n- nothing (S02 is independent of S01)\""
+    }
+  ],
+  "slices": [
+    {
+      "milestone_id": "M001",
+      "id": "S01",
+      "title": "Command-key interception",
+      "status": "pending",
+      "risk": "medium",
+      "depends": [],
+      "demo": "After this: pressing Cmd+Q in the emulator closes the Mac OS 9 app, not PocketShaver. Cmd+Shift+Q quits PocketShaver. All other Cmd+key combos reach Mac OS 9.",
+      "created_at": "2026-03-30T04:28:52.692Z",
+      "completed_at": null,
+      "full_summary_md": "",
+      "full_uat_md": "",
+      "goal": "Intercept all Cmd+key shortcuts in the UIKit responder chain and forward them to the emulated Mac OS 9 as ADB key events. Cmd+Shift+Q quits PocketShaver. All other Cmd+key combos reach the emulator. Non-Cmd keyboard input, soft keyboard, touch, and gamepad remain unaffected.",
+      "success_criteria": "- `pressesBegan(_:with:)` and `pressesEnded(_:with:)` overrides on `OverlayViewController` intercept Cmd-modified key presses and forward them as ADB key events via `InputInteractionModel.handle(_:isDown:hapticAllowed:)`\n- Cmd+Shift+Q calls `exit(0)` to terminate PocketShaver\n- All other Cmd+key combos send paired `SDLKey.cmd` + letter key ADB down/up events\n- Non-Cmd presses call `super` to preserve HiddenInputField / soft keyboard / gamepad paths\n- `canBecomeFirstResponder` returns `true` on DFiP (in addition to simulator) so presses route to OverlayViewController\n- `keyCommands` returns an empty array to prevent SDL2's internal UIKeyCommand registration from stealing Cmd+key combos\n- `UIKeyboardHIDUsage` → `SDLKey` mapping covers letters, numbers, symbols, function keys, modifiers, arrows, and navigation keys\n- Project compiles without errors via `xcodebuild`",
+      "proof_level": "Contract — verified via compilation + static code inspection. Full integration requires manual runtime testing on macOS DFiP.",
+      "integration_closure": "- Upstream surfaces consumed: `InputInteractionModel.handle(_:isDown:hapticAllowed:)` for ADB key forwarding, `SDLKey` enum for key mappings, `UIDevice.isiOSAppOnMac` for DFiP detection\n- New wiring: `OverlayViewController.pressesBegan`/`pressesEnded` → `InputInteractionModel.handle` → `objc_ADBKeyDown`/`objc_ADBKeyUp`\n- What remains: S02 (window resize lock) is independent. After both slices, milestone is complete pending manual UAT.",
+      "observability_impact": "- Runtime signals: none (keyboard input is synchronous and fire-and-forget via ADB bridge)\n- Inspection surfaces: `canBecomeFirstResponder`, `keyCommands`, `pressesBegan`/`pressesEnded` existence can be verified via static grep\n- Failure visibility: if Cmd+key combos don't reach the emulator, the user sees no effect — diagnosable by checking responder chain ordering and `canBecomeFirstResponder` return value",
+      "sequence": 0,
+      "replan_triggered_at": null
+    },
+    {
+      "milestone_id": "M001",
+      "id": "S02",
+      "title": "Lock window size on iOS 26",
+      "status": "pending",
+      "risk": "low",
+      "depends": [],
+      "demo": "After this: cursor near window edges does not trigger resize handles on iOS 26 or DFiP on macOS.",
+      "created_at": "2026-03-30T04:28:52.692Z",
+      "completed_at": null,
+      "full_summary_md": "",
+      "full_uat_md": "",
+      "goal": "Disable iOS 26 windowed mode resize behavior so the emulator window stays fixed-size and the user can interact with the Mac OS 9 menu bar at the top edge without accidentally resizing.",
+      "success_criteria": "- No resize handles appear when cursor approaches window edges\n- Window cannot be resized via drag on iOS 26\n- App still launches and displays correctly\n- Touch and gamepad input unaffected",
+      "proof_level": "integration — requires running on iOS 26 or DFiP on macOS to verify no resize handles",
+      "integration_closure": "Info.plist key or windowScene configuration prevents the system from offering resize affordances.",
+      "observability_impact": "None.",
+      "sequence": 0,
+      "replan_triggered_at": null
+    }
+  ],
+  "tasks": [
+    {
+      "milestone_id": "M001",
+      "slice_id": "S01",
+      "id": "T01",
+      "title": "Added UIKeyboardHIDUsage→SDLKey failable initializer and pressesBegan/pressesEnded/keyCommands overrides to intercept all Cmd+key combos on DFiP, forwarding them as ADB events to the emulated Mac OS 9",
+      "status": "complete",
+      "one_liner": "Added UIKeyboardHIDUsage→SDLKey failable initializer and pressesBegan/pressesEnded/keyCommands overrides to intercept all Cmd+key combos on DFiP, forwarding them as ADB events to the emulated Mac OS 9",
+      "narrative": "Added a comprehensive init?(fromHIDUsage:) failable initializer on SDLKey that maps all UIKeyboardHIDUsage values to corresponding SDLKey cases — covering 26 letters, 10 digits, 12 symbol keys, 5 modifier pairs, 12 function keys, 10 navigation keys, 4 arrows, and 17 keypad keys. Updated canBecomeFirstResponder and setupViews() to include UIDevice.isiOSAppOnMac. Added keyCommands (returns []), pressesBegan (intercepts Cmd+key combos, sends ADB key-down, handles Cmd+Shift+Q → exit(0)), and pressesEnded (sends matching ADB key-up events). Non-Cmd presses fall through to super to preserve existing SDL input paths.",
+      "verification_result": "All 6 grep checks from the task plan pass: pressesBegan, pressesEnded, keyCommands found in OverlayViewController.swift; isiOSAppOnMac appears 3 times (≥2 required); fromHIDUsage/UIKeyboardHIDUsage found in SDLKey.swift; exit(0) found in OverlayViewController.swift.",
+      "duration": "",
+      "completed_at": "2026-03-30T04:43:22.360Z",
+      "blocker_discovered": false,
+      "deviations": "None.",
+      "known_issues": "None.",
+      "key_files": [
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift",
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift"
+      ],
+      "key_decisions": [
+        "Placed import UIKit inside the HID mapping extension section since SDLKey.swift had no prior UIKit dependency",
+        "Used Set-based iteration in pressesBegan/pressesEnded to handle each press individually, calling super with single-element sets for non-Cmd presses"
+      ],
+      "full_summary_md": "---\nid: T01\nparent: S01\nmilestone: M001\nkey_files:\n  - SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift\n  - SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift\nkey_decisions:\n  - Placed import UIKit inside the HID mapping extension section since SDLKey.swift had no prior UIKit dependency\n  - Used Set-based iteration in pressesBegan/pressesEnded to handle each press individually, calling super with single-element sets for non-Cmd presses\nduration: \"\"\nverification_result: passed\ncompleted_at: 2026-03-30T04:43:22.361Z\nblocker_discovered: false\n---\n\n# T01: Added UIKeyboardHIDUsage→SDLKey failable initializer and pressesBegan/pressesEnded/keyCommands overrides to intercept all Cmd+key combos on DFiP, forwarding them as ADB events to the emulated Mac OS 9\n\n**Added UIKeyboardHIDUsage→SDLKey failable initializer and pressesBegan/pressesEnded/keyCommands overrides to intercept all Cmd+key combos on DFiP, forwarding them as ADB events to the emulated Mac OS 9**\n\n## What Happened\n\nAdded a comprehensive init?(fromHIDUsage:) failable initializer on SDLKey that maps all UIKeyboardHIDUsage values to corresponding SDLKey cases — covering 26 letters, 10 digits, 12 symbol keys, 5 modifier pairs, 12 function keys, 10 navigation keys, 4 arrows, and 17 keypad keys. Updated canBecomeFirstResponder and setupViews() to include UIDevice.isiOSAppOnMac. Added keyCommands (returns []), pressesBegan (intercepts Cmd+key combos, sends ADB key-down, handles Cmd+Shift+Q → exit(0)), and pressesEnded (sends matching ADB key-up events). Non-Cmd presses fall through to super to preserve existing SDL input paths.\n\n## Verification\n\nAll 6 grep checks from the task plan pass: pressesBegan, pressesEnded, keyCommands found in OverlayViewController.swift; isiOSAppOnMac appears 3 times (≥2 required); fromHIDUsage/UIKeyboardHIDUsage found in SDLKey.swift; exit(0) found in OverlayViewController.swift.\n\n## Verification Evidence\n\n| # | Command | Exit Code | Verdict | Duration |\n|---|---------|-----------|---------|----------|\n| 1 | `grep -q 'pressesBegan' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 2 | `grep -q 'pressesEnded' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 3 | `grep -q 'keyCommands' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n| 4 | `grep -c 'isiOSAppOnMac' ...OverlayViewController.swift → 3` | 0 | ✅ pass | 50ms |\n| 5 | `grep -q 'fromHIDUsage|UIKeyboardHIDUsage' ...SDLKey.swift` | 0 | ✅ pass | 50ms |\n| 6 | `grep -q 'exit(0)' ...OverlayViewController.swift` | 0 | ✅ pass | 50ms |\n\n\n## Deviations\n\nNone.\n\n## Known Issues\n\nNone.\n\n## Files Created/Modified\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift`\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift`\n",
+      "description": "Build the `UIKeyboardHIDUsage` → `SDLKey` mapping and implement `pressesBegan`/`pressesEnded`/`keyCommands` overrides on `OverlayViewController` to intercept all Cmd+key combos and forward them as ADB key events. Update `canBecomeFirstResponder` to return `true` on DFiP.\n\n## Steps\n\n1. **Add `UIKeyboardHIDUsage` → `SDLKey` mapping to `SDLKey.swift`.**\n   Add a static function or `init?(from:)` on `SDLKey` that maps `UIKeyboardHIDUsage` values to `SDLKey` cases. Cover: all 26 letters (`.keyboardA` through `.keyboardZ`), digits 0-9 (`.keyboard0` through `.keyboard9`), common symbols (`.keyboardHyphen`, `.keyboardEqualSign`, `.keyboardOpenBracket`, `.keyboardCloseBracket`, `.keyboardBackslash`, `.keyboardSemicolon`, `.keyboardQuote`, `.keyboardComma`, `.keyboardPeriod`, `.keyboardSlash`, `.keyboardGraveAccentAndTilde`, `.keyboardSpacebar`), modifiers (`.keyboardLeftShift`/`.keyboardRightShift` → `.shift`, `.keyboardLeftAlt`/`.keyboardRightAlt` → `.alt`, `.keyboardLeftControl`/`.keyboardRightControl` → `.ctrl`, `.keyboardLeftGUI`/`.keyboardRightGUI` → `.cmd`, `.keyboardCapsLock` → `.capslock`), function keys (`.keyboardF1` through `.keyboardF12`), navigation (`.keyboardReturnOrEnter` → `.enter`, `.keyboardDeleteOrBackspace` → `.backspace`, `.keyboardDeleteForward` → `.delete`, `.keyboardTab` → `.tab`, `.keyboardEscape` → `.escape`, `.keyboardInsert` → `.insert`, `.keyboardHome` → `.home`, `.keyboardEnd` → `.end`, `.keyboardPageUp` → `.pageup`, `.keyboardPageDown` → `.pagedown`), arrows (`.keyboardUpArrow`, `.keyboardDownArrow`, `.keyboardLeftArrow`, `.keyboardRightArrow`), and keypad keys (`.keypad0` through `.keypad9`, `.keypadPeriod`, `.keypadPlus`, `.keypadHyphen`, `.keypadAsterisk`, `.keypadSlash`, `.keypadEnter`, `.keypadEqualSign`). Return `nil` for unmapped HID codes.\n\n2. **Update `canBecomeFirstResponder` in `OverlayViewController.swift`.**\n   Change from `return UIDevice.isSimulator` to `return UIDevice.isSimulator || UIDevice.isiOSAppOnMac`. This ensures presses route to OverlayViewController in DFiP mode. Also update the `setupViews()` call site: change `if UIDevice.isSimulator { becomeFirstResponder() }` to `if UIDevice.isSimulator || UIDevice.isiOSAppOnMac { becomeFirstResponder() }`.\n\n3. **Add `keyCommands` override to `OverlayViewController`.**\n   Override `var keyCommands: [UIKeyCommand]?` to return an empty array `[]`. This prevents SDL2's internal `UIKeyCommand` registrations from intercepting Cmd+key combos via the responder chain before `pressesBegan` fires. Place this in the existing `OverlayViewController` extension that has `canPerformAction`.\n\n4. **Add `pressesBegan(_:with:)` override to `OverlayViewController`.**\n   In the same extension, override `pressesBegan`. For each press in the set:\n   - Guard that `press.key` is non-nil (physical keyboard press)\n   - If `press.key!.modifierFlags.contains(.command)` AND the key is NOT a bare modifier (i.e., the keyCode is not `.keyboardLeftGUI`/`.keyboardRightGUI`/`.keyboardLeftShift`/`.keyboardRightShift`/`.keyboardLeftAlt`/`.keyboardRightAlt`/`.keyboardLeftControl`/`.keyboardRightControl`):\n     - Check if Shift is also held (`press.key!.modifierFlags.contains(.shift)`) AND the keyCode maps to Q (`.keyboardQ`). If so → call `exit(0)` to terminate PocketShaver.\n     - Otherwise → map the keyCode to `SDLKey` via the mapping from step 1. If mapped, call `inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)` then `inputInteractionModel.handle(mappedKey, isDown: true, hapticAllowed: false)`. Do NOT call `super` — this prevents the event from reaching SDL or the system.\n   - If `press.key!.keyCode` is `.keyboardLeftGUI` or `.keyboardRightGUI` (bare Cmd press) → call `inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)`. Do NOT call `super`.\n   - For all other presses (no `.command` modifier and not a Cmd key) → call `super.pressesBegan(presses, with: event)` to preserve existing input paths.\n\n5. **Add `pressesEnded(_:with:)` override to `OverlayViewController`.**\n   Mirror the `pressesBegan` logic for key-up events:\n   - For Cmd-modified non-modifier presses → map keyCode, call `inputInteractionModel.handle(mappedKey, isDown: false, hapticAllowed: false)` then `inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)`. Do NOT call `super`.\n   - For bare Cmd key release (`.keyboardLeftGUI`/`.keyboardRightGUI`) → call `inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)`. Do NOT call `super`.\n   - For all other presses → call `super.pressesEnded(presses, with: event)`.\n\n## Must-Haves\n\n- [ ] `SDLKey.init?(fromHIDUsage:)` or equivalent static mapping covers letters, digits, symbols, F-keys, arrows, modifiers, navigation, and keypad\n- [ ] `canBecomeFirstResponder` returns `true` when `UIDevice.isiOSAppOnMac` is true\n- [ ] `keyCommands` returns empty array `[]`\n- [ ] `pressesBegan` intercepts Cmd-modified presses and sends ADB key-down events\n- [ ] `pressesBegan` detects Cmd+Shift+Q and calls `exit(0)`\n- [ ] `pressesBegan` calls `super` for non-Cmd presses\n- [ ] `pressesEnded` sends matching ADB key-up events for Cmd-modified presses\n- [ ] `pressesEnded` calls `super` for non-Cmd presses\n- [ ] Bare Cmd key press/release sends `.cmd` ADB down/up\n\n## Verification\n\n- `grep -q 'pressesBegan' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` succeeds\n- `grep -q 'pressesEnded' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` succeeds\n- `grep -q 'keyCommands' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` succeeds\n- `grep -q 'isiOSAppOnMac' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` returns at least 2 matches (canBecomeFirstResponder + setupViews)\n- `grep -q 'fromHIDUsage\\|UIKeyboardHIDUsage' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` succeeds\n- `grep -q 'exit(0)' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` succeeds",
+      "estimate": "1h",
+      "files": [
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift",
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift"
+      ],
+      "verify": "grep -q 'pressesBegan' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'pressesEnded' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'keyCommands' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'fromHIDUsage\\|UIKeyboardHIDUsage' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift && grep -q 'exit(0)' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && echo 'All checks passed'",
+      "inputs": [
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — existing SDLKey enum with ADB scancodes",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — existing OverlayViewController with canPerformAction/performClose, canBecomeFirstResponder, setupViews",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/InputInteractionModel.swift` — existing handle(_:isDown:hapticAllowed:) method for ADB key forwarding",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Utils/Extensions/Extensions.swift` — UIDevice.isiOSAppOnMac and UIDevice.isSimulator"
+      ],
+      "expected_output": [
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — new UIKeyboardHIDUsage → SDLKey mapping extension",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — pressesBegan/pressesEnded/keyCommands overrides, updated canBecomeFirstResponder and setupViews"
+      ],
+      "observability_impact": "",
+      "full_plan_md": "",
+      "sequence": 0
+    },
+    {
+      "milestone_id": "M001",
+      "slice_id": "S01",
+      "id": "T02",
+      "title": "Build project and verify Cmd-key interception compiles cleanly",
+      "status": "pending",
+      "one_liner": "",
+      "narrative": "",
+      "verification_result": "",
+      "duration": "",
+      "completed_at": null,
+      "blocker_discovered": false,
+      "deviations": "",
+      "known_issues": "",
+      "key_files": [],
+      "key_decisions": [],
+      "full_summary_md": "",
+      "description": "Build the PocketShaver Xcode project to prove the new code integrates with the existing codebase (SDL2 xcframework, C++ bridge, Obj-C++ ADB layer). Fix any compilation errors.\n\n## Steps\n\n1. **Run `xcodebuild` for the PocketShaver scheme targeting iOS Simulator.**\n   Execute: `xcodebuild -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad (10th generation)' -configuration Debug build 2>&1 | tail -30`\n   The simulator destination avoids code-signing issues. The build must succeed (exit code 0, \"BUILD SUCCEEDED\" in output).\n\n2. **If build fails, diagnose and fix.**\n   Common issues:\n   - `UIKeyboardHIDUsage` requires `import UIKit` (already present in both files, but verify)\n   - `UIPress.Key` property `.keyCode` is `UIKeyboardHIDUsage` type — ensure the mapping function's parameter type matches\n   - `inputInteractionModel` is a `lazy var` on OverlayViewController — the press handler accesses it as `self.inputInteractionModel` which is fine\n   - `@MainActor` isolation — `InputInteractionModel` is `@MainActor`, and `pressesBegan`/`pressesEnded` are called on the main thread, but if the compiler complains, may need `@MainActor` annotation or `Task { @MainActor in ... }` wrapper\n   - `exit(0)` — this is a C function available via Foundation, no import needed\n   Fix any issues in the source files and re-run `xcodebuild` until build succeeds.\n\n3. **Run static verification checks.**\n   Confirm key integration points:\n   - `pressesBegan` and `pressesEnded` both reference `inputInteractionModel.handle`\n   - `pressesBegan` contains `exit(0)` for the Cmd+Shift+Q path\n   - `canBecomeFirstResponder` references `isiOSAppOnMac`\n   - Non-Cmd presses call `super.pressesBegan` / `super.pressesEnded`\n   - `keyCommands` returns `[]`\n\n## Must-Haves\n\n- [ ] `xcodebuild` exits with code 0 and output contains `BUILD SUCCEEDED`\n- [ ] No compiler warnings in the modified files related to the new code\n\n## Verification\n\n- `xcodebuild -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad (10th generation)' -configuration Debug build 2>&1 | grep -q 'BUILD SUCCEEDED'`\n\n## Inputs\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — T01 output: HID mapping extension\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — T01 output: press interception overrides\n\n## Expected Output\n\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — compiles cleanly (may have minor fixes)\n- `SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — compiles cleanly (may have minor fixes)",
+      "estimate": "30m",
+      "files": [
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift",
+        "SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift",
+        "PocketShaver.xcodeproj/project.pbxproj"
+      ],
+      "verify": "cd /Users/sierraburkhart/Workspace/PocketShaver && xcodebuild -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad (10th generation)' -configuration Debug build 2>&1 | grep -q 'BUILD SUCCEEDED'",
+      "inputs": [
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — T01 output with HID-to-SDLKey mapping",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — T01 output with press interception overrides"
+      ],
+      "expected_output": [
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/Model/SDLKey.swift` — compiles cleanly, possibly with minor fixes",
+        "`SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — compiles cleanly, possibly with minor fixes"
+      ],
+      "observability_impact": "",
+      "full_plan_md": "",
+      "sequence": 0
+    }
+  ],
+  "decisions": [
+    {
+      "seq": 3,
+      "id": "D001",
+      "when_context": "M001/S02",
+      "scope": "arch",
+      "decision": "Window resize behavior on iOS 26",
+      "choice": "Disable iOS 26 window resizing",
+      "rationale": "Accidental resize when trying to use the Mac OS 9 menu bar near the top edge is a usability problem. The emulator window should be fixed-size.",
+      "revisable": "Yes — if future work adds proper resize handling",
+      "made_by": "human",
+      "superseded_by": null
+    }
+  ],
+  "verification_evidence": [
+    {
+      "id": 1,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'pressesBegan' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 2,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'pressesEnded' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 3,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'keyCommands' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 4,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -c 'isiOSAppOnMac' ...OverlayViewController.swift → 3",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 5,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'fromHIDUsage|UIKeyboardHIDUsage' ...SDLKey.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    },
+    {
+      "id": 6,
+      "task_id": "T01",
+      "slice_id": "S01",
+      "milestone_id": "M001",
+      "command": "grep -q 'exit(0)' ...OverlayViewController.swift",
+      "exit_code": 0,
+      "verdict": "✅ pass",
+      "duration_ms": 50,
+      "created_at": "2026-03-30T04:43:22.361Z"
+    }
+  ]
+}
