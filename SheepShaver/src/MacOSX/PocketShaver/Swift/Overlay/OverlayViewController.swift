@@ -791,6 +791,26 @@ extension OverlayViewController {
 
 
 		sdlVC.embed(vc)
+
+		lockWindowSize()
+	}
+
+	/// Pin the window's size restrictions so iPadOS 26 drag-to-resize is disabled.
+	/// On iPhone `sizeRestrictions` is nil, so the optional chain is a no-op.
+	/// On macOS (Designed for iPad) windows are already fixed-size.
+	private static func lockWindowSize() {
+		guard let window = UIApplication.shared.delegate?.window.flatMap({ $0 }) else {
+			return
+		}
+
+		let windowSize = window.bounds.size
+		guard windowSize.width > 0, windowSize.height > 0 else {
+			return
+		}
+
+		let restrictions = window.windowScene?.sizeRestrictions
+		restrictions?.minimumSize = windowSize
+		restrictions?.maximumSize = windowSize
 	}
 }
 

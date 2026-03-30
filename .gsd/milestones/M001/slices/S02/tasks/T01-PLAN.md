@@ -1,10 +1,12 @@
-# S02: Lock window size on iOS 26
+---
+estimated_steps: 28
+estimated_files: 1
+skills_used: []
+---
 
-**Goal:** Disable iOS 26 windowed-mode resizing so the emulator window is fixed-size.
-**Demo:** After this: After this: cursor near window edges does not trigger resize handles on iOS 26 or DFiP on macOS.
+# T01: Add lockWindowSize() to OverlayViewController and call it from injectOverlayViewController()
 
-## Tasks
-- [x] **T01: Added lockWindowSize() that pins sizeRestrictions min/max to current window bounds, disabling iPadOS 26 drag-to-resize** — Add a static `lockWindowSize()` method to `OverlayViewController` that pins the window's `sizeRestrictions.minimumSize` and `maximumSize` to the current window size, preventing iPadOS 26 drag-to-resize. Call it from `injectOverlayViewController()` after the overlay is embedded.
+Add a static `lockWindowSize()` method to `OverlayViewController` that pins the window's `sizeRestrictions.minimumSize` and `maximumSize` to the current window size, preventing iPadOS 26 drag-to-resize. Call it from `injectOverlayViewController()` after the overlay is embedded.
 
 This is a ~15-line change in a single file. The method uses the existing `UIApplication.shared.delegate?.window` access pattern already present in `injectOverlayViewController()`.
 
@@ -43,6 +45,15 @@ On macOS DFiP (Designed for iPad), iOS apps already have fixed windows, so this 
 - `grep -q 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` exits 0
 - `grep -q 'sizeRestrictions' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` exits 0
 - `grep -c 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` returns >= 2 (definition + call site)
-  - Estimate: 20m
-  - Files: SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift
-  - Verify: xcodebuild build -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad Air 11-inch (M3)' CODE_SIGNING_ALLOWED=NO -quiet 2>&1 && grep -q 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'sizeRestrictions' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && test $(grep -c 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift) -ge 2
+
+## Inputs
+
+- ``SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — existing file containing `injectOverlayViewController()` where lockWindowSize() will be added and called`
+
+## Expected Output
+
+- ``SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift` — modified with lockWindowSize() method and call site in injectOverlayViewController()`
+
+## Verification
+
+xcodebuild build -project PocketShaver.xcodeproj -scheme PocketShaver -destination 'platform=iOS Simulator,name=iPad Air 11-inch (M3)' CODE_SIGNING_ALLOWED=NO -quiet 2>&1 && grep -q 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && grep -q 'sizeRestrictions' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift && test $(grep -c 'lockWindowSize' SheepShaver/src/MacOSX/PocketShaver/Swift/Overlay/OverlayViewController.swift) -ge 2
