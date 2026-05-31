@@ -20,18 +20,24 @@
 
 struct RaveDrawPrivate;
 
-// Overlay lifecycle (shared across all contexts, backed by compositor offscreen texture)
+// Overlay lifecycle (per-engine ownership via gfxaccel_resources;
+// no longer shared with GL, no refcount, no deferred-destroy).
 extern void RaveCreateMetalOverlay(int32_t left, int32_t top, int32_t width, int32_t height);
 extern void RaveDestroyMetalOverlay(void);
 extern void RaveClearOverlayToTransparent(void);
 
-// Deferred overlay destruction (prevents flicker on rapid create/destroy cycles)
-extern void RaveScheduleDeferredOverlayDestroy(void);
-extern void RaveCancelDeferredOverlayDestroy(void);
-
-// Overlay reference counting (shared between RAVE and GL engines)
-extern void RaveOverlayRetain(void);
-extern void RaveOverlayRelease(void);
+// Fan-out hooks: small C-linkage probes so rave_engine.cpp's
+// RaveOnAttach / RaveOnDetach handlers can interrogate / drive RAVE's
+// per-engine overlay state without needing direct ObjC++ access.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int  rave_has_active_overlay(void);
+int  rave_get_overlay_dims(uint32_t *outW, uint32_t *outH);
+void rave_release_overlay_for_detach(void);
+#ifdef __cplusplus
+}
+#endif
 
 // Per-context Metal resource management
 extern void RaveInitMetalResources(struct RaveDrawPrivate *priv);

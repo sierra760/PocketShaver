@@ -1756,12 +1756,17 @@ uint32_t GLDispatch(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
 				// stack at shifted positions. Read type from stack arg -1 (the slot
 				// that would have been r10) and pixels from stack arg 0.
 				uint32_t type, pixels;
+				// This branch handles the dispatch-table calling convention
+				// (gl_dt_flag_addr == 1). The "else" branch handles the stub-call
+				// convention (gl_dt_flag_addr == 0). Both are real dispatch paths;
+				// neither is a "stub" in the unimplemented sense. See the gl_thunks.cpp
+				// comment for the full calling-convention contract.
 				if (gl_ppc_stack_arg_offset) {
 					// Dispatch-table path: type and pixels are both on the stack
 					type   = gl_ppc_stack_arg(-1);  // game's r10 equivalent
 					pixels = gl_ppc_stack_arg(0);    // game's stack arg 0
 				} else {
-					// Stub path: type is r10, pixels is stack arg 0
+					// FindLibSymbol path: type is r10, pixels is stack arg 0
 					type   = r10;
 					pixels = gl_ppc_stack_arg(0);
 				}

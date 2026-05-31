@@ -67,10 +67,33 @@ vertex CompositorVertexOut compositor_vertex(uint vid [[vertex_id]])
  */
 fragment float4 compositor_fragment_32bpp(CompositorVertexOut in [[stage_in]],
                                           texture2d<float> tex [[texture(0)]],
-                                          sampler samp [[sampler(0)]])
+                                          sampler samp [[sampler(0)]],
+                                          constant uchar *gamma_lut [[buffer(0)]],
+                                          constant uint &fade_active [[buffer(1)]])
 {
     float4 s = tex.sample(samp, in.texCoord);
-    return float4(s.g, s.r, s.a, 1.0);
+    // Recover (R, G, B) from the big-endian swizzle.
+    float3 c = float3(s.g, s.r, s.a);
+
+    // Apply the planar gamma LUT (first 256 = R, next 256 = G, last
+    // 256 = B) so a DSp FadeGamma is VISIBLE at 32bpp (the depth DSp games are
+    // force-resized to). Indices are round([0,1]*255) ∈ [0,255], so the planar
+    // offsets land in [0,767] by construction — no OOB read (trusted buffer).
+    uint3 idx = uint3(round(c * 255.0));
+    float r = float(gamma_lut[idx.r])         / 255.0;
+    float g = float(gamma_lut[256u + idx.g])  / 255.0;
+    float b = float(gamma_lut[512u + idx.b])  / 255.0;
+
+    // Apply the Classic-Mac 1.8 -> 2.2 correction at direct
+    // color too for cross-depth consistency when NOT fading; bypass during a
+    // fade so the LUT marches linearly (DSp-1.7).
+    if (fade_active == 0u) {
+        r = pow(r, 1.8 / 2.2);
+        g = pow(g, 1.8 / 2.2);
+        b = pow(b, 1.8 / 2.2);
+    }
+
+    return float4(r, g, b, 1.0);
 }
 
 /*
@@ -88,7 +111,9 @@ fragment float4 compositor_fragment_indexed(CompositorVertexOut in [[stage_in]],
                                             texture2d<uint, access::read> tex [[texture(0)]],
                                             constant uchar4 *palette [[buffer(0)]],
                                             constant uint &bits_per_pixel [[buffer(1)]],
-                                            constant uint &pixel_width [[buffer(2)]])
+                                            constant uchar *gamma_lut [[buffer(2)]],
+                                            constant uint &pixel_width [[buffer(3)]],
+                                            constant uint &fade_active [[buffer(4)]])
 {
     uint px = uint(in.texCoord.x * float(pixel_width));
     uint py = uint(in.texCoord.y * float(tex.get_height()));
@@ -113,7 +138,24 @@ fragment float4 compositor_fragment_indexed(CompositorVertexOut in [[stage_in]],
     }
 
     uchar4 color = palette[index];
-    return float4(float(color.r), float(color.g), float(color.b), 255.0) / 255.0;
+
+    // Apply gamma LUT (planar: first 256 = R, next 256 = G, last 256 = B)
+    float r = float(gamma_lut[color.r]) / 255.0;
+    float g = float(gamma_lut[256 + color.g]) / 255.0;
+    float b = float(gamma_lut[512 + color.b]) / 255.0;
+
+    // Apply Classic Mac 1.8 -> sRGB 2.2 gamma correction.
+    // Classic Mac apps authored palettes for 1.8 gamma CRT; modern iOS is 2.2.
+    // During a fade the LUT already encodes the DSp-1.7 linear ramp;
+    // bypass the static 1.8->2.2 correction so the fade marches linearly in
+    // display space (composing the static pow over a fading LUT warps the ramp).
+    if (fade_active == 0u) {
+        r = pow(r, 1.8 / 2.2);
+        g = pow(g, 1.8 / 2.2);
+        b = pow(b, 1.8 / 2.2);
+    }
+
+    return float4(r, g, b, 1.0);
 }
 
 /*
@@ -128,7 +170,9 @@ fragment float4 compositor_fragment_indexed(CompositorVertexOut in [[stage_in]],
  *  available for MTLPixelFormatR16Uint.
  */
 fragment float4 compositor_fragment_16bpp(CompositorVertexOut in [[stage_in]],
-                                          texture2d<uint, access::read> tex [[texture(0)]])
+                                          texture2d<uint, access::read> tex [[texture(0)]],
+                                          constant uchar *gamma_lut [[buffer(0)]],
+                                          constant uint &fade_active [[buffer(1)]])
 {
     uint px = uint(in.texCoord.x * float(tex.get_width()));
     uint py = uint(in.texCoord.y * float(tex.get_height()));
@@ -147,7 +191,25 @@ fragment float4 compositor_fragment_16bpp(CompositorVertexOut in [[stage_in]],
     uint G = (packed >> 5) & 0x1F;
     uint B = packed & 0x1F;
 
-    return float4(float(R) / 31.0, float(G) / 31.0, float(B) / 31.0, 1.0);
+    // Scale each 5-bit channel (0..31) to the 8-bit LUT index range
+    // (0..255), then apply the planar gamma LUT so a DSp FadeGamma is visible
+    // at 16bpp too. (255*31)/31 = 255, so indices land in [0,255] -> [0,767].
+    uint idx_r = (R * 255u) / 31u;
+    uint idx_g = (G * 255u) / 31u;
+    uint idx_b = (B * 255u) / 31u;
+    float r = float(gamma_lut[idx_r])         / 255.0;
+    float g = float(gamma_lut[256u + idx_g])  / 255.0;
+    float b = float(gamma_lut[512u + idx_b])  / 255.0;
+
+    // Static 1.8 -> 2.2 correction when NOT fading; bypass
+    // during a fade so the LUT marches linearly (DSp-1.7).
+    if (fade_active == 0u) {
+        r = pow(r, 1.8 / 2.2);
+        g = pow(g, 1.8 / 2.2);
+        b = pow(b, 1.8 / 2.2);
+    }
+
+    return float4(r, g, b, 1.0);
 }
 
 /*
@@ -170,4 +232,65 @@ fragment float4 compositor_fragment_composite(CompositorVertexOut in [[stage_in]
     // Scale UVs to sample only the viewport portion of the overlay texture.
     float2 uv = in.texCoord * float2(uv_scale[0], uv_scale[1]);
     return overlay_tex.sample(samp, uv);
+}
+
+/* ========================================================================
+ *  SubmitFrame pipeline shaders
+ *
+ *  Vertex + fragment siblings used by MetalCompositorSubmitFrame to encode
+ *  CompositeLayer entries into the drawable (or, in TESTING_BUILD, into
+ *  an offscreen target via MetalCompositorTesting_SetNextRenderTarget).
+ *
+ *  Simplification: each layer emits a fullscreen triangle
+ *  with the source texture sampled across its full bounds. Per-rect
+ *  clipping (dst_origin/dst_size) is deferred; for z-order verification
+ *  the fullscreen emission is sufficient (each layer occupies the full
+ *  screen in its blend mode, slot order determines final visible).
+ *
+ *  The three blend modes (Opaque / Premultiplied / Straight) share this
+ *  shader pair; the pipeline object differs only in its color-attachment
+ *  blend state (built at MetalCompositorInit time in s_pipe_for_blend[]).
+ * ======================================================================== */
+
+struct SubmitFrameVOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct SubmitFrameUniform {
+    float2 src_origin;
+    float2 src_size;
+    float2 dst_origin;
+    float2 dst_size;
+    float  alpha;
+    float  _pad[3];
+};
+
+vertex SubmitFrameVOut submitframe_vertex(uint vid [[vertex_id]],
+                                         constant SubmitFrameUniform &u [[buffer(0)]])
+{
+    /* Fullscreen triangle covering the viewport. UVs flipped so texture
+     * origin at top-left maps correctly (matches compositor_vertex). */
+    float2 pos;
+    pos.x = (vid == 1) ? 3.0 : -1.0;
+    pos.y = (vid == 2) ? 3.0 : -1.0;
+
+    SubmitFrameVOut out;
+    out.position = float4(pos, 0.0, 1.0);
+    out.uv.x = (pos.x + 1.0) * 0.5;
+    out.uv.y = (1.0 - pos.y) * 0.5;
+    return out;
+}
+
+fragment float4 submitframe_fragment(SubmitFrameVOut in [[stage_in]],
+                                    texture2d<float> tex [[texture(0)]],
+                                    constant SubmitFrameUniform &u [[buffer(0)]])
+{
+    constexpr sampler samp(filter::linear, address::clamp_to_edge);
+    float4 c = tex.sample(samp, in.uv);
+    /* Apply per-layer alpha for non-Opaque blend modes. kBlendOpaque
+     * pipelines disable blending entirely so the alpha multiplier is
+     * ignored even though we compute it. */
+    c.a *= u.alpha;
+    return c;
 }

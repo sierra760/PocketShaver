@@ -1114,6 +1114,7 @@ struct GLContext {
     // ---- Enable/disable caps ----
     bool     depth_test;
     bool     blend;
+    bool     color_sum;                // GL_COLOR_SUM (EXT_secondary_color) — add secondary color after texturing
     bool     cull_face_enabled;
     uint32_t cull_face_mode;           // GL_FRONT, GL_BACK, GL_FRONT_AND_BACK
     uint32_t front_face;               // GL_CCW or GL_CW
@@ -1353,6 +1354,15 @@ extern uint32_t GLDispatch(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
                            uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10,
                            const uint32_t *float_bits, int num_float_args);
 
+// @autoreleasepool wrapper around GLDispatch (defined in gfxaccel_arc_shim.mm).
+// See the RaveDispatchARC comment for the rationale.  Called from
+// sheepshaver_glue.cpp:NATIVE_GL_DISPATCH in
+// place of direct GLDispatch so the emul thread drains autoreleased MTL*/NS*
+// temporaries every dispatch call.
+extern uint32_t GLDispatchARC(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
+                              uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10,
+                              const uint32_t *float_bits, int num_float_args);
+
 // Install library hooks to intercept GL/AGL/GLU/GLUT function lookups
 extern void GLInstallHooks();
 
@@ -1400,6 +1410,33 @@ extern void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *
 // Read a rectangle from the framebuffer into a malloc'd BGRA8 buffer. Caller must free().
 // Returns NULL on failure. Output length written to *out_len.
 extern uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int height, int *out_len);
+
+/*
+ *  Per-engine overlay lifecycle + gfxaccel_resources fan-out
+ *  hooks for GL (mirrors RAVE's overlay pattern).
+ *
+ *  gl_overlay_bind / gl_overlay_unbind / gl_overlay_present are called from
+ *  gl_engine.cpp's NativeAGLSetDrawable / NativeAGLSwapBuffers. They own
+ *  the kGfxEngineGL fleet slot's overlay texture lifetime and emit a
+ *  kLayerSlotOverlay CompositeLayer via MetalCompositorSubmitFrame on
+ *  present.
+ *
+ *  gl_has_active_overlay / gl_get_overlay_dims / gl_release_overlay_for_detach
+ *  are the C-linkage probes consumed by gl_engine.cpp's GLOnAttach / GLOnDetach
+ *  fan-out handlers (registered with gfxaccel_resources at GLInstallHooks).
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void gl_overlay_bind(int32_t left, int32_t top, int32_t width, int32_t height);
+void gl_overlay_unbind(void);
+void gl_overlay_present(void);
+int  gl_has_active_overlay(void);
+int  gl_get_overlay_dims(uint32_t *outW, uint32_t *outH);
+void gl_release_overlay_for_detach(void);
+#ifdef __cplusplus
+}
+#endif
 
 
 #endif /* GL_ENGINE_H */

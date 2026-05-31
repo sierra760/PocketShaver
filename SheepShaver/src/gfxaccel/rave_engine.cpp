@@ -22,6 +22,9 @@
 #include "macos_util.h"
 #include "thunks.h"
 #include "rave_engine.h"
+#include "rave_metal_renderer.h"
+#include "gfxaccel_resources.h"
+#include "metal_compositor.h"  // MetalCompositorSubmitFrame_ClearCachedOverlay
 
 #include <cstring>
 #include <cmath>
@@ -29,6 +32,23 @@
 
 #define DEBUG 0
 #include "debug.h"
+
+#ifdef TESTING_BUILD
+// ---------------------------------------------------------------------------
+// TESTING_BUILD probe for rave_engine.cpp.
+//
+// rave_engine.cpp does NOT call SharedMetalDevice() or any singleton that
+// fails in test context.  ConvertPixels and RavePixelFormatName are pure
+// CPU functions callable from tests with only PSFakeMacRAM installed.
+//
+// RaveTesting_IsTestBuild() is a trivial probe so tests can assert the
+// TESTING_BUILD compilation path is active for this translation unit.
+// ---------------------------------------------------------------------------
+extern "C" int RaveTesting_IsTestBuild(void)
+{
+	return 1;
+}
+#endif /* TESTING_BUILD */
 
 // RAVE error codes (must match TQAError enum in RAVE.h)
 #define kQANoErr                    0
@@ -175,8 +195,12 @@ enum {
 	kQAPixel_ACL16_88 = 11,
 	kQAPixel_I8 = 12,
 	kQAPixel_AI16_88 = 13,
-	kQAPixel_YUV422 = 14,   // GAP-007: YUV 4:2:2 interleaved
-	kQAPixel_YUV411 = 15    // GAP-007: YUV 4:1:1 interleaved
+	// YUV YUVS/YUVU conversion implemented. Test: RAVEPixelTypeTests.testYUVS_convertPixels
+	// Renamed per QD3D 1.6 RAVE.h -- both are 4:2:2 variants (unsigned vs signed UV), not 4:2:2 vs 4:1:1
+	kQAPixel_YUVS = 14,     // YUYV unsigned UV (4:2:2)
+	kQAPixel_YUVU = 15,     // YUYV signed UV (4:2:2)
+	kQAPixel_YUV422 = 14,   // backward-compat alias for kQAPixel_YUVS
+	kQAPixel_YUV411 = 15    // backward-compat alias for kQAPixel_YUVU (misnomer)
 };
 
 // OptionalFeatures bitmask -- advertise features we actually support.
@@ -197,23 +221,26 @@ enum {
 static const uint32 kAllOptionalFeatures =
 	kQAOptional_DeepZ | kQAOptional_Texture | kQAOptional_TextureHQ |
 	kQAOptional_TextureColor | kQAOptional_Blend | kQAOptional_BlendAlpha |
-	kQAOptional_Antialias | kQAOptional_ZSorted | kQAOptional_PerspectiveZ |
+	// Deliberate: kQAOptional_PerspectiveZ (bit8) de-advertised — depth is always
+	// submitted as raw z (rave_metal_renderer.mm:1234); 1/invW HSR deferred (Tomb Raider 95.0
+	// out-of-[0,1] Metal clipping, :1229-1233). Capability honesty: no advertised-but-inert bit.
+	kQAOptional_Antialias | kQAOptional_ZSorted |
 	kQAOptional_CL4 | kQAOptional_CL8 |
 	kQAOptional_FogAlpha | kQAOptional_FogDepth | kQAOptional_MultiTextures |
 	kQAOptional_MipmapBias | kQAOptional_ChannelMask | kQAOptional_ZBufferMask |
 	kQAOptional_AlphaTest | kQAOptional_AccessTexture | kQAOptional_AccessBitmap |
 	kQAOptional_AccessDrawBuffer | kQAOptional_AccessZBuffer |
-	kQAOptional_ClearDrawBuffer | kQAOptional_ClearZBuffer | // GAP-016: OffscreenDrawContexts removed (not implemented)
+	kQAOptional_ClearDrawBuffer | kQAOptional_ClearZBuffer | // OffscreenDrawContexts removed (not implemented)
 	kQAOptional_OpenGL;  // GL tags 100-153 are stored/retrieved via Set/GetInt — games rely on this for scissor, blend, wrap
 
 // OptionalFeatures2 bitmask -- only advertise what we support
 // Bit assignments now match DDK RAVE 1.6 Specification exactly.
 static const uint32 kAllOptionalFeatures2 =
 	kQAOptional2_TextureDrawContexts | kQAOptional2_BitmapDrawContexts |
-	kQAOptional2_Busy | kQAOptional2_SwapBuffers | kQAOptional2_PriorityBits |  // GAP-001
+	kQAOptional2_Busy | kQAOptional2_SwapBuffers | kQAOptional2_PriorityBits |  // kQAOptional2_PriorityBits advertised correctly; priority extraction fixed. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 	kQAOptional2_BitmapScale;
 
-// GAP-029: kQAFast_* constants (RAVE 1.6) -- DIFFERENT bit positions from kQAOptional_*
+// kQAFast_* bit positions verified against RAVE.h. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 // These are NOT aliases. Per RAVE.h, kQAFast_xxx has its own bit namespace.
 enum {
 	kQAFast_None            = 0,
@@ -399,6 +426,87 @@ uint32_t RaveResourceFindByAddr(uint32_t mac_addr) {
 		}
 	}
 	return 0;
+}
+
+/*
+ *  Lookup a RAVE texture entry whose
+ *  pixmap_mac_addr matches `pixmapAddr`.
+ *
+ *  Returns the first matching texture entry, or nullptr if no match.
+ *  Bitmap and color-table entries are excluded (they don't use
+ *  pixmap_mac_addr in the same sense — bitmap data is eager-copied, so
+ *  we only care about the deferred-direct-format texture path that
+ *  Bugdom's ARGB16 sprites take).
+ */
+RaveResourceEntry *RaveFindTextureByPixmapAddr(uint32_t pixmapAddr)
+{
+	if (pixmapAddr == 0) return nullptr;
+	for (int i = 0; i < RAVE_MAX_RESOURCES; i++) {
+		RaveResourceEntry *e = &rave_resource_table[i];
+		if (e->type == kRaveResourceTexture &&
+		    e->pixmap_mac_addr == pixmapAddr) {
+			return e;
+		}
+	}
+	return nullptr;
+}
+
+/*
+ *  Q3Pixmap_Set_Image intercept callback.
+ *
+ *  Synchronously copies `byteCount` bytes from `srcHostAddr` into the
+ *  cpu_pixel_data buffer of the RAVE texture tracking `pixmapAddr`,
+ *  bounded by the entry's cpu_pixel_data_size. Marks the entry as
+ *  `cpu_pixel_data_is_authoritative` so the subsequent
+ *  RaveRealizeDeferredTexture / RaveRefreshTextureFromPixmap calls
+ *  read from cpu_pixel_data instead of pixmap_mac_addr.
+ *
+ *  If no RAVE texture tracks this pixmap address, returns silently —
+ *  most Q3Pixmap_Set_Image calls are unrelated to any RAVE texture
+ *  (e.g. Q3Pixmaps backing 2D PICT draws, not 3D sprite textures),
+ *  and we must not log-spam or stall in those cases.
+ *
+ *  Thread-safety: inherits the single-threaded RAVE dispatch invariant.
+ *  The FindLibSymbol-based activation hook (deferred to a follow-up)
+ *  runs on the emulated PPC
+ *  thread, same as RAVE dispatch, so no additional locking is needed.
+ */
+void NativeHookQ3PixmapSetImage(uint32_t pixmapAddr,
+                                 uint32_t srcHostAddr,
+                                 uint32_t byteCount)
+{
+	RaveResourceEntry *entry = RaveFindTextureByPixmapAddr(pixmapAddr);
+	if (!entry) {
+		// Not a RAVE-tracked pixmap — unrelated Q3Pixmap_Set_Image call.
+		// Silent return; must not log-spam.
+		return;
+	}
+	if (!entry->cpu_pixel_data || entry->cpu_pixel_data_size == 0) {
+		// Entry exists but has no cpu_pixel_data buffer (Mac_sysalloc
+		// failed at TextureNew time). Defensive: fall back to the
+		// pixmap_mac_addr path by leaving the flag unset.
+		RAVE_LOG("Q3Pixmap_Set_Image: entry has no cpu_pixel_data buffer; "
+		         "pixmap=0x%08x", pixmapAddr);
+		return;
+	}
+
+	// Bound the copy by our cpu_pixel_data buffer size.
+	uint32_t copyBytes = byteCount;
+	if (copyBytes > entry->cpu_pixel_data_size) {
+		copyBytes = entry->cpu_pixel_data_size;
+	}
+
+	// Copy src -> cpu_pixel_data. Under EMULATED_PPC, srcHostAddr is a
+	// Mac address; Mac2HostAddr resolves it to a host pointer. Under
+	// TESTING_BUILD (EMULATED_PPC=0), Mac2HostAddr is the identity cast
+	// per PSFakeMacRAM's contract.
+	memcpy(entry->cpu_pixel_data, Mac2HostAddr(srcHostAddr), copyBytes);
+
+	entry->cpu_pixel_data_is_authoritative = true;
+
+	RAVE_LOG("Q3Pixmap_Set_Image intercept: pixmap=0x%08x src=0x%08x "
+	         "bytes=%u (bounded=%u) -> cpu_pixel_data_is_authoritative=true",
+	         pixmapAddr, srcHostAddr, byteCount, copyBytes);
 }
 
 /*
@@ -649,6 +757,89 @@ static void ExpandACL16_88(const uint8_t *srcBuf, uint8_t *dst, uint32_t width, 
 }
 
 
+// BT.601 YUYV-to-BGRA converter for kQAPixel_YUVS (unsigned UV).
+// YUYV format: 2 pixels per 4 bytes. Big-endian Mac byte order: Y0 U Y1 V.
+// BT.601: R = Y + 1.402*(V-128), G = Y - 0.344*(U-128) - 0.714*(V-128), B = Y + 1.772*(U-128)
+// Output: BGRA8 (B=byte0, G=byte1, R=byte2, A=0xFF).
+// T-08-03 mitigation: validate width*2 <= rowBytes before pixel loop.
+static inline uint8_t clamp_u8(int v)
+{
+	return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+static void ConvertYUVS(uint32 srcAddr, uint8_t *dst,
+                        uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	// T-08-03: rowBytes must be at least width*2 (2 bytes per pixel in YUYV)
+	if (width > 0 && rowBytes < width * 2) {
+		memset(dst, 0, (size_t)width * height * 4);
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		uint32 rowAddr = srcAddr + y * rowBytes;
+		for (uint32_t x = 0; x < width; x += 2) {
+			uint8_t Y0 = ReadMacInt8(rowAddr + x * 2 + 0);
+			uint8_t U  = ReadMacInt8(rowAddr + x * 2 + 1);
+			uint8_t Y1 = ReadMacInt8(rowAddr + x * 2 + 2);
+			uint8_t V  = ReadMacInt8(rowAddr + x * 2 + 3);
+
+			// BT.601 unsigned UV: offset by -128 to center around zero
+			int cr = V - 128;
+			int cb = U - 128;
+			for (int p = 0; p < 2; p++) {
+				if (x + p >= width) break;  // handle odd widths
+				int Yp = (p == 0) ? Y0 : Y1;
+				int r = Yp + (int)(1.402f * cr);
+				int g = Yp - (int)(0.344f * cb) - (int)(0.714f * cr);
+				int b = Yp + (int)(1.772f * cb);
+				uint32_t idx = (y * width + x + p) * 4;
+				dst[idx + 0] = clamp_u8(b);   // B
+				dst[idx + 1] = clamp_u8(g);   // G
+				dst[idx + 2] = clamp_u8(r);   // R
+				dst[idx + 3] = 0xFF;           // A (opaque)
+			}
+		}
+	}
+}
+
+// BT.601 YUYV-to-BGRA converter for kQAPixel_YUVU (signed UV).
+// Same as YUVS but UV bytes are interpreted as signed: int cr = (int8_t)V; int cb = (int8_t)U;
+// No -128 offset since the values are already in signed range [-128..127].
+static void ConvertYUVU(uint32 srcAddr, uint8_t *dst,
+                        uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	// T-08-03: rowBytes must be at least width*2 (2 bytes per pixel in YUYV)
+	if (width > 0 && rowBytes < width * 2) {
+		memset(dst, 0, (size_t)width * height * 4);
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		uint32 rowAddr = srcAddr + y * rowBytes;
+		for (uint32_t x = 0; x < width; x += 2) {
+			uint8_t Y0 = ReadMacInt8(rowAddr + x * 2 + 0);
+			uint8_t U  = ReadMacInt8(rowAddr + x * 2 + 1);
+			uint8_t Y1 = ReadMacInt8(rowAddr + x * 2 + 2);
+			uint8_t V  = ReadMacInt8(rowAddr + x * 2 + 3);
+
+			// BT.601 signed UV: interpret U/V as signed bytes directly
+			int cr = (int8_t)V;
+			int cb = (int8_t)U;
+			for (int p = 0; p < 2; p++) {
+				if (x + p >= width) break;  // handle odd widths
+				int Yp = (p == 0) ? Y0 : Y1;
+				int r = Yp + (int)(1.402f * cr);
+				int g = Yp - (int)(0.344f * cb) - (int)(0.714f * cr);
+				int b = Yp + (int)(1.772f * cb);
+				uint32_t idx = (y * width + x + p) * 4;
+				dst[idx + 0] = clamp_u8(b);   // B
+				dst[idx + 1] = clamp_u8(g);   // G
+				dst[idx + 2] = clamp_u8(r);   // R
+				dst[idx + 3] = 0xFF;           // A (opaque)
+			}
+		}
+	}
+}
+
 /*
  *  RavePixelFormatName - return human-readable name for a kQAPixel_* constant
  *  Used by diagnostic logging to identify texture formats on-device.
@@ -670,8 +861,8 @@ static const char *RavePixelFormatName(uint32_t pixelType)
 		case kQAPixel_ACL16_88:     return "ACL16_88";
 		case kQAPixel_I8:           return "I8";
 		case kQAPixel_AI16_88:      return "AI16_88";
-		case kQAPixel_YUV422:       return "YUV422";
-		case kQAPixel_YUV411:       return "YUV411";
+		case kQAPixel_YUVS:         return "YUVS";
+		case kQAPixel_YUVU:         return "YUVU";
 		default:                    return "UNKNOWN";
 	}
 }
@@ -690,12 +881,14 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 			ConvertARGB32(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB32:
+			// RGB32 validated. Test: RAVEPixelTypeTests.testRGB32_convertPixels
 			ConvertRGB32(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_ARGB16:
 			ConvertARGB16(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB16:
+			// RGB16 validated. Test: RAVEPixelTypeTests.testRGB16_convertPixels
 			ConvertRGB16(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB8_332:
@@ -710,21 +903,24 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 		case kQAPixel_AI16_88:
 			ConvertAI16_88(srcAddr, dst, width, height, rowBytes);
 			break;
-		// GAP-008: Stub converters for exotic pixel types
-		// These produce opaque black BGRA as a safe fallback.
-		case kQAPixel_Alpha1:
-		case kQAPixel_RGB16_565:
-		case kQAPixel_RGB24: {
-			RAVE_LOG("ConvertPixels: stub conversion for pixelType=%d (%dx%d) -> opaque black",
-			         pixelType, width, height);
-			uint32_t totalPixels = width * height * 4;
-			memset(dst, 0, totalPixels);
-			// Set alpha to 0xFF for opaque black
-			for (uint32_t i = 3; i < totalPixels; i += 4) {
-				dst[i] = 0xFF;
-			}
+		case kQAPixel_YUVS:
+			// YUVS BT.601 conversion. Test: RAVEPixelTypeTests.testYUVS_convertPixels
+			ConvertYUVS(srcAddr, dst, width, height, rowBytes);
 			break;
-		}
+		case kQAPixel_YUVU:
+			// YUVU BT.601 signed-UV conversion. Test: RAVEPixelTypeTests.testYUVU_convertPixels_signedUV
+			ConvertYUVU(srcAddr, dst, width, height, rowBytes);
+			break;
+		// Exotic types are deliberately unconverted. Test: RAVEPixelTypeTests.testExoticPixelTypes_documentedErrors
+		// These return false (unconverted) because they are not used by Mac OS 9 RAVE apps:
+		case kQAPixel_Alpha1:
+			// Deliberate: kQAPixel_Alpha1 not used by known Mac OS 9 RAVE apps.
+		case kQAPixel_RGB16_565:
+			// Deliberate: kQAPixel_RGB16_565 is "Win32 ONLY" per RAVE.h; no Mac OS 9 apps use this path.
+		case kQAPixel_RGB24:
+			// Deliberate: kQAPixel_RGB24 is "Win32 ONLY" per RAVE.h.
+			converted = false;
+			break;
 		default:
 			converted = false;  // indexed format -- needs CLUT
 			break;
@@ -747,6 +943,25 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 
 
 /*
+ *  Host-pointer variant of ConvertPixels.
+ *
+ *  Under EMULATED_PPC=0 (test build), Mac2HostAddr is the identity cast
+ *  and ReadMacInt* reduces to host-endian byte loads at a host pointer.
+ *  The existing ConvertPixels already works on host pointers in that
+ *  case — we just need to cast the pointer to uint32.  This wrapper
+ *  makes the intent explicit (no Mac-address arithmetic involved) and
+ *  gives tests a clean entry point.
+ */
+bool ConvertPixelsFromHost(uint32_t pixelType, const uint8_t *srcHost,
+                            uint8_t *dst, uint32_t width,
+                            uint32_t height, uint32_t rowBytes)
+{
+	return ConvertPixels(pixelType, (uint32)(uintptr_t)srcHost, dst,
+	                     width, height, rowBytes);
+}
+
+
+/*
  *  Shared texture creation helper
  *
  *  Used by both the hook path (NativeHookTextureNew) and the engine dispatch
@@ -761,8 +976,8 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 	uint32_t rowBytes = ReadMacInt32(imagesAddr + 8);
 	uint32_t pixmap   = ReadMacInt32(imagesAddr + 12);
 
-	// GAP-010: Extract priority bits from upper 16 bits of flags (per RAVE 1.6 spec)
-	entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+	// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+	entry->priority = (uint8_t)((flags >> 28) & 0xF);
 
 	bool hasMipmaps = (flags & 2);  // kQATexture_Mipmap = (1 << 1) = bit 1
 	uint32_t mipLevels = 1;
@@ -776,6 +991,13 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 	entry->height     = h;
 	entry->mip_levels = mipLevels;
 	entry->row_bytes  = rowBytes;
+
+	// New textures start with
+	// cpu_pixel_data_is_authoritative=false; the flag is flipped by
+	// NativeHookQ3PixmapSetImage if a Q3Pixmap_Set_Image intercept
+	// fires for this texture's pixmap_mac_addr. Explicit init for
+	// clarity even though RaveResourceAlloc memsets the entry to 0.
+	entry->cpu_pixel_data_is_authoritative = false;
 
 	bool isIndexed = (pixelType == kQAPixel_CL8 || pixelType == kQAPixel_CL4 || pixelType == kQAPixel_ACL16_88);
 
@@ -884,9 +1106,23 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 	uint32_t rowBytes = entry->row_bytes;
 	uint32_t mipLevels = entry->mip_levels;
 
-	// Always read from the original pixmap — QD3D writes texture data there
-	// after QATextureNew returns but before the first draw call.
+	// Prefer cpu_pixel_data when a
+	// Q3Pixmap_Set_Image intercept has synchronously copied the real
+	// pixel data into our engine-owned buffer. This handles the
+	// classic-Mac transient-buffer lifecycle (Bugdom sprites) where
+	// pixmap_mac_addr would otherwise read stale/recycled heap data.
+	// If the flag is false, fall back to the original pixmap_mac_addr
+	// path — preserves working-title behavior (spider-web sprite,
+	// Nanosaur opaque textures, any title whose source buffer is
+	// persistent across the first draw).
 	uint32_t pixmap = entry->pixmap_mac_addr;
+	const char *readSrcName = "pixmap_mac_addr";
+	if (entry->cpu_pixel_data_is_authoritative &&
+	    entry->cpu_pixel_mac_addr != 0 &&
+	    entry->cpu_pixel_data_size > 0) {
+		pixmap = entry->cpu_pixel_mac_addr;
+		readSrcName = "cpu_pixel_data (R2 intercept)";
+	}
 
 	// [DIAG] Sample raw source pixels at realize time
 	if (rave_logging_enabled) {
@@ -894,8 +1130,8 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		for (int s = 0; s < 4 && s < (int)(w * h); s++) {
 			raw[s] = (uint16_t)ReadMacInt16(pixmap + s * 2);
 		}
-		printf("RAVE DIAG: Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x\n",
-		       raw[0], raw[1], raw[2], raw[3], pixmap);
+		printf("RAVE DIAG: Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x (%s)\n",
+		       raw[0], raw[1], raw[2], raw[3], pixmap, readSrcName);
 	}
 
 	uint8_t *expanded = new uint8_t[w * h * 4];
@@ -904,12 +1140,18 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 	// Check if source data was all zeros (placeholder texture from QD3D).
 	// Sample a few pixels — if all are opaque black (0xFF000000 in BGRA),
 	// the game likely hasn't written real data yet.
+	//
+	// Also test the alpha channel
+	// (expanded[off+3]). ARGB16 sprites with transparent-border top
+	// scanlines (the common PICT-loaded sprite layout) have alpha-dense
+	// but RGB-zero pixels; the previous RGB-only check missed those and
+	// incorrectly flagged the source as empty.
 	bool sourceWasEmpty = true;
 	uint32_t sampleCount = (w * h < 64) ? w * h : 64;
 	for (uint32_t i = 0; i < sampleCount; i++) {
 		uint32_t offset = i * 4;
-		// Check if any pixel has non-zero color (B, G, R channels)
-		if (expanded[offset] != 0 || expanded[offset+1] != 0 || expanded[offset+2] != 0) {
+		// Check if any pixel has non-zero color (B, G, R, A channels)
+		if (expanded[offset] != 0 || expanded[offset+1] != 0 || expanded[offset+2] != 0 || expanded[offset+3] != 0) {
 			sourceWasEmpty = false;
 			break;
 		}
@@ -1190,8 +1432,8 @@ int32_t NativeEngineBitmapNew(uint32_t flags, uint32_t pixelType,
 	}
 	RaveResourceEntry *entry = RaveResourceGet(handle);
 	RaveCreateBitmapFromImage(pixelType, imageAddr, entry);
-	// GAP-010: Extract priority bits from upper 16 bits of flags
-	entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+	// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+	entry->priority = (uint8_t)((flags >> 28) & 0xF);
 	WriteMacInt32(newBitmapPtr, entry->mac_addr);
 	return kQANoErr;
 }
@@ -1548,7 +1790,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_FastFeatures:
-		// GAP-029: Use kAllFastFeatures (kQAFast_* namespace per spec)
+		// Use kAllFastFeatures (kQAFast_* namespace per spec). Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 		// Metal accelerates everything, so bit values match OptionalFeatures
 		WriteMacInt32(responsePtr, kAllFastFeatures);
 		RAVE_LOG("EngineGestalt: %s -> 0x%08x", gestalt_selector_names[selector], kAllFastFeatures);
@@ -1600,7 +1842,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_TexturePixelTypesAllowed:
-		// GAP-009: Added RGB32 and RGB16 to allowed texture pixel types
+		// Added RGB32 and RGB16 to allowed texture pixel types
 		WriteMacInt32(responsePtr, (1 << kQAPixel_ARGB32) | (1 << kQAPixel_RGB32) |
 					  (1 << kQAPixel_ARGB16) | (1 << kQAPixel_RGB16) |
 					  (1 << kQAPixel_CL8) | (1 << kQAPixel_CL4) |
@@ -1645,7 +1887,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	default:
-		// GAP-003: kQANotSupported is correct per spec for engines without engine-specific selectors
+		// kQANotSupported is correct per spec for engines without engine-specific selectors
 		// (kQAGestalt_EngineSpecific_Minimum and above fall through to here)
 		// ATI gestalt selectors (1000+)
 		if (selector == 1000) {  // kQATIGestalt_CurrentContext
@@ -1874,8 +2116,8 @@ uint32 NativeHookDrawContextNew(uint32 device, uint32 rect, uint32 clip,
 /*
  *  Hook handler: QATextureNew(engine, flags, pixelType, images[], &newTexture)
  *
- *  For sentinel engine: create a stub texture handle (Phase 3+ will implement
- *  real texture upload to Metal). For other engines: chain to original.
+ *  For sentinel engine: create a stub texture handle (real texture upload
+ *  to Metal is implemented later). For other engines: chain to original.
  *
  *  r3 = engine, r4 = flags, r5 = pixelType, r6 = images, r7 = &newTexture
  */
@@ -1920,8 +2162,8 @@ uint32 NativeHookBitmapNew(uint32 engine, uint32 flags, uint32 pixelType,
 		}
 		RaveResourceEntry *entry = RaveResourceGet(handle);
 		RaveCreateBitmapFromImage(pixelType, image, entry);
-		// GAP-010: Extract priority bits from upper 16 bits of flags
-		entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+		// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+		entry->priority = (uint8_t)((flags >> 28) & 0xF);
 		RAVE_LOG("HOOK: QABitmapNew(sentinel) flags=0x%x pixelType=%d %dx%d -> handle %d addr=0x%08x metal=%p",
 		       flags, pixelType, entry->width, entry->height, handle, entry->mac_addr, entry->metal_texture);
 		WriteMacInt32(newBitmapPtr, entry->mac_addr);
@@ -1988,6 +2230,24 @@ uint32 NativeHookDrawContextDelete(uint32 drawContextPtr) {
 		// Recycle the Mac-side context address so the next QADrawContextNew
 		// can reuse it instead of permanently allocating from SheepMem.
 		rave_ctx_free_list.push_back(drawContextPtr);
+
+		// Clear the compositor's cached overlay on
+		// QADrawContextDestroy.  The cache holds a strong reference to the
+		// source MTLTexture that may outlive this engine's draw context;
+		// Nanosaur destroys and recreates its QADrawContext at scene
+		// transitions (menu <-> level 1 <-> level 2), and when a new
+		// context is created the overlay's shape / size / sampler state may
+		// differ.  Without this invalidation surface the prior scene's
+		// overlay content can bleed through the first frames of the new
+		// scene ("intermittent 3D stale pixel residue").
+		//
+		// Call sites for ClearCachedOverlay:
+		//   1. MetalCompositor_OnModeExit  (DMC mode change; metal_compositor.mm:198)
+		//   2. Compositor shutdown         (metal_compositor.mm tear-down)
+		//   3. QADrawContextDelete         (this call)
+		//
+		// Regression test: NanosaurSceneTransitionTests.
+		MetalCompositorSubmitFrame_ClearCachedOverlay();
 
 		return kQANoErr;
 	}
@@ -2277,6 +2537,85 @@ bool RaveIsRegistered(void)
 	return rave_registered;
 }
 
+/* ----------------------------------------------------------------------
+ * gfxaccel_resources fan-out handlers.
+ *
+ * RAVE registers a pair of attach/detach callbacks with gfxaccel_resources
+ * at engine init (RaveRegisterEngine, below). The resource manager fans
+ * out DMC on_mode_enter/exit events to engines via these callbacks.
+ *
+ * Lifecycle:
+ *   - on_mode_enter (LIFO) -> RaveOnAttach: pre-vend an overlay texture for
+ *     the new mode's resolution IF RAVE has an active context. Otherwise
+ *     skip; the next RaveCreateMetalOverlay call will vend lazily.
+ *   - on_mode_exit  (FIFO) -> RaveOnDetach: release the cached overlay
+ *     handle back to the resource manager so RAVE doesn't pin a stale
+ *     allocation across the mode switch.
+ *
+ * The handlers must NOT call back into DMC (the resource manager fan-out
+ * runs on the DMC writer's thread while holding the writer mutex —
+ * recursive subscribe/unsubscribe would deadlock; threat T-03-26 / T-03-27).
+ *
+ * These cross the .cpp/.mm boundary via the small extern "C" probes
+ * declared in rave_metal_renderer.h (rave_has_active_overlay,
+ * rave_get_overlay_dims, rave_release_overlay_for_detach).
+ * ---------------------------------------------------------------------- */
+static int32_t RaveOnAttach(uint32_t /* engine_id */,
+                            const struct DMCModeSnapshot *incoming,
+                            void * /* ctx */)
+{
+	/* If RAVE has no active overlay at attach time, skip pre-vending —
+	 * the next RaveCreateMetalOverlay (driven by an actual RAVE context
+	 * creation) will vend lazily. This is the common case for non-RAVE
+	 * workloads (e.g. pure-2D apps switching modes). */
+	if (!rave_has_active_overlay()) {
+		return 0;  /* kGfxAccelResNoErr — accept the transition */
+	}
+	if (incoming == NULL) {
+		return 0;  /* defensive — accept transition with no pre-vend */
+	}
+
+	/* RAVE was active in the outgoing mode; pre-vend at the incoming
+	 * mode's resolution so the compositor sees an overlay on its first
+	 * present after the mode switch. Vend
+	 * format is BGRA8Unorm (= MTLPixelFormatBGRA8Unorm = 80). */
+	void *tex = gfxaccel_resources_vend_overlay_texture(
+	                kGfxEngineRAVE,
+	                incoming->width,
+	                incoming->height,
+	                80 /* MTLPixelFormatBGRA8Unorm */);
+	if (tex == NULL) {
+		/* Vend failed — reject the transition. The rollback path is
+		 * safe under concurrent DMC readers. */
+		return -3009;  /* kDMCErrSubscriberRejected */
+	}
+	return 0;
+}
+
+static int32_t RaveOnDetach(uint32_t /* engine_id */,
+                            const struct DMCModeSnapshot * /* outgoing */,
+                            void * /* ctx */)
+{
+	/* Release the cached overlay (idempotent — no-op if RAVE has none).
+	 * The next RaveCreateMetalOverlay after the mode switch will re-vend
+	 * at the appropriate resolution. */
+	rave_release_overlay_for_detach();
+	return 0;
+}
+
+static bool rave_resource_handlers_registered = false;
+
+static void RaveRegisterResourceHandlers(void)
+{
+	if (rave_resource_handlers_registered) return;
+	struct GfxResEngineHandlers rave_handlers;
+	rave_handlers.attach = RaveOnAttach;
+	rave_handlers.detach = RaveOnDetach;
+	rave_handlers.ctx    = NULL;
+	gfxaccel_resources_register_engine(kGfxEngineRAVE, &rave_handlers);
+	rave_resource_handlers_registered = true;
+}
+
 void RaveRegisterEngine(void)
 {
 	// Guard against double registration AND re-entrancy.
@@ -2304,7 +2643,16 @@ void RaveRegisterEngine(void)
 
 	RAVE_LOG("RaveRegisterEngine() called");
 
-	// ---- Phase 1: Cache ALL library symbols BEFORE any CallMacOS ----
+	// ---- Step 0: Register RAVE's attach/detach handlers
+	// with the gfxaccel_resources fan-out registry.
+	// Idempotent (rave_resource_handlers_registered guard); safe to call
+	// before the QARegisterEngine attempt because gfxaccel_resources_init
+	// has already run (main_unix.cpp ordering: SharedMetalDevice ->
+	// MetalCompositorInit -> gfxaccel_resources_init -> ROM patches ->
+	// VideoInstallAccel -> RaveRegisterEngine).
+	RaveRegisterResourceHandlers();
+
+	// ---- Step 1: Cache ALL library symbols BEFORE any CallMacOS ----
 	//
 	// IMPORTANT: FindLibSymbol can trigger CFM fragment loading, which in turn
 	// calls VideoInstallAccel -> RaveRegisterEngine (re-entrancy). Our guard
@@ -2362,7 +2710,7 @@ void RaveRegisterEngine(void)
 	uint32 new_gestalt_tvect = FindLibSymbol("\014InterfaceLib", "\012NewGestalt");
 	RAVE_LOG("cached InterfaceLib: NewGestalt=0x%08x", new_gestalt_tvect);
 
-	// ---- Phase 2: Registration (CallMacOS calls, no more FindLibSymbol) ----
+	// ---- Step 2: Registration (CallMacOS calls, no more FindLibSymbol) ----
 
 	// Get the EngineGetMethod TVECT address to pass to QARegisterEngine
 	// Sub-opcode 100 (kRaveEngineDrawPrivateNew) is our EngineGetMethod callback
@@ -2390,7 +2738,7 @@ void RaveRegisterEngine(void)
 
 	RAVE_LOG("engine registered successfully");
 
-	// ---- Phase 3: Gestalt registration (uses cached NewGestalt TVECT) ----
+	// ---- Step 3: Gestalt registration (uses cached NewGestalt TVECT) ----
 
 	if (new_gestalt_tvect) {
 		typedef int16 (*new_gestalt_t)(uint32, uint32);
@@ -2422,7 +2770,7 @@ void RaveRegisterEngine(void)
 		RAVE_LOG("NewGestalt not found, skipping Gestalt registration");
 	}
 
-	// ---- Phase 4: Install enumeration hooks ----
+	// ---- Step 4: Install enumeration hooks ----
 	//
 	// The RAVE manager's QARegisterEngine requires an internal loading context
 	// (ZgLoadingSharedLibrary) that we can't satisfy from VideoInstallAccel.

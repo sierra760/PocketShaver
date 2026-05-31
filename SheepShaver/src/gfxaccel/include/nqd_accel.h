@@ -76,4 +76,40 @@ extern void NQDMetalFillMask(uint32 p);
 // Used by callers to decide whether Metal acceleration is safe.
 extern bool NQDMetalAddrInBuffer(uint32 mac_addr);
 
+// ---------------------------------------------------------------------------
+// 1:1 bitblt (DSpBlit_Fastest, sub-op 711).
+//
+// Strict 1:1 copy (srcRect == dstRect) reusing the proven nqd_bitblt kernel.
+// src_base/dst_base are Mac (guest) addresses of the src/dst rect origins.
+// transfer_mode is 0 (srcCopy) or 36 (transparent, for SrcKey with src_key as
+// the transparent value). Rejects out-of-buffer baseAddr before dispatch.
+// Returns true if encoded into the shared NQD batch; false otherwise (caller
+// maps false -> kDSpInternalErr). NO new concurrency primitive.
+extern bool NQDMetalBitblt1to1(uint32 src_base, int32 src_row_bytes,
+                               uint32 dst_base, int32 dst_row_bytes,
+                               uint32 pixel_size_bytes, uint32 bits_per_pixel,
+                               uint32 width_pixels, uint32 height,
+                               uint32 transfer_mode, uint32 src_key);
+
+// ---------------------------------------------------------------------------
+// Scaling bitblt (DSpBlit_Faster, sub-op 710).
+//
+// Dispatches the nqd_bitblt_scaled compute kernel (one thread per dst pixel;
+// nearest-neighbor by default, bilinear when interpolate != 0; color-key
+// honored per key_enable). src_base/dst_base are Mac (guest) addresses of the
+// src/dst rect origins (the caller folds the rect top/left into the base).
+// Rejects out-of-buffer baseAddr before dispatch. Returns true if the dispatch
+// was encoded into the shared NQD batch; false on unavailable Metal, degenerate
+// geometry, unsupported pixel size, or OOB address (caller maps false ->
+// kDSpInternalErr). NO new concurrency primitive — encodes into the single
+// shared MTLCommandQueue.
+extern bool NQDMetalBitbltScaled(uint32 src_base, int32 src_row_bytes,
+                                 uint32 dst_base, int32 dst_row_bytes,
+                                 uint32 pixel_size_bytes, uint32 bits_per_pixel,
+                                 uint32 src_w, uint32 src_h,
+                                 uint32 dst_w, uint32 dst_h,
+                                 uint32 interpolate,
+                                 uint32 src_key, uint32 dst_key,
+                                 uint32 key_enable);
+
 #endif /* NQD_ACCEL_H */

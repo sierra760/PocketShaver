@@ -8,8 +8,17 @@
 /* Define if building universal (internal helper macro) */
 /* #undef AC_APPLE_UNIVERSAL_BUILD */
 
-/* Define if using a PowerPC CPU emulator. */
+/* Define if using a PowerPC CPU emulator.
+ *
+ * Under TESTING_BUILD=1 (PocketShaverTests target), the test
+ * bundle compiles gfxaccel sources with EMULATED_PPC=0 so Mac2HostAddr
+ * collapses to identity and the test bundle does not link libkpx_cpu_ios.a.
+ * Respect any pre-existing command-line
+ * definition instead of hard-overriding it here.
+ */
+#ifndef EMULATED_PPC
 #define EMULATED_PPC 1
+#endif
 
 /* Define to enable dyngen engine */
 #define ENABLE_DYNGEN 0

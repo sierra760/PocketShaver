@@ -28,6 +28,9 @@
 #include "rave_metal_renderer.h"
 #include "metal_device_shared.h"
 #include "metal_compositor.h"
+#include "display_mode_controller.h"
+#include "gfxaccel_resources.h"
+#include "gfxaccel_resources_heap.h"
 
 // Forward declare Mac_sysalloc (from macos_util.h) to avoid UIKit header conflicts
 extern uint32 Mac_sysalloc(uint32 size);
@@ -109,7 +112,7 @@ struct RaveMetalState {
 	bool                        msaaActive;         // currently rendering in MSAA mode
 	bool                        msaaResourcesReady; // MSAA textures allocated
 
-	// Pre-built sampler states (Phase 4)
+	// Pre-built sampler states
 	id<MTLSamplerState>         samplers[3];        // [0]=nearest, [1]=bilinear, [2]=trilinear
 
 	// Diagnostic counters (per-frame, reset at RenderStart)
@@ -155,128 +158,221 @@ struct RaveMetalState {
 
 
 /*
- *  Overlay reference counting (shared across RAVE and GL engines).
- *  The overlay is now a compositor-owned offscreen texture.
+ *  RAVE per-engine overlay state.
+ *
+ *  Replaces the legacy shared-overlay refcount + deferred-destroy machinery
+ *  with per-engine ownership. RAVE owns exactly one overlay MTLTexture at a
+ *  time, vended by
+ *  gfxaccel_resources_vend_overlay_texture(kGfxEngineRAVE, ...) and
+ *  released via gfxaccel_resources_release_overlay_texture. Same
+ *  resolution = cache-hit recycle; resolution change = re-vend.
+ *
+ *  Deferred-destroy is gone because per-engine ownership eliminates the
+ *  shared-refcount race that motivated it.
+ *
+ *  The legacy 3D-frame-pacing throttle call is gone too. SubmitFrame's
+ *  hidden dispatch_semaphore(3) subsumes pacing.
  */
-static int accel_overlay_refcount = 0;
+static id<MTLTexture> s_rave_overlay_tex = nil;     /* cached vended handle */
+static uint32_t       s_rave_overlay_w   = 0;
+static uint32_t       s_rave_overlay_h   = 0;
+static int32_t        s_rave_dst_left    = 0;
+static int32_t        s_rave_dst_top     = 0;
+static int32_t        s_rave_dst_width   = 0;
+static int32_t        s_rave_dst_height  = 0;
+
+#ifdef TESTING_BUILD
+// ---------------------------------------------------------------------------
+// Test-only device/queue/bundle/overlay override.
+//
+// Mirrors the NQD TESTING_BUILD pattern (nqd_metal_renderer.mm).
+// When TESTING_BUILD is defined (ONLY on the PocketShaverTests target --
+// never on the production app target), tests may inject their own
+// per-test id<MTLDevice> + id<MTLCommandQueue> by calling
+// RaveTesting_SetDevice() BEFORE RaveInitMetalResources().
+// RaveInitMetalResources() then uses the injected pair instead of
+// SharedMetalDevice().  RaveTesting_SetBundle() lets tests inject the
+// NSBundle for shader library loading (same as NQDTesting_SetBundle).
+// RaveTesting_SetTestOverlayTexture() lets tests inject a standalone
+// MTLTexture as the render target, bypassing gfxaccel_resources
+// (which requires compositor init that tests don't have).
+// RaveTesting_Reset() clears all injected state between tests.
+//
+// Production builds (TESTING_BUILD undefined) do not see these symbols;
+// the preprocessor drops the entire block.
+// ---------------------------------------------------------------------------
+static id<MTLDevice>       rave_testing_device  = nil;
+static id<MTLCommandQueue> rave_testing_queue   = nil;
+static id<NSObject>        rave_testing_bundle  = nil;
+static id<MTLTexture>      rave_testing_overlay = nil;
+
+extern "C" void RaveTesting_SetDevice(void *device, void *queue)
+{
+	rave_testing_device = (__bridge id<MTLDevice>)device;
+	rave_testing_queue  = (__bridge id<MTLCommandQueue>)queue;
+}
+
+extern "C" void RaveTesting_SetBundle(void *bundle)
+{
+	rave_testing_bundle = (__bridge id<NSObject>)bundle;
+}
+
+extern "C" void RaveTesting_SetTestOverlayTexture(void *texture)
+{
+	rave_testing_overlay = (__bridge id<MTLTexture>)texture;
+}
+
+extern "C" void RaveTesting_Reset(void)
+{
+	rave_testing_device  = nil;
+	rave_testing_queue   = nil;
+	rave_testing_bundle  = nil;
+	rave_testing_overlay = nil;
+	s_rave_overlay_tex   = nil;
+	s_rave_overlay_w     = 0;
+	s_rave_overlay_h     = 0;
+}
+
+/*
+ *  RaveTesting_CountPipelines - return count of non-nil base pipeline slots.
+ *  Test accessor for PSO cache validation.
+ *  Returns -1 if metal state is null.
+ */
+extern "C" int RaveTesting_CountPipelines(struct RaveDrawPrivate *priv)
+{
+	if (!priv || !priv->metal) return -1;
+	RaveMetalState *ms = priv->metal;
+	int count = 0;
+	for (int i = 0; i < 48; i++) {
+		if (ms->pipelines[i] != nil) count++;
+	}
+	return count;
+}
+#endif /* TESTING_BUILD */
+
+/*
+ *  rave_acquire_overlay_texture - vend (or cache-hit) the per-engine overlay.
+ *
+ *  Returns the MTLTexture handle on success or nil on failure (vend may
+ *  return NULL during early startup or if SharedMetalDevice() is nil).
+ */
+static id<MTLTexture> rave_acquire_overlay_texture(uint32_t width, uint32_t height)
+{
+#ifdef TESTING_BUILD
+	if (rave_testing_overlay != nil) {
+		return rave_testing_overlay;
+	}
+#endif
+	if (s_rave_overlay_tex != nil &&
+	    s_rave_overlay_w == width &&
+	    s_rave_overlay_h == height) {
+		return s_rave_overlay_tex;  /* cache-hit */
+	}
+	void *raw = gfxaccel_resources_vend_overlay_texture(
+	                kGfxEngineRAVE, width, height,
+	                MTLPixelFormatBGRA8Unorm);
+	if (raw == NULL) {
+		RAVE_LOG("rave_acquire_overlay_texture: vend(%ux%u) returned NULL", width, height);
+		return nil;
+	}
+	s_rave_overlay_tex = (__bridge id<MTLTexture>)raw;
+	s_rave_overlay_w = width;
+	s_rave_overlay_h = height;
+	return s_rave_overlay_tex;
+}
+
+/*
+ *  rave_release_overlay_texture - release the per-engine overlay back to
+ *  the resource manager and clear RAVE's cached handle. Idempotent.
+ */
+static void rave_release_overlay_texture(void)
+{
+	if (s_rave_overlay_tex == nil) return;
+	gfxaccel_resources_release_overlay_texture(
+	    kGfxEngineRAVE, (__bridge void *)s_rave_overlay_tex);
+	s_rave_overlay_tex = nil;
+	s_rave_overlay_w = 0;
+	s_rave_overlay_h = 0;
+}
+
+/*
+ *  rave_has_active_overlay - true iff RAVE currently holds a vended overlay.
+ *  Used by the gfxaccel_resources fan-out attach/detach handlers (in
+ *  rave_engine.cpp) to decide whether to pre-vend on mode-enter / release
+ *  on mode-exit.
+ */
+extern "C" int rave_has_active_overlay(void)
+{
+	return (s_rave_overlay_tex != nil) ? 1 : 0;
+}
+
+/*
+ *  rave_get_overlay_dims - export current overlay dimensions for the
+ *  fan-out attach handler (so it can re-vend at the previously-active
+ *  resolution if RAVE was active before the mode switch). Returns 0 if
+ *  RAVE has no active overlay.
+ */
+extern "C" int rave_get_overlay_dims(uint32_t *outW, uint32_t *outH)
+{
+	if (s_rave_overlay_tex == nil) return 0;
+	if (outW) *outW = s_rave_overlay_w;
+	if (outH) *outH = s_rave_overlay_h;
+	return 1;
+}
+
+/*
+ *  rave_release_overlay_for_detach - external entry to release the cached
+ *  overlay (called from gfxaccel_resources fan-out detach handler).
+ */
+extern "C" void rave_release_overlay_for_detach(void)
+{
+	rave_release_overlay_texture();
+}
 
 void RaveCreateMetalOverlay(int32_t left, int32_t top, int32_t width, int32_t height)
 {
-	// Check if compositor already has an overlay texture of the right size
-	if (MetalCompositorGetOverlayTexture() != nullptr) {
-		RAVE_LOG("RaveCreateMetalOverlay: reusing existing compositor overlay texture");
-		MetalCompositorSetOverlayRect(left, top, width, height);
-		MetalCompositorSetOverlayActive(1);
+	id<MTLTexture> tex = rave_acquire_overlay_texture((uint32_t)width, (uint32_t)height);
+	if (tex == nil) {
+		RAVE_LOG("RaveCreateMetalOverlay: vend(%dx%d) FAILED", width, height);
 		return;
 	}
-
-	// Request offscreen texture from compositor
-	int result = MetalCompositorCreateOverlayTexture(width, height);
-	if (result != 0) {
-		RAVE_LOG("RaveCreateMetalOverlay: MetalCompositorCreateOverlayTexture(%d,%d) FAILED", width, height);
-		return;
-	}
-
-	MetalCompositorSetOverlayRect(left, top, width, height);
-	MetalCompositorSetOverlayActive(1);
-	RAVE_LOG("RaveCreateMetalOverlay: using compositor offscreen texture %dx%d at (%d,%d)", width, height, left, top);
+	s_rave_dst_left   = left;
+	s_rave_dst_top    = top;
+	s_rave_dst_width  = width;
+	s_rave_dst_height = height;
+	/* Declare RAVE as the active owner so DMC subscribers / snapshot
+	 * readers know which engine drives mode semantics. The idempotent
+	 * early-return makes this a fast no-op when owner already matches. */
+	(void)dmc_set_active_owner(kDMCOwnerRAVE);
+	RAVE_LOG("RaveCreateMetalOverlay: vended overlay %dx%d at (%d,%d)", width, height, left, top);
 }
 
 
 void RaveDestroyMetalOverlay(void)
 {
-	RAVE_LOG("RaveDestroyMetalOverlay: deactivating compositor overlay");
-	MetalCompositorSetOverlayActive(0);
-}
-
-
-
-/*
- *  Deferred overlay destruction
- *
- *  Prevents flicker during rapid context create/destroy cycles (e.g., RAVE Bench
- *  windowed mode). Instead of immediately destroying the overlay when the last
- *  context is deleted, we schedule destruction after ~100ms. If a new context
- *  is created within that window, the destroy is cancelled and the overlay reused.
- */
-
-static bool pending_overlay_destroy_scheduled = false;
-static bool pending_overlay_destroy_cancelled = false;
-
-void RaveScheduleDeferredOverlayDestroy(void)
-{
-	if (pending_overlay_destroy_scheduled) {
-		RAVE_LOG("DeferredOverlayDestroy: already scheduled, skipping");
-		return;
-	}
-	pending_overlay_destroy_scheduled = true;
-	pending_overlay_destroy_cancelled = false;
-
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-	               dispatch_get_main_queue(), ^{
-		if (pending_overlay_destroy_cancelled) {
-			RAVE_LOG("DeferredOverlayDestroy: was cancelled, skipping");
-		} else if (accel_overlay_refcount > 0) {
-			RAVE_LOG("DeferredOverlayDestroy: refcount is %d, skipping (defense-in-depth)", accel_overlay_refcount);
-		} else {
-			RAVE_LOG("DeferredOverlayDestroy: firing -- destroying overlay");
-			RaveClearOverlayToTransparent();
-			RaveDestroyMetalOverlay();
-		}
-		pending_overlay_destroy_scheduled = false;
-		pending_overlay_destroy_cancelled = false;
-	});
-	RAVE_LOG("DeferredOverlayDestroy: scheduled (100ms)");
-}
-
-void RaveCancelDeferredOverlayDestroy(void)
-{
-	if (pending_overlay_destroy_scheduled) {
-		pending_overlay_destroy_cancelled = true;
-		RAVE_LOG("DeferredOverlayDestroy: cancelled -- reusing overlay");
-	}
+	RAVE_LOG("RaveDestroyMetalOverlay: releasing per-engine overlay");
+	rave_release_overlay_texture();
+	/* Return ownership to QuickDraw (2D framebuffer) so DMC reflects the
+	 * post-3D state. */
+	(void)dmc_set_active_owner(kDMCOwnerQuickDraw);
 }
 
 
 /*
- *  Overlay reference counting
+ *  RaveClearOverlayToTransparent - release the per-engine overlay.
  *
- *  The overlay texture is shared between RAVE and GL engines.
- *  Each engine retains the overlay when it creates a context and releases
- *  when the context is destroyed. Deferred destroy only fires at refcount 0.
- */
-
-void RaveOverlayRetain(void)
-{
-	accel_overlay_refcount++;
-	pending_overlay_destroy_cancelled = true;  // cancel any pending deferred destroy
-	RAVE_LOG("RaveOverlayRetain: refcount now %d", accel_overlay_refcount);
-}
-
-void RaveOverlayRelease(void)
-{
-	accel_overlay_refcount--;
-	if (accel_overlay_refcount <= 0) {
-		accel_overlay_refcount = 0;
-		RAVE_LOG("RaveOverlayRelease: refcount reached 0, scheduling deferred destroy");
-		RaveScheduleDeferredOverlayDestroy();
-	} else {
-		RAVE_LOG("RaveOverlayRelease: refcount now %d", accel_overlay_refcount);
-	}
-}
-
-
-/*
- *  RaveClearOverlayToTransparent - deactivate the compositor overlay
- *
- *  Called when the last RAVE context is deleted. With the offscreen texture
- *  architecture, we simply deactivate the overlay so the compositor skips the
- *  3D compositing pass. The texture content becomes stale but invisible.
+ *  Called when the last RAVE context is deleted. With per-engine vending,
+ *  there's no shared overlay to "clear to transparent" —
+ *  releasing the texture removes RAVE's contribution from the next
+ *  SubmitFrame entirely (no overlay layer is emitted when s_rave_overlay_tex
+ *  is nil).
  */
 void RaveClearOverlayToTransparent(void)
 {
-	MetalCompositorSetOverlayActive(0);
-	RAVE_LOG("Overlay deactivated (clear to transparent)");
+	rave_release_overlay_texture();
+	/* Return ownership to QuickDraw on late overlay cleanup. */
+	(void)dmc_set_active_owner(kDMCOwnerQuickDraw);
+	RAVE_LOG("Overlay released (clear to transparent)");
 }
 
 
@@ -474,7 +570,7 @@ static void BuildPipelines(id<MTLDevice> device, id<MTLLibrary> lib,
  *  EnsureMSAAResources - lazy allocation of 4x MSAA textures and pipelines
  *
  *  Called on first frame that requests MSAA. Creates multisample color and
- *  depth textures plus 24 MSAA pipeline variants.
+ *  depth textures plus 48 MSAA pipeline variants.
  */
 static void EnsureMSAAResources(RaveDrawPrivate *priv)
 {
@@ -522,23 +618,67 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	priv->metal = ms;
 
 	// Get device from shared Metal device (compositor owns the device lifecycle).
+#ifdef TESTING_BUILD
+	if (rave_testing_device != nil) {
+		ms->device = rave_testing_device;
+	} else {
+#endif
 	ms->device = (__bridge id<MTLDevice>)SharedMetalDevice();
+#ifdef TESTING_BUILD
+	}
+#endif
 	if (!ms->device) {
 		RAVE_LOG("RaveInitMetalResources: SharedMetalDevice failed");
 		return;
 	}
 
-	// Cache the compositor's offscreen overlay texture
-	ms->overlayTexture = (__bridge id<MTLTexture>)MetalCompositorGetOverlayTexture();
+	// Initialize RAVE ring buffer for per-draw vertex staging.
+	// Replaces 15+ newBufferWithBytes: calls per frame with ring sub-allocation.
+#ifdef TESTING_BUILD
+	if (rave_testing_device == nil) {
+		// Only init ring buffer in production -- tests don't need it
+		gfxaccel_rave_ring_init();
+	}
+#else
+	gfxaccel_rave_ring_init();
+#endif
 
+	// Cache RAVE's per-engine overlay texture (vended via gfxaccel_resources;
+	// replaces the legacy compositor-allocated overlay path).
+	// May be nil here at first init - NativeRenderStart re-fetches per frame.
+	ms->overlayTexture = s_rave_overlay_tex;
+
+#ifdef TESTING_BUILD
+	if (rave_testing_queue != nil) {
+		ms->commandQueue = rave_testing_queue;
+	} else {
+#endif
 	ms->commandQueue = [ms->device newCommandQueue];
+#ifdef TESTING_BUILD
+	}
+#endif
 
 	// Load pre-compiled shader library (.metallib)
-	id<MTLLibrary> lib = [ms->device newDefaultLibrary];
+	id<MTLLibrary> lib = nil;
+#ifdef TESTING_BUILD
+	if (rave_testing_bundle != nil) {
+		NSError *err = nil;
+		lib = [ms->device newDefaultLibraryWithBundle:(NSBundle *)rave_testing_bundle error:&err];
+		if (!lib) {
+			RAVE_LOG("RaveInitMetalResources: newDefaultLibraryWithBundle failed: %s",
+			         err ? [[err localizedDescription] UTF8String] : "unknown");
+			return;
+		}
+	} else {
+#endif
+	lib = [ms->device newDefaultLibrary];
 	if (!lib) {
 		RAVE_LOG("RaveInitMetalResources: newDefaultLibrary failed (no .metallib?)");
 		return;
 	}
+#ifdef TESTING_BUILD
+	}
+#endif
 	ms->shaderLibrary = lib;
 
 	// Create vertex descriptor: position(float4), color(float4), texcoord(float2)
@@ -664,6 +804,9 @@ void RaveReleaseMetalResources(RaveDrawPrivate *priv)
 	RaveMetalState *ms = priv->metal;
 	if (!ms) return;
 
+	// Release RAVE ring buffer.
+	gfxaccel_rave_ring_shutdown();
+
 	// LIFECYCLE AUDIT (M003/S04/T02): All Metal resource types verified:
 	// (1) RTT texture handles: freed from resource table (created by this context)
 	// (2) 48+48 pipeline states: nil'd (ARC releases)
@@ -674,6 +817,7 @@ void RaveReleaseMetalResources(RaveDrawPrivate *priv)
 	// (7) MSAA textures + pipelines: nil'd (ARC releases)
 	// (8) Depth buffer, shader library, vertex descriptor: nil'd (ARC releases)
 	// (9) Command queue, device, command buffers: nil'd (ARC releases)
+	// (10) RAVE ring buffer: shutdown'd
 
 	// Free RTT (render-to-texture) handles created by this draw context
 	for (uint32_t rttHandle : ms->rttTextureHandles) {
@@ -878,7 +1022,10 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 			[ms->currentEncoder setRenderPipelineState:selectedPipeline];
 			ms->currentPipelineIdx = pipe_idx;
 		} else {
-			// Check if channel mask requires a masked pipeline variant
+			// Channel mask applied uniformly in all draw paths.
+			// Test: RAVERenderingStateTests.testChannelMask_RedOnly
+			// Paths covered: ApplyDirtyState (all Draw* methods), FlushZSortBuffer,
+			// NativeDrawBitmap, NativeClearDrawBuffer.
 			uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask, default 0xF (all)
 			if (channelMask != 0xF && channelMask != 0) {
 				id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
@@ -1093,7 +1240,7 @@ static void ConvertGouraudVertex(uint32 srcAddr, RaveVertex *dst, bool perspZ) {
 
 	dst->uv[0] = 0.0f;
 	dst->uv[1] = 0.0f;
-	dst->uv[2] = invW;  // GAP-011: pass invW for fog depth computation
+	dst->uv[2] = invW;  // pass invW for fog depth computation
 	dst->uv[3] = 0.0f;
 }
 
@@ -1214,10 +1361,15 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 		[ms->currentEncoder setFragmentBytes:&fragUniforms length:sizeof(fragUniforms) atIndex:0];
 
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:batchVerts
-			                                            length:dataSize
-			                                           options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(batchVerts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				fprintf(stderr, "[RAVE Metal] ring buffer not available; skipping draw\n");
+				batchCount = 0;
+				return;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:batchVerts length:dataSize atIndex:0];
 		}
@@ -1254,9 +1406,17 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 			curTexOp = tri->textureOp;
 			curFilter = tri->filterMode;
 
-			id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
-			if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx])
-				[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+			// Apply channel mask in z-sort flush path (same as ApplyDirtyState)
+			uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask
+			if (channelMask != 0xF && channelMask != 0) {
+				id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
+				if (maskedPipe)
+					[ms->currentEncoder setRenderPipelineState:maskedPipe];
+			} else {
+				id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
+				if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx])
+					[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+			}
 
 			if (tri->textured && tri->textureMacAddr != 0) {
 				uint32_t tex_handle = RaveResourceFindByAddr(tri->textureMacAddr);
@@ -1492,8 +1652,14 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1513,8 +1679,14 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = count * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1532,8 +1704,14 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1557,8 +1735,14 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 
 		size_t dataSize = totalVerts * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:allVerts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(allVerts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:allVerts length:dataSize atIndex:0];
 		}
@@ -1579,8 +1763,14 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:allVerts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(allVerts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:allVerts length:dataSize atIndex:0];
 		}
@@ -1610,8 +1800,15 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = outIdx * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:expanded length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(expanded, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] expanded;
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:expanded length:dataSize atIndex:0];
 		}
@@ -1734,8 +1931,14 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1755,8 +1958,14 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = count * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1774,8 +1983,14 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -1798,8 +2013,14 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 
 		size_t dataSize = totalVerts * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:allVerts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(allVerts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:allVerts length:dataSize atIndex:0];
 		}
@@ -1820,8 +2041,14 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:allVerts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(allVerts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:allVerts length:dataSize atIndex:0];
 		}
@@ -1851,8 +2078,15 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		}
 		size_t dataSize = outIdx * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:expanded length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(expanded, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] expanded;
+				delete[] allVerts;
+				break;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:expanded length:dataSize atIndex:0];
 		}
@@ -2114,9 +2348,17 @@ int32 NativeDrawBitmap(uint32 drawContextAddr, uint32 vertexAddr, uint32 bitmapM
 	if (blend_mode < 0 || blend_mode > 2) blend_mode = 1;  // default Interpolate for bitmaps
 	int pipe_idx = 1 + blend_mode * 16;  // has_texture=1
 
-	id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
-	if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx]) {
-		[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+	// Apply channel mask in bitmap draw path (same as ApplyDirtyState)
+	uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask
+	if (channelMask != 0xF && channelMask != 0) {
+		id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
+		if (maskedPipe)
+			[ms->currentEncoder setRenderPipelineState:maskedPipe];
+	} else {
+		id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
+		if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx]) {
+			[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+		}
 	}
 
 	// Disable depth test for bitmap (ZFunction_Always = 7, no depth writes)
@@ -2219,8 +2461,14 @@ int32 NativeDrawTriMeshGouraud(uint32 drawContextAddr, uint32 numTriangles, uint
 	if (outIdx > 0) {
 		size_t dataSize = outIdx * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				return kQANoErr;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -2299,8 +2547,14 @@ int32 NativeDrawTriMeshTexture(uint32 drawContextAddr, uint32 numTriangles, uint
 	if (outIdx > 0) {
 		size_t dataSize = outIdx * sizeof(RaveVertex);
 		if (dataSize > 4096) {
-			id<MTLBuffer> buf = [ms->device newBufferWithBytes:verts length:dataSize options:MTLResourceStorageModeShared];
-			[ms->currentEncoder setVertexBuffer:buf offset:0 atIndex:0];
+			uint32_t ringOffset = 0;
+			void *ringBuf = gfxaccel_rave_ring_stage(verts, (uint32_t)dataSize, &ringOffset);
+			if (ringBuf) {
+				[ms->currentEncoder setVertexBuffer:(__bridge id<MTLBuffer>)ringBuf offset:ringOffset atIndex:0];
+			} else {
+				delete[] verts;
+				return kQANoErr;
+			}
 		} else {
 			[ms->currentEncoder setVertexBytes:verts length:dataSize atIndex:0];
 		}
@@ -2482,12 +2736,23 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 		return kQAError;
 	}
 
-	// Get the compositor's offscreen overlay texture
-	ms->overlayTexture = (__bridge id<MTLTexture>)MetalCompositorGetOverlayTexture();
-	if (!ms->overlayTexture) {
-		RAVE_LOG("NativeRenderStart: no overlay texture from compositor");
+	// Get RAVE's per-engine overlay texture (vended via
+	// gfxaccel_resources rather than allocated by the compositor).
+	// If the cached texture's dims don't match the context viewport,
+	// re-vend at the current viewport size so RAVE always renders into
+	// a correctly-sized overlay.
+	id<MTLTexture> overlay = rave_acquire_overlay_texture(
+	                              (uint32_t)priv->width, (uint32_t)priv->height);
+	if (overlay == nil) {
+		RAVE_LOG("NativeRenderStart: failed to acquire per-engine overlay texture");
 		return kQAError;
 	}
+	ms->overlayTexture = overlay;
+	/* Track the destination rect for SubmitFrame emission in NativeRenderEnd. */
+	s_rave_dst_left   = priv->left;
+	s_rave_dst_top    = priv->top;
+	s_rave_dst_width  = priv->width;
+	s_rave_dst_height = priv->height;
 
 	// Check if MSAA is requested
 	// kQAAntialias_Fast (1) = default, no MSAA
@@ -2615,10 +2880,14 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	// Fire kQAMethod_ImageBufferInitialize (selector 3) callback
 	FireNoticeMethod(priv, 3);
 
-	// Update the compositor overlay viewport to match the actual RAVE render
-	// dimensions. The overlay texture may be larger than the render viewport
-	// (e.g. game resizes its viewport after context creation).
-	MetalCompositorSetOverlayRect(priv->left, priv->top, priv->width, priv->height);
+	// SetOverlayRect is gone — destination rect now travels with
+	// each SubmitFrame's CompositeLayer (encoded in NativeRenderEnd from
+	// s_rave_dst_*). Update local cached dst rect in case the viewport
+	// changed after context creation.
+	s_rave_dst_left   = priv->left;
+	s_rave_dst_top    = priv->top;
+	s_rave_dst_width  = priv->width;
+	s_rave_dst_height = priv->height;
 
 	RAVE_LOG("RenderStart: ctx=0x%08x clear=(%.2f,%.2f,%.2f,%.2f) size=%dx%d",
 	         drawContextAddr,
@@ -2654,7 +2923,8 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 
 	[ms->currentEncoder endEncoding];
 
-	// GAP-018: Blit offscreen overlay content to RTT textures
+	// Offscreen overlay blitted to all RTT texture handles via MTLBlitCommandEncoder.
+	// Test: RAVESurfaceTests.testOffscreenOverlay_RTT_blit
 	if (!ms->rttTextureHandles.empty() && ms->overlayTexture) {
 		id<MTLBlitCommandEncoder> blit = [ms->currentCommandBuffer blitCommandEncoder];
 		id<MTLTexture> srcTex = ms->overlayTexture;
@@ -2676,12 +2946,21 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 		[blit endEncoding];
 	}
 
-	// DontSwap: with offscreen texture, the rendered content persists regardless.
-	// DontSwap just controls whether we log "committed" vs "frame complete".
-	// No presentDrawable — the compositor reads the offscreen texture on its next VBL.
+	// DELIBERATE: DontSwap is an intentional no-op beyond logging.
+	// With offscreen texture, the rendered content persists regardless and the
+	// command buffer commits unconditionally; DontSwap just controls whether we
+	// log "committed (DontSwap)" vs "frame committed to offscreen". There is no
+	// presentDrawable / held back-buffer to suppress — the compositor reads the
+	// offscreen overlay on its next VBL, so this is semantically equivalent to a
+	// true single-overlay DontSwap. Test: RAVEABITests.testDontSwap_intentionalNoOp
 	int32_t dont_swap = (int32_t)priv->state[32].i;
 
 	[ms->currentCommandBuffer commit];
+
+	// Signal ring buffer frame-end after commit.
+	// Advances to next ring slot and signals the semaphore so the slot
+	// can be reused after GPU work completes.
+	gfxaccel_rave_ring_frame_end();
 
 	ms->lastCommittedBuffer = ms->currentCommandBuffer;
 	ms->currentEncoder = nil;
@@ -2709,8 +2988,50 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 		         dont_swap ? "committed (DontSwap)" : "frame committed to offscreen");
 	}
 
-	// Throttle to VBL cadence — prevent 3D from outrunning the compositor
-	MetalCompositorSync3DFramePacing();
+	// Legacy 3D-frame-pacing throttle call deleted — SubmitFrame's hidden
+	// dispatch_semaphore(3) subsumes the sleep-based pacing. The throttle
+	// declaration remains in metal_compositor.h (still called by GL until
+	// GL migrates; later removed entirely).
+	//
+	// Emit a CompositeLayer for the just-rendered overlay via
+	// MetalCompositorSubmitFrame. The
+	// compositor sees this as a single kLayerSlotOverlay layer with
+	// premultiplied-alpha blend (RAVE always blends — see BuildPipelines
+	// audit comment ~line 575) over whatever the framebuffer currently
+	// shows. dmc_set_active_owner already declared RAVE in
+	// RaveCreateMetalOverlay; the idempotent fast-path handles the
+	// per-frame re-declaration.
+	if (s_rave_overlay_tex != nil) {
+		struct CompositeLayer layer;
+		layer.source       = (__bridge void *)s_rave_overlay_tex;
+		layer.src_origin_x = 0;
+		layer.src_origin_y = 0;
+		layer.src_size_w   = s_rave_overlay_w;
+		layer.src_size_h   = s_rave_overlay_h;
+		layer.dst_origin_x = (float)s_rave_dst_left;
+		layer.dst_origin_y = (float)s_rave_dst_top;
+		layer.dst_size_w   = (float)s_rave_dst_width;
+		layer.dst_size_h   = (float)s_rave_dst_height;
+		layer.slot         = kLayerSlotOverlay;
+		layer.blend        = kBlendPremultiplied;
+		layer.alpha        = 1.0f;
+
+		const struct DMCModeSnapshot *snap = dmc_current_snapshot();
+		struct FrameDescriptor desc;
+		desc.layers               = &layer;
+		desc.layer_count          = 1;
+		desc.generation           = snap ? snap->generation : 0;
+		desc.vbl_tick_target_usec = 0;
+
+		int32_t err = MetalCompositorSubmitFrame(&desc);
+		if (err == kGfxAccelErrStaleGeneration) {
+			RAVE_LOG("RenderEnd: SubmitFrame stale generation; dropping frame");
+		} else if (err != kGfxAccelNoErr) {
+			RAVE_LOG("RenderEnd: SubmitFrame returned %d", err);
+		}
+		/* Re-declare RAVE owner — fast no-op when already RAVE. */
+		(void)dmc_set_active_owner(kDMCOwnerRAVE);
+	}
 
 	return kQANoErr;
 }
@@ -2721,8 +3042,9 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
  *
  *  Explicitly presents the held drawable from a DontSwap RenderEnd.
  *  If no drawable is held (DontSwap was not set), this is a no-op.
- *  GAP-019: dirtyRect parameter intentionally ignored -- Metal always presents full drawable;
- *  partial present is not supported by the Metal API
+ *  DELIBERATE: Metal CAMetalLayer.presentDrawable always presents the full
+ *  drawable. Partial present is not supported by the Metal API. QD3D 1.6 spec §Present allows
+ *  implementation-defined behavior. Test: RAVESurfaceTests.testDirtyRect_present_deliberate
  *  PPC args: r3=drawContextAddr
  */
 int32 NativeSwapBuffers(uint32 drawContextAddr)
@@ -2767,11 +3089,10 @@ int32 NativeBusy(uint32 drawContextAddr)
  *  PPC args: r3=drawContextAddr
  *  Returns: Mac address of new texture resource (TQATexture*)
  *
- *  GAP-017: The RAVE 1.6 spec includes a flags parameter (Lock/Mipmap bits)
- *  in TQATextureNewFromDrawContext. These flags are not meaningful for
- *  render-to-texture -- Metal manages GPU memory directly, and RTT textures
- *  don't need client-side locking or mipmaps. Intentionally ignored per spec
- *  flexibility. The PPC thunk passes only drawContextAddr (r3).
+ *  DELIBERATE: Lock and Mipmap flags intentionally ignored for RTT textures.
+ *  Metal manages GPU memory directly; lock semantics are a software rendering artifact.
+ *  QD3D 1.6 spec allows engine-specific interpretation of these hints.
+ *  Test: RAVESurfaceTests.testLockMipmap_documented
  */
 uint32 NativeTextureNewFromDrawContext(uint32 drawContextAddr)
 {
@@ -2923,6 +3244,9 @@ int32 NativeRenderAbort(uint32 drawContextAddr)
 	[ms->currentEncoder endEncoding];
 	// Must commit even on abort per Metal rules
 	[ms->currentCommandBuffer commit];
+
+	// Signal ring buffer frame-end on abort too.
+	gfxaccel_rave_ring_frame_end();
 
 	ms->currentEncoder = nil;
 	ms->currentCommandBuffer = nil;
@@ -3232,7 +3556,9 @@ int32_t NativeAccessDrawBufferEnd(uint32_t drawContextAddr, uint32_t dirtyRectAd
 	NSUInteger h = drawableTexture.height;
 	uint32_t rowBytes = (uint32_t)(w * 4);
 
-	// GAP-021: Use dirtyRect to limit upload region when provided
+	// dirtyRect partial upload implemented — replaceRegion limited to dirty sub-rect.
+	// Coordinates clamped to texture dimensions before upload (T-08-09 mitigation).
+	// Test: RAVESurfaceTests.testDirtyRect_upload
 	NSUInteger uploadX = 0, uploadY = 0, uploadW = w, uploadH = h;
 	if (dirtyRectAddr != 0) {
 		// RAVE dirtyRect: top(int16), left(int16), bottom(int16), right(int16) -- Rect format
@@ -3418,7 +3744,7 @@ int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint3
 	clearScissor.height = (NSUInteger)(bottom - top);
 	[ms->currentEncoder setScissorRect:clearScissor];
 	int pipe_idx = 0;
-	// GAP-024: Apply channel mask from state[27] (kQATag_ChannelMask, default 0xF = all)
+	// Apply channel mask from state[27] (kQATag_ChannelMask, default 0xF = all)
 	uint32_t channelMask = priv->state[27].i;
 	if (channelMask == 0) channelMask = 0xF;  // treat 0 as default (all channels)
 	if (channelMask != 0xF) {
@@ -3476,7 +3802,8 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 	RaveMetalState *ms = priv->metal;
 	if (!ms->renderPassActive || !ms->currentEncoder) return kQAError;
 
-	// GAP-025: ZBufferMask=0 means depth writes disabled; skip clear per spec
+	// ZBufferMask=0 skips depth clear per kQAZBufferMask_Disable spec.
+	// Test: RAVERenderingStateTests.testZBufferMask_skipClear
 	if (priv->state[28].i == 0) {
 		RAVE_LOG("ClearZBuffer: skipped (ZBufferMask=0, depth writes disabled)");
 		return kQANoErr;
@@ -3673,18 +4000,34 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 	uint32_t h = entry->height;
 	uint32_t pixelType = entry->pixel_type;
 	uint32_t rowBytes = entry->row_bytes;
+
+	// Prefer cpu_pixel_data when a
+	// Q3Pixmap_Set_Image intercept has populated it. Same logic as
+	// RaveRealizeDeferredTexture — the pixmap_mac_addr path reads
+	// potentially-stale heap data for titles (e.g. Bugdom) that
+	// free the source buffer after QATextureNew.
 	uint32_t pixmap = entry->pixmap_mac_addr;
+	if (entry->cpu_pixel_data_is_authoritative &&
+	    entry->cpu_pixel_mac_addr != 0 &&
+	    entry->cpu_pixel_data_size > 0) {
+		pixmap = entry->cpu_pixel_mac_addr;
+	}
 
 	// Always re-read and re-upload — the pixmap is a live buffer
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
 
-	// Check if any non-black pixels exist
+	// Check if any non-black pixels exist.
+	//
+	// Also test the alpha channel
+	// (expanded[off+3]). Same rationale as the sibling check in
+	// RaveRealizeDeferredTexture — ARGB16 sprites with transparent-border
+	// top scanlines have alpha-dense but RGB-zero pixels.
 	bool hasData = false;
 	uint32_t sampleCount = (w * h < 256) ? w * h : 256;
 	for (uint32_t i = 0; i < sampleCount && !hasData; i++) {
 		uint32_t off = i * 4;
-		if (expanded[off] != 0 || expanded[off+1] != 0 || expanded[off+2] != 0) {
+		if (expanded[off] != 0 || expanded[off+1] != 0 || expanded[off+2] != 0 || expanded[off+3] != 0) {
 			hasData = true;
 		}
 	}
@@ -3697,7 +4040,10 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 	delete[] expanded;
 
 	if (hasData) {
-		// Data arrived — stop re-uploading
+		// Data arrived — stop re-uploading. Under R2 authoritative read
+		// path `pixmap == cpu_pixel_mac_addr`, so this copy is a no-op
+		// (self-copy). Under the classic path it mirrors the pixmap data
+		// into cpu_pixel_data for AccessTexture consumers.
 		if (entry->cpu_pixel_data && entry->cpu_pixel_mac_addr) {
 			Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 		}

@@ -31,6 +31,21 @@ void *SharedMetalDevice(void);
  * Implicitly creates the device if not yet initialised. */
 void *SharedMetalCommandQueue(void);
 
+/* Install debug-only command buffer error handler.
+ * cmdBufPtr is void* pointing to id<MTLCommandBuffer>.
+ * In DEBUG builds, adds a completedHandler that asserts on non-nil error.
+ * In Release builds, this is a no-op. */
+void MetalValidation_InstallErrorHandler(void *cmdBufPtr);
+
+#ifdef TESTING_BUILD
+/* Test-only introspection: returns 1 if the last command buffer error
+ * handler fired, 0 otherwise. Only available under TESTING_BUILD + DEBUG. */
+uint32_t MetalValidation_TestingDidFireError(void);
+
+/* Test-only reset: clears the last-validation-error-fired flag. */
+void MetalValidation_TestingReset(void);
+#endif /* TESTING_BUILD */
+
 #ifdef __cplusplus
 }
 #endif

@@ -124,8 +124,15 @@ enum {
 	kRaveHookAccessTextureEnd = 217,  // QAAccessTextureEnd hook
 	kRaveHookAccessBitmap     = 218,  // QAAccessBitmap hook
 	kRaveHookAccessBitmapEnd  = 219,  // QAAccessBitmapEnd hook
+	// Q3Pixmap_Set_Image intercept. Dispatch
+	// sub-opcode only — the activation path (FindLibSymbol hook on the
+	// QuickDraw 3D library fragment) is deferred to a follow-up phase.
+	// When activated, the PPC thunk dispatches here with
+	// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount. Tests invoke
+	// NativeHookQ3PixmapSetImage directly (no dispatch round-trip).
+	kRaveHookQ3PixmapSetImage = 220,  // Q3Pixmap_Set_Image intercept (deferred activation)
 
-	kRaveHookCount            = 20
+	kRaveHookCount            = 21
 };
 
 // ATI RaveExtFuncs sub-opcodes (300-303)
@@ -239,6 +246,15 @@ extern void RaveThunksInit(void);
 // Receives PPC registers r3-r8 as arguments, returns value for gpr(3)
 extern uint32_t RaveDispatch(uint32_t r3, uint32_t r4, uint32_t r5,
                              uint32_t r6, uint32_t r7, uint32_t r8);
+
+// @autoreleasepool wrapper around RaveDispatch (defined in
+// gfxaccel_arc_shim.mm).  Called from sheepshaver_glue.cpp:NATIVE_RAVE_DISPATCH
+// in place of direct RaveDispatch so the emul thread drains autoreleased
+// MTL*/NS* temporaries every dispatch call.  Fixes Nanosaur steady-state
+// memory growth.
+extern uint32_t RaveDispatchARC(uint32_t r3, uint32_t r4, uint32_t r5,
+                                uint32_t r6, uint32_t r7, uint32_t r8);
+
 
 // Engine registration entry point (implemented in plan 02)
 extern void RaveRegisterEngine(void);
@@ -389,7 +405,7 @@ static constexpr bool rave_logging_enabled = false;
 /*
  *  Resource handle table for dummy texture/bitmap/color table resources.
  *  Same pattern as draw context table (1-based handles, fixed size).
- *  Phase 4 upgrades entries to hold real Metal textures.
+ *  Entries hold real Metal textures.
  */
 enum RaveResourceType {
 	kRaveResourceFree = 0,
@@ -402,7 +418,7 @@ struct RaveResourceEntry {
 	RaveResourceType type;
 	uint32_t         mac_addr;   // SheepMem address visible to PPC side
 
-	// Phase 4: Metal texture data
+	// Metal texture data
 	void            *metal_texture;   // id<MTLTexture> stored as void* for C++ header
 	uint32_t         pixel_type;      // kQAPixel_* value
 	uint32_t         width;
@@ -412,7 +428,7 @@ struct RaveResourceEntry {
 	uint32_t         original_size;   // size of original_pixels buffer
 	uint32_t         row_bytes;       // original row bytes for level 0
 	uint32_t         bound_clut;      // resource handle of bound color table (0 = none)
-	uint16_t         priority;        // GAP-010: priority bits from flags >> 16 (per RAVE 1.6 spec)
+	uint8_t          priority;        // 4-bit priority (0-15) from bits [31:28] per RAVE 1.6 spec
 	uint32_t         pixmap_mac_addr; // deferred: Mac address of pixel data (indexed textures)
 	bool             pixels_copied;   // true once pixel data has been copied (at Detach time)
 
@@ -420,6 +436,17 @@ struct RaveResourceEntry {
 	uint8_t         *cpu_pixel_data;       // permanent CPU copy in original Mac format
 	uint32_t         cpu_pixel_data_size;   // total bytes
 	uint32_t         cpu_pixel_mac_addr;    // Mac-visible address (for PPC access)
+
+	// Q3Pixmap_Set_Image intercept. When set to true by
+	// NativeHookQ3PixmapSetImage, the draw-time read paths
+	// (RaveRealizeDeferredTexture, RaveRefreshTextureFromPixmap) must
+	// prefer cpu_pixel_data over pixmap_mac_addr — cpu_pixel_data holds
+	// the synchronously-copied "authoritative" pixels and the
+	// pixmap_mac_addr Mac heap region may have been freed by the game
+	// (classic-Mac lifecycle pattern). Stays false for textures where
+	// no Set_Image intercept ever fires; those keep the existing
+	// pixmap_mac_addr read path.
+	bool             cpu_pixel_data_is_authoritative;
 
 	// Color table specific fields
 	uint32_t        *clut_data;       // expanded BGRA32 palette (256 or 16 entries)
@@ -440,12 +467,60 @@ extern RaveResourceEntry *RaveResourceGet(uint32_t handle);
 // Lookup by Mac address. Returns 1-based handle, or 0 if not found.
 extern uint32_t RaveResourceFindByAddr(uint32_t mac_addr);
 
+// Lookup a RAVE texture entry whose
+// pixmap_mac_addr matches `pixmapAddr`. Returns nullptr if no match
+// (most common case — not every Q3Pixmap is tracked by a RAVE texture).
+// O(n) over rave_resource_table[0..RAVE_MAX_RESOURCES-1]; n is bounded
+// small (512) so this is cheap enough to run from the Q3Pixmap_Set_Image
+// intercept callback. Thread-safety: callers must hold the same
+// invariant as the existing RaveResource* API (single-threaded RAVE
+// dispatch).
+extern RaveResourceEntry *RaveFindTextureByPixmapAddr(uint32_t pixmapAddr);
+
+// Q3Pixmap_Set_Image intercept callback.
+// When the emulated game writes sprite pixels through Q3Pixmap_Set_Image,
+// the FindLibSymbol-based hook (deferred activation) calls this function
+// to synchronously copy the pixels into
+// the RAVE engine's cpu_pixel_data buffer before the Mac heap region
+// gets freed / recycled.
+//
+// Arguments:
+//   pixmapAddr  - Mac address of the target pixmap storage (the buffer
+//                 the game will later free). We look this up against
+//                 every RAVE texture's captured pixmap_mac_addr.
+//   srcHostAddr - Mac address of the source pixel data (the caller-side
+//                 buffer containing the real PICT-decoded pixels). Copied
+//                 into cpu_pixel_data via Host2Mac_memcpy.
+//   byteCount   - Number of bytes to copy (bounded by the receiving
+//                 entry's cpu_pixel_data_size).
+//
+// If no RAVE texture is tracking `pixmapAddr`, returns silently (the
+// write is unrelated to any RAVE-managed texture — common case). If a
+// match is found and the entry has a valid cpu_pixel_data allocation,
+// copies min(byteCount, cpu_pixel_data_size) bytes and sets
+// cpu_pixel_data_is_authoritative = true. Tests call this directly from
+// the harness (no PPC dispatch round-trip) to simulate what the
+// activation-path hook would do on a live Bugdom binary.
+extern void NativeHookQ3PixmapSetImage(uint32_t pixmapAddr,
+                                        uint32_t srcHostAddr,
+                                        uint32_t byteCount);
+
 // Deferred texture creation: creates Metal texture from current Mac memory contents.
 // Called at first draw-time use when metal_texture is nullptr and pixmap_mac_addr is set.
 extern void RaveRealizeDeferredTexture(RaveResourceEntry *entry);
 extern void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry);
 extern bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
                           uint32_t width, uint32_t height, uint32_t rowBytes);
+
+// Test-harness convenience. ConvertPixels
+// variant that reads from a host-side pointer instead of a Mac address.
+// Used by RAVETextureLifecycleTests to exercise the realize/refresh
+// paths on PSFakeMacRAM-backed storage without standing up a full PPC
+// emulator. Production code continues to use ConvertPixels (the Mac
+// address variant).
+extern bool ConvertPixelsFromHost(uint32_t pixelType, const uint8_t *srcHost,
+                                   uint8_t *dst, uint32_t width,
+                                   uint32_t height, uint32_t rowBytes);
 
 /*
  *  Engine method dispatch functions (called from rave_dispatch.cpp)

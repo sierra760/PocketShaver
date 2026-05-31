@@ -136,14 +136,14 @@ class PreferencesAdvancedViewController: UITableViewController {
 				}
 			case .emulationIgnoreIllegalInstructions:
 				return PreferencesEnabledSettingCell(
-					title: "Ignore illegal instructions",
+					title: "Ignore illegal instructions (developer testing)",
 					isOn: model.ignoreIllegalInstructions
 				) { [weak self] isOn in
 					self?.model.ignoreIllegalInstructions = isOn
 				}
 			case .emulationIgnoreIllegalInstructionsInfo:
 				return PreferencesInformationCell(
-					text: "When enabled, unrecognized PowerPC instructions are skipped instead of crashing the emulator. May improve compatibility with some apps.",
+					text: "Developer testing -- masks real PPC bugs. When enabled, unrecognized PowerPC instructions are skipped instead of crashing. May produce 'kind of works' behavior. Leave OFF for accurate testing.",
 					separatorHidden: false
 				)
 			case .relateiveMouseModeSetting:

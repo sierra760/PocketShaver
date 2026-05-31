@@ -38,6 +38,10 @@
 
 #include "MiscellaneousSettingsObjCCppHeader.h"
 
+#if TARGET_OS_IPHONE
+#include "display_mode_controller.h"
+#endif
+
 #define DEBUG 0
 #include "debug.h"
 
@@ -242,6 +246,11 @@ static int16 set_gamma(VidLocals *csSave, uint32 gamma)
 			mac_gamma[i].red = mac_gamma[i].green = mac_gamma[i].blue = i;
 		}
 		video_set_gamma(256);
+#if TARGET_OS_IPHONE
+		// Bump DMC gamma_gen so subscribers can observe the linear-ramp change
+		// (DMC seam — additive to the existing video_set_gamma path).
+		dmc_record_gamma_change();
+#endif
 	} else { // User-supplied gamma table
 
 		// Validate header
@@ -299,6 +308,11 @@ static int16 set_gamma(VidLocals *csSave, uint32 gamma)
 			}
 		}
 		video_set_gamma(data_cnt);
+#if TARGET_OS_IPHONE
+		// Bump DMC gamma_gen so subscribers can observe the custom-ramp change
+		// (DMC seam — additive to the existing video_set_gamma path).
+		dmc_record_gamma_change();
+#endif
 	}
 	return noErr;
 }

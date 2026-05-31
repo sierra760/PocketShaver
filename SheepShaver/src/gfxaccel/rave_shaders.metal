@@ -182,22 +182,32 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         }
     }
 
+    // Fog invW depth z=1/invW and all 5 fog modes verified against RAVE.h.
+    // Test: RAVERenderingStateTests.testFogLinear, testFogExponential, testFogExponentialSquared
+    // FogMode_Alpha uses vertex alpha as fog factor, output alpha=1.0 per spec.
+    // Test: RAVERenderingStateTests.testFogAlpha
+    //
     // Fog SECOND (applied only to surviving fragments)
+    // FogMode_None(0): no fog
+    // FogMode_Alpha(1): fog_factor = vertex.alpha, then alpha = 1.0
+    // FogMode_Linear(2): z = 1/invW, fog = (end - z) / (end - start)
+    // FogMode_Exponential(3): z = 1/invW, fog = exp(-density * z)
+    // FogMode_ExponentialSquared(4): z = 1/invW, fog = exp(-(density*z)^2)
     if (has_fog) {
         float fog_factor = 1.0;
         if (uniforms.fog_mode == 1) {
             // Alpha-based fog: vertex alpha IS the fog interpolation factor
             fog_factor = color.a;
         } else if (uniforms.fog_mode == 2) {
-            // Linear fog -- GAP-011: use invW-based depth when available
+            // Linear fog: z = 1/invW, fog = clamp((end - z) / (end - start), 0, 1)
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             fog_factor = clamp((uniforms.fog_end - z) / (uniforms.fog_end - uniforms.fog_start), 0.0, 1.0);
         } else if (uniforms.fog_mode == 3) {
-            // Exponential fog -- GAP-011: use invW-based depth when available
+            // Exponential fog: z = 1/invW, fog = clamp(exp(-density * z), 0, 1)
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             fog_factor = clamp(exp(-uniforms.fog_density * z), 0.0, 1.0);
         } else if (uniforms.fog_mode == 4) {
-            // Exponential squared fog -- GAP-011: use invW-based depth when available
+            // Exponential squared fog: z = 1/invW, fog = clamp(exp(-(density*z)^2), 0, 1)
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             float dz = uniforms.fog_density * z;
             fog_factor = clamp(exp(-dz * dz), 0.0, 1.0);
@@ -205,7 +215,7 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         float3 fog_color = float3(uniforms.fog_color_r, uniforms.fog_color_g, uniforms.fog_color_b);
         color.rgb = mix(fog_color, color.rgb, fog_factor);
         if (uniforms.fog_mode == 1) {
-            color.a = 1.0;  // GAP-013: FogMode_Alpha disables vertex alpha blending
+            color.a = 1.0;  // FogMode_Alpha disables vertex alpha blending per spec
         }
     }
 

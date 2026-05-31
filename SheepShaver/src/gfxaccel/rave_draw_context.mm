@@ -14,7 +14,7 @@
  *    - NativeSetFloat/SetInt/SetPtr: store state values by tag ID
  *    - NativeGetFloat/GetInt/GetPtr: retrieve state values by tag ID
  *
- *  ObjC++ (.mm) for future Metal integration in Plan 02.
+ *  ObjC++ (.mm) for future Metal integration.
  */
 
 #include "sysdeps.h"
@@ -189,7 +189,7 @@ static void InitStateDefaults(RaveDrawPrivate *ctx, uint32 flags)
  *
  *  The struct has 35 method pointer fields starting at offset 8.
  *  Fields 0-34 all map to draw method tags.
- *  Fields 26-33 are RAVE 1.6 buffer access/clear methods (Phase 6).
+ *  Fields 26-33 are RAVE 1.6 buffer access/clear methods.
  */
 static const int kDrawContextMethodFields = 35;
 
@@ -265,7 +265,7 @@ int32 NativeDrawPrivateNew(uint32 drawContextAddr, uint32 deviceAddr,
 	// Allocate vertex staging buffer
 	ctx->vertexStagingCapacity = 65536;
 	ctx->vertexStagingCount = 0;
-	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * 48]; // 48 bytes per vertex (Phase 4 layout)
+	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * 48]; // 48 bytes per vertex
 
 	// Allocate multi-texture UV staging buffer (parallel to vertexStagingBuffer)
 	// 16 bytes per vertex: uOverW2(4) + vOverW2(4) + invW2(4) + pad(4)
@@ -315,9 +315,11 @@ int32 NativeDrawPrivateNew(uint32 drawContextAddr, uint32 deviceAddr,
 	rave_context_count++;
 
 	// Initialize Metal overlay (viewport-sized) and per-context resources.
-	// RaveOverlayRetain cancels any pending deferred destroy internally.
+	// Shared-overlay retain call deleted — per-engine ownership
+	// via gfxaccel_resources eliminates the shared refcount model entirely.
+	// RaveCreateMetalOverlay vends a per-engine overlay texture from
+	// gfxaccel_resources directly.
 	RaveCreateMetalOverlay(ctx->left, ctx->top, ctx->width, ctx->height);
-	RaveOverlayRetain();
 	RaveInitMetalResources(ctx);
 
 	RAVE_LOG("DrawPrivateNew: handle=%d size=%dx%d contexts=%d",
@@ -382,12 +384,16 @@ int32 NativeDrawPrivateDelete(uint32 drawPrivateHandle)
 	delete ctx;
 	rave_context_count--;
 
-	// Release one overlay refcount per context delete, matching the per-context
-	// RaveOverlayRetain() in NativeDrawPrivateNew. RaveOverlayRelease schedules
-	// deferred destroy if refcount reaches 0.
-	RaveOverlayRelease();
+	// Overlay lifetime is scoped to the DMC MODE, not to draw-context churn.
+	// When the last RAVE context goes away, LEAVE the cached overlay alive.
+	// The gfxaccel_resources fan-out (RaveOnDetach in rave_engine.cpp) will
+	// release it on real mode changes, and RaveOnAttach will re-vend at the
+	// new resolution. Tearing down here caused visible black flashes on every
+	// Nanosaur scene transition (menu ↔ gameplay) because the host's main-
+	// thread VBL presented frames during the gap between destroy and the
+	// next DrawPrivateNew → RaveCreateMetalOverlay call.
 
-	// Clamp for safety (non-overlay purposes)
+	// Clamp for safety
 	if (rave_context_count <= 0) {
 		rave_context_count = 0;
 		rave_current_draw_context_addr = 0;

@@ -251,8 +251,8 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 			return (uint32)NativeSwapBuffers(r3);
 
 		default:
-			// Remaining draw methods are stubs
-			RAVE_LOG("RAVE draw stub: %s (tag %d)", draw_method_names[method_id], method_id);
+			// All 35 draw methods (0-34) have explicit case handlers. This default arm is unreachable dead code. Test: RAVEABITests.testStubLogLines_drawMethods_deadCode
+			__builtin_unreachable();
 			return kQANoErr;
 		}
 	}
@@ -323,7 +323,8 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 			return (uint32)NativeEngineAccessBitmapEnd(r3, r4);
 
 		default:
-			RAVE_LOG("RAVE engine stub: %s (tag %d)", engine_method_names[engine_index], method_id);
+			// All 18 engine methods (100-117) have explicit case handlers. This default arm is unreachable dead code. Test: RAVEABITests.testStubLogLines_engineMethods_deadCode
+			__builtin_unreachable();
 			return kQANoErr;
 		}
 	}
@@ -410,6 +411,17 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 		case kRaveHookAccessBitmapEnd:
 			// QAAccessBitmapEnd(engine, bitmap, dirtyRect)
 			return NativeHookAccessBitmapEnd(r3, r4, r5);
+
+		case kRaveHookQ3PixmapSetImage:
+			// Q3Pixmap_Set_Image intercept.
+			// Sub-opcode 220. Dispatch entry wired in; the FindLibSymbol
+			// activation path (hook on the QuickDraw 3D library
+			// fragment) is deferred. Tests call NativeHookQ3PixmapSetImage
+			// directly (no dispatch round-trip), so this arm is reached
+			// only once the activation path lands.
+			// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount
+			NativeHookQ3PixmapSetImage(r3, r4, r5);
+			return kQANoErr;
 
 		default:
 			RAVE_LOG("RAVE: unknown hook sub-opcode %d", method_id);

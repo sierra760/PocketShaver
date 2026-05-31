@@ -25,6 +25,7 @@
 #include "video_defs.h"
 #include "rave_engine.h"
 #include "gl_engine.h"
+#include "dsp_engine.h"
 #include "nqd_accel.h"
 
 #define DEBUG 0
@@ -439,8 +440,25 @@ bool NQD_bitblt_hook(uint32 p)
 		ReadMacInt32(p + acclSrcPixelSize) == ReadMacInt32(p + acclDestPixelSize) &&
 		(int32)(ReadMacInt32(p + acclSrcRowBytes) ^ ReadMacInt32(p + acclDestRowBytes)) >= 0) {
 		const uint32 mode = ReadMacInt32(p + acclTransferMode);
-		if (mode <= 7 || (mode >= 32 && mode <= 39) || mode == 50) {
-			// All transfer modes via Metal — no pre-check on 0x018, 0x128, 0x130, 0x15c
+		// The colorizing Boolean SOURCE modes
+		// (1, 3-7 — srcOr/srcBic/notSrcCopy/notSrcOr/notSrcXor/notSrcBic) at a
+		// COLOUR depth (multi-bit source, acclSrcPixelSize >= 8) are the general
+		// multi-bit-colour-source-under-a-Boolean-op case, whose Color-QuickDraw
+		// semantics are defined only for 1-bit-style sources (rare/ill-defined
+		// for multi-bit colour sources per IWQD). Decline these to software
+		// QuickDraw rather than invent semantics — the Metal kernel's
+		// colorize arm handles ONLY the 1-bit source (bits_per_pixel == 1) case.
+		// srcCopy (0) and srcXor (2) are depth-agnostic raw copy/bitwise ops and
+		// stay accelerated at every depth; arithmetic (32-39) and hilite (50) are
+		// unaffected. Never leave a
+		// multi-bit-colour Boolean source running raw per-byte bitwise on the GPU.
+		const uint32 src_px = ReadMacInt32(p + acclSrcPixelSize);
+		const bool colorizing_bool = (mode == 1 || (mode >= 3 && mode <= 7));
+		if (colorizing_bool && src_px >= 8) {
+			// Fall through to the CPU fallback / software QuickDraw (DELIBERATE).
+		} else if (mode <= 7 || (mode >= 32 && mode <= 39) || mode == 50) {
+			// All accelerated transfer modes via Metal — no pre-check on
+			// 0x018, 0x128, 0x130, 0x15c.
 			WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_BITBLT));
 			return true;
 		}
@@ -700,4 +718,22 @@ void VideoInstallAccel(void)
 	// GLInstallHooks has its own guards and returns immediately if already installed.
 	if (PrefsFindBool("glaccel"))
 		GLInstallHooks();
+
+	// DSp (DrawSprocket) engine — fourth engine peer to NQD/RAVE/GL.
+	// Gated on "dspaccel" prefs key (default true) so users
+	// can disable cleanly to isolate regressions. Both DSpInit and the install
+	// hook live in the SAME gated branch: DSpInit registers the engine +
+	// host-bridge observer (idempotent, safe to call multiply); the install
+	// hook patches the emulated-PPC DrawSprocketLib CFM symbol-table entries
+	// to redirect into our dsp_method_tvects[] thunks. The installer has
+	// its own retry-guard triplet (dsp_hooks_installed + dsp_hooks_in_progress
+	// + dsp_hooks_attempts) and caps at DSP_HOOKS_MAX_ATTEMPTS=3 — mirrors
+	// GLInstallHooks wired 3 lines above. The CFM fragment may not be loaded
+	// on the first accRun tick (apps lazy-load DrawSprocketLib), so
+	// VideoInstallAccel calls into this branch on every accRun tick until
+	// hooks install.
+	if (PrefsFindBool("dspaccel")) {
+		DSpInit();
+		DSpInstallHooks();
+	}
 }

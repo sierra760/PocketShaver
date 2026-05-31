@@ -24,7 +24,27 @@ uint32_t gl_scratch_addr = 0;
 // These shift R3-R10 left by one position because the game passes the context
 // index in R3 and real GL args start at R4.
 uint32_t gl_dt_method_tvects[GL_MAX_SUBOPCODE];
-uint32_t gl_dt_flag_addr = 0;  // scratch word: 1 = dispatch-table call, 0 = stub call
+
+// gl_dt_flag_addr — runtime calling-convention discriminator.
+//
+// Two PPC calling conventions reach NativeGLDispatch:
+//   (A) FindLibSymbol TVECT (stub call): AllocateGLTVECT sets flag=0.
+//       GPR3..GPR10 carry the real GL function arguments directly.
+//   (B) Dispatch-table slot: AllocateGLDispatchTableTVECT sets flag=1.
+//       GPR3 = context index; GPR4..GPR10 carry the real arguments
+//       shifted by one register.
+//
+// gl_dispatch.cpp reads this flag into gl_ppc_stack_arg_offset:
+//   - flag=0 → args start at GPR3 (standard PPC ABI)
+//   - flag=1 → args start at GPR4 (context index in GPR3 is consumed)
+//
+// For 9+ argument functions (glTexImage2D, glTexSubImage2D), the flag also
+// determines the stack argument offset (PPC calling convention passes args
+// 9+ on the stack; the offset differs by one slot between conventions).
+//
+// Single-threaded by design: the emulator thread sets the flag, reads it,
+// and dispatches — no race. Do not eliminate; it's a runtime invariant.
+uint32_t gl_dt_flag_addr = 0;  // 1 = dispatch-table call, 0 = stub call
 // gl_logging_enabled is defined in gl_dispatch.cpp (single definition)
 
 /*

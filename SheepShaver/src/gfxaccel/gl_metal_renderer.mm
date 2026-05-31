@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstddef>   // offsetof (IN-01: clip_planes alignment static_assert)
 #include <cmath>
 #include <unordered_map>
 #include <vector>
@@ -28,8 +29,11 @@
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "gl_engine.h"
-#include "rave_metal_renderer.h"  // for RaveCreateMetalOverlay, RaveOverlayRetain/Release
-#include "metal_compositor.h"    // for MetalCompositorGetOverlayTexture
+#include "rave_metal_renderer.h"  // for RaveCreateMetalOverlay (shared-refcount API deleted)
+#include "metal_compositor.h"    // for MetalCompositorSubmitFrame, CompositeLayer, FrameDescriptor
+#include "gfxaccel_resources.h"  // per-engine overlay vending for kGfxEngineGL
+#include "gfxaccel_resources_heap.h"  // heap sub-allocation for GL buffers
+#include "display_mode_controller.h"  // dmc_current_snapshot() for FrameDescriptor generation
 #include "accel_logging.h"
 #include "metal_device_shared.h"
 
@@ -45,6 +49,250 @@
 // Forward declare Mac_sysalloc (from macos_util.h) to avoid UIKit header conflicts
 extern uint32 Mac_sysalloc(uint32 size);
 
+/*
+ *  GL per-engine overlay state (mirrors RAVE).
+ *
+ *  Replaces the legacy compositor-owned overlay texture + SetOverlayActive +
+ *  Sync3DFramePacing cluster with per-engine ownership. GL owns exactly one
+ *  overlay MTLTexture at a time, vended by
+ *  gfxaccel_resources_vend_overlay_texture(kGfxEngineGL, ...) and released
+ *  via gfxaccel_resources_release_overlay_texture. Same-resolution rebind =
+ *  cache-hit recycle; resolution change = re-vend.
+ *
+ *  NativeAGLSwapBuffers emits a kLayerSlotOverlay CompositeLayer via
+ *  MetalCompositorSubmitFrame — the "active" signal is the presence of the
+ *  layer in the descriptor, not a separate enable call. SubmitFrame's hidden
+ *  dispatch_semaphore(3) subsumes the legacy per-frame pacing call.
+ */
+static id<MTLTexture> s_gl_overlay_tex = nil;     /* cached vended handle */
+static uint32_t       s_gl_overlay_w   = 0;
+static uint32_t       s_gl_overlay_h   = 0;
+static int32_t        s_gl_dst_left    = 0;
+static int32_t        s_gl_dst_top     = 0;
+static int32_t        s_gl_dst_width   = 0;
+static int32_t        s_gl_dst_height  = 0;
+
+// ---------------------------------------------------------------------------
+// Test-only device/queue/bundle/overlay override.
+//
+// Mirrors the RAVE TESTING_BUILD pattern (rave_metal_renderer.mm lines 184-251).
+// When TESTING_BUILD is defined (ONLY on the PocketShaverTests target --
+// never on the production app target), tests may inject their own
+// per-test id<MTLDevice> + id<MTLCommandQueue> by calling
+// GLTesting_SetDevice() BEFORE GLMetalInit().
+// GLMetalInit() then uses the injected pair instead of SharedMetalDevice().
+// GLTesting_SetBundle() lets tests inject the NSBundle for shader library
+// loading (same as NQDTesting_SetBundle / RaveTesting_SetBundle).
+// GLTesting_SetTestOverlayTexture() lets tests inject a standalone
+// MTLTexture as the render target, bypassing gfxaccel_resources
+// (which requires compositor init that tests don't have).
+// GLTesting_Reset() clears all injected state between tests.
+//
+// Production builds (TESTING_BUILD undefined) do not see these symbols;
+// the preprocessor drops the entire block.
+// ---------------------------------------------------------------------------
+#ifdef TESTING_BUILD
+static id<MTLDevice>       gl_testing_device  = nil;
+static id<MTLCommandQueue> gl_testing_queue   = nil;
+static id<NSObject>        gl_testing_bundle  = nil;
+static id<MTLTexture>      gl_testing_overlay = nil;
+
+extern "C" void GLTesting_SetDevice(void *device, void *queue)
+{
+	gl_testing_device = (__bridge id<MTLDevice>)device;
+	gl_testing_queue  = (__bridge id<MTLCommandQueue>)queue;
+}
+
+extern "C" void GLTesting_SetBundle(void *bundle)
+{
+	gl_testing_bundle = (__bridge id<NSObject>)bundle;
+}
+
+extern "C" void GLTesting_SetTestOverlayTexture(void *texture)
+{
+	gl_testing_overlay = (__bridge id<MTLTexture>)texture;
+}
+
+extern "C" void GLTesting_Reset(void)
+{
+	gl_testing_device  = nil;
+	gl_testing_queue   = nil;
+	gl_testing_bundle  = nil;
+	gl_testing_overlay = nil;
+	s_gl_overlay_tex   = nil;
+	s_gl_overlay_w     = 0;
+	s_gl_overlay_h     = 0;
+}
+
+#endif /* TESTING_BUILD */
+
+/*
+ *  gl_acquire_overlay_texture - vend (or cache-hit) the per-engine overlay.
+ *
+ *  Returns the MTLTexture handle on success or nil on failure (vend may
+ *  return NULL during early startup or if SharedMetalDevice() is nil).
+ */
+static id<MTLTexture> gl_acquire_overlay_texture(uint32_t width, uint32_t height)
+{
+    if (s_gl_overlay_tex != nil &&
+        s_gl_overlay_w == width &&
+        s_gl_overlay_h == height) {
+        return s_gl_overlay_tex;  /* cache-hit */
+    }
+    void *raw = gfxaccel_resources_vend_overlay_texture(
+                    kGfxEngineGL, width, height,
+                    MTLPixelFormatBGRA8Unorm);
+    if (raw == NULL) {
+        GL_METAL_LOG("gl_acquire_overlay_texture: vend(%ux%u) returned NULL", width, height);
+        return nil;
+    }
+    s_gl_overlay_tex = (__bridge id<MTLTexture>)raw;
+    s_gl_overlay_w = width;
+    s_gl_overlay_h = height;
+    return s_gl_overlay_tex;
+}
+
+/*
+ *  gl_release_overlay_texture - release the per-engine overlay back to
+ *  the resource manager and clear GL's cached handle. Idempotent.
+ */
+static void gl_release_overlay_texture(void)
+{
+    if (s_gl_overlay_tex == nil) return;
+    gfxaccel_resources_release_overlay_texture(
+        kGfxEngineGL, (__bridge void *)s_gl_overlay_tex);
+    s_gl_overlay_tex = nil;
+    s_gl_overlay_w = 0;
+    s_gl_overlay_h = 0;
+}
+
+/*
+ *  gl_overlay_bind - called from NativeAGLSetDrawable bind branch.
+ *
+ *  Vends an overlay at the drawable's port dimensions (cache-hit on
+ *  matching dims). Stores the destination rect for later SubmitFrame
+ *  layer emission in gl_overlay_present.
+ */
+extern "C" void gl_overlay_bind(int32_t left, int32_t top, int32_t width, int32_t height)
+{
+    if (width <= 0 || height <= 0) {
+        GL_METAL_LOG("gl_overlay_bind: invalid dims %dx%d — ignoring", width, height);
+        return;
+    }
+    id<MTLTexture> tex = gl_acquire_overlay_texture((uint32_t)width, (uint32_t)height);
+    if (tex == nil) {
+        GL_METAL_LOG("gl_overlay_bind: vend(%dx%d) FAILED", width, height);
+        return;
+    }
+    s_gl_dst_left   = left;
+    s_gl_dst_top    = top;
+    s_gl_dst_width  = width;
+    s_gl_dst_height = height;
+    GL_METAL_LOG("gl_overlay_bind: vended overlay %dx%d at (%d,%d)", width, height, left, top);
+}
+
+/*
+ *  gl_overlay_unbind - called from NativeAGLSetDrawable unbind branch
+ *  (and on GL shutdown / context destroy paths that used to deactivate
+ *  the shared compositor overlay).
+ *
+ *  Releases the per-engine overlay. The next bind re-vends lazily.
+ */
+extern "C" void gl_overlay_unbind(void)
+{
+    GL_METAL_LOG("gl_overlay_unbind: releasing per-engine overlay");
+    gl_release_overlay_texture();
+    s_gl_dst_left = 0;
+    s_gl_dst_top = 0;
+    s_gl_dst_width = 0;
+    s_gl_dst_height = 0;
+}
+
+/*
+ *  gl_overlay_present - called from NativeAGLSwapBuffers.
+ *
+ *  Emits a single kLayerSlotOverlay CompositeLayer for GL's cached overlay
+ *  via MetalCompositorSubmitFrame. Replaces the legacy overlay-activate +
+ *  per-frame-pacing pair — SubmitFrame's semaphore provides pacing and the
+ *  layer presence is the "active" signal.
+ *
+ *  Silent no-op if there's no cached overlay (defensive — e.g. present
+ *  called before bind).
+ */
+extern "C" void gl_overlay_present(void)
+{
+    if (s_gl_overlay_tex == nil) {
+        GL_METAL_LOG("gl_overlay_present: no cached overlay — skipping SubmitFrame");
+        return;
+    }
+
+    struct CompositeLayer layer;
+    layer.source       = (__bridge void *)s_gl_overlay_tex;
+    layer.src_origin_x = 0;
+    layer.src_origin_y = 0;
+    layer.src_size_w   = s_gl_overlay_w;
+    layer.src_size_h   = s_gl_overlay_h;
+    layer.dst_origin_x = (float)s_gl_dst_left;
+    layer.dst_origin_y = (float)s_gl_dst_top;
+    layer.dst_size_w   = (float)s_gl_dst_width;
+    layer.dst_size_h   = (float)s_gl_dst_height;
+    layer.slot         = kLayerSlotOverlay;
+    layer.blend        = kBlendPremultiplied;
+    layer.alpha        = 1.0f;
+
+    const struct DMCModeSnapshot *snap = dmc_current_snapshot();
+    struct FrameDescriptor desc;
+    desc.layers               = &layer;
+    desc.layer_count          = 1;
+    desc.generation           = snap ? snap->generation : 0;
+    desc.vbl_tick_target_usec = 0;
+
+    int32_t err = MetalCompositorSubmitFrame(&desc);
+    if (err == kGfxAccelErrStaleGeneration) {
+        GL_METAL_LOG("gl_overlay_present: SubmitFrame stale generation; dropping frame");
+    } else if (err != kGfxAccelNoErr) {
+        GL_METAL_LOG("gl_overlay_present: SubmitFrame returned %d", err);
+    }
+    /* Declare GL owner — fast no-op when already GL (idempotent). */
+    (void)dmc_set_active_owner(kDMCOwnerGL);
+}
+
+/*
+ *  gl_has_active_overlay - true iff GL currently holds a vended overlay.
+ *  Used by the gfxaccel_resources fan-out attach/detach handlers (in
+ *  gl_engine.cpp) to decide whether to pre-vend on mode-enter / release
+ *  on mode-exit.
+ */
+extern "C" int gl_has_active_overlay(void)
+{
+    return (s_gl_overlay_tex != nil) ? 1 : 0;
+}
+
+/*
+ *  gl_get_overlay_dims - export current overlay dimensions for the
+ *  fan-out attach handler. Returns 0 if GL has no active overlay.
+ */
+extern "C" int gl_get_overlay_dims(uint32_t *outW, uint32_t *outH)
+{
+    if (s_gl_overlay_tex == nil) return 0;
+    if (outW) *outW = s_gl_overlay_w;
+    if (outH) *outH = s_gl_overlay_h;
+    return 1;
+}
+
+/*
+ *  gl_release_overlay_for_detach - external entry to release the cached
+ *  overlay (called from gfxaccel_resources fan-out detach handler).
+ */
+extern "C" void gl_release_overlay_for_detach(void)
+{
+    gl_release_overlay_texture();
+    s_gl_dst_left = 0;
+    s_gl_dst_top = 0;
+    s_gl_dst_width = 0;
+    s_gl_dst_height = 0;
+}
+
 // GL constants needed for blend factor mapping
 #define GL_ZERO                    0x0000
 #define GL_ONE                     0x0001
@@ -57,6 +305,21 @@ extern uint32 Mac_sysalloc(uint32 size);
 #define GL_DST_COLOR               0x0306
 #define GL_ONE_MINUS_DST_COLOR     0x0307
 #define GL_SRC_ALPHA_SATURATE      0x0308
+
+// GL constant-color blend factors (EXT_blend_color). Tokens are not #defined
+// elsewhere in gfxaccel; values verified against resources/OpenGL_SDK_1.2/Headers/glext.h.
+#define GL_CONSTANT_COLOR              0x8001
+#define GL_ONE_MINUS_CONSTANT_COLOR    0x8002
+#define GL_CONSTANT_ALPHA              0x8003
+#define GL_ONE_MINUS_CONSTANT_ALPHA    0x8004
+
+// GL blend equations (EXT_blend_equation / EXT_blend_minmax / EXT_blend_subtract).
+// Values verified against resources/OpenGL_SDK_1.2/Headers/glext.h.
+#define GL_FUNC_ADD                    0x8006
+#define GL_MIN                         0x8007
+#define GL_MAX                         0x8008
+#define GL_FUNC_SUBTRACT               0x800A
+#define GL_FUNC_REVERSE_SUBTRACT       0x800B
 
 // GL primitive modes
 #define GL_POINTS                  0x0000
@@ -137,12 +400,13 @@ extern uint32 Mac_sysalloc(uint32 size);
 // ---- Vertex layout for Metal buffer submission ----
 // Must match GLVertexIn in gl_shaders.metal
 struct GLMetalVertex {
-    float position[4];   // float4, offset 0
-    float color[4];      // float4, offset 16
-    float normal[3];     // float3, offset 32
-    float texcoord[3];   // float3 (s, t, q), offset 44 — q enables projective texturing (unit 0)
-    float texcoord1[3];  // float3 (s, t, q), offset 56 — unit 1 for multitexture
-    // Total stride = 68 bytes
+    float position[4];        // float4, offset 0
+    float color[4];           // float4, offset 16
+    float normal[3];          // float3, offset 32
+    float texcoord[3];        // float3 (s, t, q), offset 44 — q enables projective texturing (unit 0)
+    float texcoord1[3];       // float3 (s, t, q), offset 56 — unit 1 for multitexture
+    float secondary_color[3]; // float3 (r, g, b), offset 68 — EXT_secondary_color / GL_COLOR_SUM (attribute 5)
+    // Total stride = 80 bytes
 };
 
 // Must match GLVertexUniforms in gl_shaders.metal
@@ -161,9 +425,11 @@ struct GLMetalVertexUniforms {
     float   point_size;         // glPointSize value
     int32_t two_side_lighting;  // GL_LIGHT_MODEL_TWO_SIDE
     // User clip planes (must match GLVertexUniforms in gl_shaders.metal)
-    int32_t num_clip_planes;
-    float   _clip_pad[1];       // padding to align clip_planes to float4
-    float   clip_planes[6][4];  // 6 clip plane equations (float4 each)
+    int32_t num_clip_planes;    // offset 216 (not 16-byte aligned: 216 = 13.5 * 16)
+    float   _clip_pad[1];       // offset 220: ONE float (4 bytes) brings the next field
+                                // to offset 224 = 14 * 16, the float4 alignment boundary.
+                                // (only 4 bytes are needed here, not 12 — see static_assert below)
+    float   clip_planes[6][4];  // offset 224, 16-byte aligned: 6 clip plane equations (float4 each)
 };
 
 // Must match GLFragmentUniforms in gl_shaders.metal
@@ -179,7 +445,10 @@ struct GLMetalFragmentUniforms {
     int32_t has_texture;             // offset 60
     int32_t has_texture_3d;          // offset 64
     int32_t shade_model;             // offset 68
-    int32_t _pad3, _pad4;           // pad to 80 (16-byte struct alignment)
+    int32_t color_sum_enabled;       // offset 72 — EXT_secondary_color / GL_COLOR_SUM (consumes former _pad3)
+    int32_t has_texture_unit1;       // offset 76 — ARB_multitexture: unit 1 has a bound+enabled 2D texture (consumes former _pad4)
+    int32_t texenv1_mode;            // offset 80 — unit-1 texenv mode (GLTexEnvModeToShader: 0=modulate..4=add)
+    int32_t _pad5, _pad6, _pad7;     // offset 84-92 (pad to 96, 16-byte struct alignment)
 };
 
 // Must match GLLight in gl_shaders.metal
@@ -221,7 +490,12 @@ struct GLMetalLightingData {
 // Metal float3 occupies 16 bytes (padded), float4 has 16-byte alignment.
 // If any of these fail, the struct layout doesn't match gl_shaders.metal.
 static_assert(sizeof(GLMetalVertexUniforms) == 320, "GLMetalVertexUniforms size must match Metal GLVertexUniforms (320 bytes)");
-static_assert(sizeof(GLMetalFragmentUniforms) == 80, "GLMetalFragmentUniforms size must match Metal GLFragmentUniforms (80 bytes)");
+// IN-01: make the clip_planes float4 alignment explicit so a future field reorder
+// (which could silently change the required _clip_pad size) can't mis-align the
+// Metal float4[6] array without tripping a compile error.
+static_assert(offsetof(GLMetalVertexUniforms, clip_planes) % 16 == 0,
+              "GLMetalVertexUniforms.clip_planes must be 16-byte aligned to match Metal float4[6]");
+static_assert(sizeof(GLMetalFragmentUniforms) == 96, "GLMetalFragmentUniforms size must match Metal GLFragmentUniforms (96 bytes)");
 static_assert(sizeof(GLMetalLight) == 128, "GLMetalLight size must match Metal GLLight (128 bytes)");
 static_assert(sizeof(GLMetalMaterial) == 80, "GLMetalMaterial size must match Metal GLMaterialData (80 bytes)");
 static_assert(sizeof(GLMetalLightingData) == 1120, "GLMetalLightingData size must match Metal GLLightingData (1120 bytes)");
@@ -295,7 +569,31 @@ static MTLBlendFactor GLBlendToMetal(uint32_t gl_blend) {
         case GL_DST_COLOR:           return MTLBlendFactorDestinationColor;
         case GL_ONE_MINUS_DST_COLOR: return MTLBlendFactorOneMinusDestinationColor;
         case GL_SRC_ALPHA_SATURATE:  return MTLBlendFactorSourceAlphaSaturated;
+        // EXT_blend_color constant-color factors (previously fell to the
+        // MTLBlendFactorOne default, silently ignoring constant-color blending).
+        case GL_CONSTANT_COLOR:           return MTLBlendFactorBlendColor;
+        case GL_ONE_MINUS_CONSTANT_COLOR: return MTLBlendFactorOneMinusBlendColor;
+        case GL_CONSTANT_ALPHA:           return MTLBlendFactorBlendAlpha;
+        case GL_ONE_MINUS_CONSTANT_ALPHA: return MTLBlendFactorOneMinusBlendAlpha;
         default:                     return MTLBlendFactorOne;
+    }
+}
+
+
+// ---- Blend equation mapping (EXT_blend_equation / EXT_blend_minmax / EXT_blend_subtract) ----
+// Maps the stored ctx->blend_equation to a Metal blend op. Previously the apply
+// site hardcoded MTLBlendOperationAdd, silently ignoring subtract/min/max equations
+// (a stored-but-not-applied PARTIAL — silent wrong output, not allowed).
+// Note: MTLBlendOperationMin/Max ignore the src/dst factors per Metal spec, matching
+// GL_MIN/GL_MAX semantics — no special-casing needed beyond the op map.
+static MTLBlendOperation GLBlendEquationToMetal(uint32_t eq) {
+    switch (eq) {
+        case GL_FUNC_ADD:              return MTLBlendOperationAdd;
+        case GL_FUNC_SUBTRACT:         return MTLBlendOperationSubtract;
+        case GL_FUNC_REVERSE_SUBTRACT: return MTLBlendOperationReverseSubtract;
+        case GL_MIN:                   return MTLBlendOperationMin;
+        case GL_MAX:                   return MTLBlendOperationMax;
+        default:                       return MTLBlendOperationAdd;
     }
 }
 
@@ -334,12 +632,16 @@ static MTLStencilOperation GLStencilOpToMetal(uint32_t gl_op) {
 
 // ---- Pipeline state key ----
 // AUDIT: M003/S04/T01 — Verified that MakePipelineKey includes all Metal render pipeline
-// state: blend_enabled, blend_src, blend_dst, depth_write, color_mask_bits, has_texture.
-// Depth test/func, stencil, and cull face are NOT part of the Metal pipeline state object
-// (they are set separately via setDepthStencilState: and setCullMode:), so their absence
-// from this key is correct. Depth-stencil state has its own cache key (MakeDepthStencilKey).
+// state: blend_enabled, blend_src, blend_dst, blend_equation, depth_write, color_mask_bits,
+// has_texture. blend_equation sets rgb/alphaBlendOperation on the MTLRenderPipelineDescriptor,
+// so it MUST be in the key — otherwise a non-Add equation would silently
+// reuse a stale Add pipeline. Depth test/func, stencil, and cull face are NOT part of the Metal
+// pipeline state object (they are set separately via setDepthStencilState: and setCullMode:), so
+// their absence from this key is correct. Depth-stencil state has its own cache key
+// (MakeDepthStencilKey).
 static uint64_t MakePipelineKey(bool blend_enabled, uint32_t blend_src, uint32_t blend_dst,
-                                 bool depth_write, uint32_t color_mask_bits, bool has_texture) {
+                                 bool depth_write, uint32_t color_mask_bits, bool has_texture,
+                                 uint32_t blend_equation) {
     uint64_t key = 0;
     key |= (blend_enabled ? 1ULL : 0);
     key |= ((uint64_t)(blend_src & 0xFFF)) << 1;
@@ -347,6 +649,9 @@ static uint64_t MakePipelineKey(bool blend_enabled, uint32_t blend_src, uint32_t
     key |= (depth_write ? 1ULL : 0) << 25;
     key |= ((uint64_t)(color_mask_bits & 0xF)) << 26;
     key |= (has_texture ? 1ULL : 0) << 30;
+    // blend_equation occupies free bits above bit 30. The five
+    // GL equations (ADD/SUBTRACT/REVERSE_SUBTRACT/MIN/MAX) need only the low bits; mask to 0xFF.
+    key |= ((uint64_t)(blend_equation & 0xFF)) << 31;
     return key;
 }
 
@@ -387,7 +692,15 @@ void GLMetalInit(GLContext *ctx)
     ms->renderPassActive = false;
 
     // Get the shared Metal device directly from the compositor.
+#ifdef TESTING_BUILD
+    if (gl_testing_device != nil) {
+        ms->device = gl_testing_device;
+    } else {
+#endif
     ms->device = (__bridge id<MTLDevice>)SharedMetalDevice();
+#ifdef TESTING_BUILD
+    }
+#endif
     if (!ms->device) {
         GL_METAL_LOG("GLMetalInit: SharedMetalDevice failed");
         delete ms;
@@ -395,14 +708,33 @@ void GLMetalInit(GLContext *ctx)
     }
 
     // Create command queue (shared when using the shared device)
+#ifdef TESTING_BUILD
+    if (gl_testing_queue != nil) {
+        ms->commandQueue = gl_testing_queue;
+    } else {
+#endif
     if (ms->device == (__bridge id<MTLDevice>)SharedMetalDevice()) {
         ms->commandQueue = (__bridge id<MTLCommandQueue>)SharedMetalCommandQueue();
     } else {
         ms->commandQueue = [ms->device newCommandQueue];
     }
+#ifdef TESTING_BUILD
+    }
+#endif
 
     // Load shader library
     NSError *err = nil;
+#ifdef TESTING_BUILD
+    if (gl_testing_bundle != nil) {
+        ms->shaderLibrary = [ms->device newDefaultLibraryWithBundle:(NSBundle *)gl_testing_bundle error:&err];
+        if (!ms->shaderLibrary) {
+            GL_METAL_LOG("GLMetalInit: newDefaultLibraryWithBundle failed: %s",
+                         err ? [[err localizedDescription] UTF8String] : "unknown");
+            delete ms;
+            return;
+        }
+    } else {
+#endif
     NSString *libPath = [[NSBundle mainBundle] pathForResource:@"gl_shaders" ofType:@"metallib"];
     if (libPath) {
         ms->shaderLibrary = [ms->device newLibraryWithFile:libPath error:&err];
@@ -417,6 +749,9 @@ void GLMetalInit(GLContext *ctx)
         delete ms;
         return;
     }
+#ifdef TESTING_BUILD
+    }
+#endif
 
     // Create vertex descriptor matching GLMetalVertex layout
     ms->vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
@@ -441,23 +776,62 @@ void GLMetalInit(GLContext *ctx)
     ms->vertexDescriptor.attributes[4].offset = 56;
     ms->vertexDescriptor.attributes[4].bufferIndex = 0;
 
+    ms->vertexDescriptor.attributes[5].format = MTLVertexFormatFloat3;  // secondary color (EXT_secondary_color / GL_COLOR_SUM)
+    ms->vertexDescriptor.attributes[5].offset = 68;                     // immediately after texcoord1 (float3 @ 68 is 4-byte aligned)
+    ms->vertexDescriptor.attributes[5].bufferIndex = 0;
+
+    // Stride desync: GLMetalVertex (C++), the attribute offsets above,
+    // and GLVertexIn in gl_shaders.metal must stay in exact lockstep — a desync
+    // corrupts position too. stride auto-grows to sizeof(GLMetalVertex) == 80.
     ms->vertexDescriptor.layouts[0].stride = sizeof(GLMetalVertex);
 
-    // Allocate triple-buffered vertex ring buffers (4MB each)
+    // Allocate triple-buffered vertex ring buffers (4MB each) from kHeapEngineGL
     for (int i = 0; i < GL_RING_BUFFER_COUNT; i++) {
-        ms->vertexBuffers[i] = [ms->device newBufferWithLength:GL_RING_BUFFER_SIZE
-                                                       options:MTLResourceStorageModeShared];
+        ms->vertexBuffers[i] = (__bridge_transfer id<MTLBuffer>)
+            gfxaccel_resources_heap_alloc_buffer(kHeapEngineGL,
+                                                 GL_RING_BUFFER_SIZE,
+                                                 MTLResourceStorageModeShared);
+        if (!ms->vertexBuffers[i]) {
+            GL_METAL_LOG("heap alloc failed for GL ring buffer %d, falling back to device", i);
+            // heap-exempt: startup fallback, removed once init ordering confirmed
+            ms->vertexBuffers[i] = [ms->device newBufferWithLength:GL_RING_BUFFER_SIZE
+                                                           options:MTLResourceStorageModeShared];
+        }
     }
     ms->currentBufferIndex = 0;
     ms->bufferOffset = 0;
 
-    // Allocate uniform buffers
-    ms->vertexUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalVertexUniforms)
-                                                      options:MTLResourceStorageModeShared];
-    ms->fragmentUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalFragmentUniforms)
-                                                        options:MTLResourceStorageModeShared];
-    ms->lightUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalLightingData)
-                                                     options:MTLResourceStorageModeShared];
+    // Allocate uniform buffers from kHeapEngineGL
+    ms->vertexUniformBuffer = (__bridge_transfer id<MTLBuffer>)
+        gfxaccel_resources_heap_alloc_buffer(kHeapEngineGL,
+                                             (uint32_t)sizeof(GLMetalVertexUniforms),
+                                             MTLResourceStorageModeShared);
+    if (!ms->vertexUniformBuffer) {
+        GL_METAL_LOG("heap alloc failed for GL vertex uniform buffer");
+        // heap-exempt: startup fallback, removed once init ordering confirmed
+        ms->vertexUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalVertexUniforms)
+                                                          options:MTLResourceStorageModeShared];
+    }
+    ms->fragmentUniformBuffer = (__bridge_transfer id<MTLBuffer>)
+        gfxaccel_resources_heap_alloc_buffer(kHeapEngineGL,
+                                             (uint32_t)sizeof(GLMetalFragmentUniforms),
+                                             MTLResourceStorageModeShared);
+    if (!ms->fragmentUniformBuffer) {
+        GL_METAL_LOG("heap alloc failed for GL fragment uniform buffer");
+        // heap-exempt: startup fallback, removed once init ordering confirmed
+        ms->fragmentUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalFragmentUniforms)
+                                                            options:MTLResourceStorageModeShared];
+    }
+    ms->lightUniformBuffer = (__bridge_transfer id<MTLBuffer>)
+        gfxaccel_resources_heap_alloc_buffer(kHeapEngineGL,
+                                             (uint32_t)sizeof(GLMetalLightingData),
+                                             MTLResourceStorageModeShared);
+    if (!ms->lightUniformBuffer) {
+        GL_METAL_LOG("heap alloc failed for GL light uniform buffer");
+        // heap-exempt: startup fallback, removed once init ordering confirmed
+        ms->lightUniformBuffer = [ms->device newBufferWithLength:sizeof(GLMetalLightingData)
+                                                         options:MTLResourceStorageModeShared];
+    }
 
     // Create sampler states
     MTLSamplerDescriptor *sampDesc = [[MTLSamplerDescriptor alloc] init];
@@ -511,7 +885,8 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
                         ctx->tex_units[ctx->active_texture].bound_texture_3d != 0);
 
     uint64_t key = MakePipelineKey(blend_enabled, blend_src, blend_dst,
-                                    depth_write, color_mask_bits, has_texture);
+                                    depth_write, color_mask_bits, has_texture,
+                                    ctx->blend_equation);
 
     auto it = ms->pipelineCache.find(key);
     if (it != ms->pipelineCache.end()) return it->second;
@@ -535,9 +910,10 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
 
     // Blend state
     if (blend_enabled) {
+        MTLBlendOperation blendOp = GLBlendEquationToMetal(ctx->blend_equation);
         pipeDesc.colorAttachments[0].blendingEnabled = YES;
-        pipeDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-        pipeDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        pipeDesc.colorAttachments[0].rgbBlendOperation = blendOp;
+        pipeDesc.colorAttachments[0].alphaBlendOperation = blendOp;
         pipeDesc.colorAttachments[0].sourceRGBBlendFactor = GLBlendToMetal(blend_src);
         pipeDesc.colorAttachments[0].destinationRGBBlendFactor = GLBlendToMetal(blend_dst);
         // Independent alpha factors: maintain alpha=1.0 invariant regardless of RGB blend mode.
@@ -697,15 +1073,36 @@ void GLMetalBeginFrame(GLContext *ctx)
     if (!ms || !ms->initialized) return;
     if (ms->renderPassActive) return;
 
-    // Get the overlay texture from the compositor (offscreen render target)
-    ms->overlayTexture = (__bridge id<MTLTexture>)MetalCompositorGetOverlayTexture();
+    // GL renders into its per-engine overlay texture (vended
+    // via gfxaccel_resources_vend_overlay_texture(kGfxEngineGL, ...) in
+    // NativeAGLSetDrawable's gl_overlay_bind path). The compositor picks
+    // this up when NativeAGLSwapBuffers fires gl_overlay_present and
+    // emits a kLayerSlotOverlay CompositeLayer via SubmitFrame.
+    //
+    // If bind happened before the context's viewport was set (unusual but
+    // possible), the cached overlay dims and the context's dims might
+    // differ — gl_acquire_overlay_texture re-vends if dims don't match the
+    // cache, so we're safe to pass whatever GL currently believes the
+    // drawable size is.
+    int w = ctx->viewport[2];
+    int h = ctx->viewport[3];
+    if (w <= 0 || h <= 0) {
+        // No viewport yet — fall back to cached overlay dims if we have one.
+        if (s_gl_overlay_tex != nil) {
+            w = (int)s_gl_overlay_w;
+            h = (int)s_gl_overlay_h;
+        } else {
+            GL_METAL_LOG("GLMetalBeginFrame: no viewport and no cached overlay");
+            return;
+        }
+    }
+
+    ms->overlayTexture = gl_acquire_overlay_texture((uint32_t)w, (uint32_t)h);
     if (!ms->overlayTexture) {
-        GL_METAL_LOG("GLMetalBeginFrame: no overlay texture from compositor");
+        GL_METAL_LOG("GLMetalBeginFrame: failed to acquire per-engine overlay %dx%d", w, h);
         return;
     }
 
-    int w = (int)[ms->overlayTexture width];
-    int h = (int)[ms->overlayTexture height];
     EnsureDepthBuffer(ms, w, h);
 
     ms->currentCommandBuffer = [ms->commandQueue commandBuffer];
@@ -796,6 +1193,9 @@ static bool ExpandPrimitives(uint32_t gl_mode, const std::vector<GLVertex> &in,
         dst.texcoord1[0] = src.texcoord[1][0];  // unit 1
         dst.texcoord1[1] = src.texcoord[1][1];
         dst.texcoord1[2] = src.texcoord[1][3];
+        // EXT_secondary_color / GL_COLOR_SUM: carry the already-stored secondary
+        // color through to attribute 5 (was silently dropped).
+        memcpy(dst.secondary_color, src.secondary_color, sizeof(float) * 3);
     };
 
     size_t n = in.size();
@@ -937,6 +1337,12 @@ static void ConvertVertices(const std::vector<GLVertex> &in, std::vector<GLMetal
         out[i].texcoord1[0] = in[i].texcoord[1][0];  // unit 1
         out[i].texcoord1[1] = in[i].texcoord[1][1];
         out[i].texcoord1[2] = in[i].texcoord[1][3];
+        // EXT_secondary_color / GL_COLOR_SUM: carry the already-stored secondary
+        // color through to attribute 5. This non-expansion path (used for
+        // GL_TRIANGLES/STRIP, GL_LINES/STRIP, GL_POINTS — the dominant primitive
+        // types) was silently dropping it, so GL_COLOR_SUM had no effect for most
+        // real draws (mirrors copyVertex in ExpandPrimitives).
+        memcpy(out[i].secondary_color, in[i].secondary_color, sizeof(float) * 3);
     }
 }
 
@@ -1234,6 +1640,18 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     fu.has_texture_3d = (ctx->tex_units[texUnit].enabled_3d &&
                           ctx->tex_units[texUnit].bound_texture_3d != 0) ? 1 : 0;
     fu.shade_model = (ctx->shade_model == GL_SMOOTH) ? 1 : 0;
+    // EXT_secondary_color / GL_COLOR_SUM: honestly gated on the tracked enable bit
+    // (NOT silently always-on) — secondary color is added after texturing only
+    // when glEnable(GL_COLOR_SUM) is active.
+    fu.color_sum_enabled = ctx->color_sum ? 1 : 0;
+    // ARB_multitexture (glMultiTexCoord*ARB, 406-437): unit 1 contributes a second
+    // 2D texture sampled with texcoord1 and combined per its texenv mode (2-unit
+    // modulate/add scope). Gated honestly on unit 1 being enabled with a bound 2D
+    // texture (NOT silently always-on). The GL_COMBINE crossbar is store-only
+    // and GL_EXT_texture_env_combine is de-advertised — only modes 0-4 are honored.
+    fu.has_texture_unit1 = (ctx->tex_units[1].enabled_2d &&
+                            ctx->tex_units[1].bound_texture_2d != 0) ? 1 : 0;
+    fu.texenv1_mode = GLTexEnvModeToShader(ctx->tex_units[1].env_mode);
 
     // ---- Upload lighting data ----
     GLMetalLightingData ld_val;
@@ -1278,6 +1696,17 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     // Set stencil reference value when stencil test is active
     if (ctx->stencil_test) {
         [ms->currentEncoder setStencilReferenceValue:(uint32_t)(ctx->stencil.ref & 0xFF)];
+    }
+
+    // Emit the constant blend color (EXT_blend_color) when blending is enabled.
+    // The pipeline's CONSTANT_COLOR/ALPHA blend factors (GLBlendToMetal) reference
+    // this encoder-level color; without this call the constant-color blend path
+    // silently used an undefined/zero blend color.
+    if (ctx->blend) {
+        [ms->currentEncoder setBlendColorRed:ctx->blend_color[0]
+                                      green:ctx->blend_color[1]
+                                       blue:ctx->blend_color[2]
+                                      alpha:ctx->blend_color[3]];
     }
 
     // Cull face
@@ -1346,6 +1775,36 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
             [ms->currentEncoder setFragmentTexture:ms->fallbackWhiteTexture atIndex:0];
         }
         [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:0];
+    }
+
+    // ARB_multitexture unit 1: bind a SECOND 2D texture + sampler at NEW
+    // fragment indices texture(2)/sampler(1). Index 1 is reserved for 3D textures
+    // (texIdx = has_texture_3d ? 1 : 0 above), so unit 1's 2D texture must NOT reuse
+    // it. The shader always declares tex1 [[texture(2)]] / samp1 [[sampler(1)]], so we
+    // bind on every draw (Metal validation) — the white fallback when unit 1 is
+    // inactive (the shader gates the sample on has_texture_unit1). Same
+    // texture_objects.find + metal_texture null-check shape as unit 0; a deleted unit-1
+    // texture falls back to white rather than binding a dangling MTLTexture.
+    if (fu.has_texture_unit1) {
+        auto tex1It = ctx->texture_objects.find(ctx->tex_units[1].bound_texture_2d);
+        if (tex1It != ctx->texture_objects.end() && tex1It->second.metal_texture) {
+            id<MTLTexture> mtlTex1 = (__bridge id<MTLTexture>)(tex1It->second.metal_texture);
+            [ms->currentEncoder setFragmentTexture:mtlTex1 atIndex:2];
+            id<MTLSamplerState> sampler1 = GLMetalGetSampler(ms, &tex1It->second);
+            [ms->currentEncoder setFragmentSamplerState:sampler1 atIndex:1];
+        } else {
+            if (ms->fallbackWhiteTexture) {
+                [ms->currentEncoder setFragmentTexture:ms->fallbackWhiteTexture atIndex:2];
+            }
+            [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:1];
+        }
+    } else {
+        // Unit 1 inactive -- still must bind texture(2)/sampler(1) for Metal validation
+        // (shader won't sample since has_texture_unit1=0).
+        if (ms->fallbackWhiteTexture) {
+            [ms->currentEncoder setFragmentTexture:ms->fallbackWhiteTexture atIndex:2];
+        }
+        [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:1];
     }
 
     [ms->currentEncoder drawPrimitives:mtlPrim vertexStart:0 vertexCount:vertCount];
@@ -1487,6 +1946,11 @@ void GLMetalDrawPixels(GLContext *ctx, int width, int height, const uint8_t *bgr
     [ms->currentEncoder setFragmentBytes:&fu_local length:sizeof(GLMetalFragmentUniforms) atIndex:1];
     [ms->currentEncoder setFragmentTexture:tex atIndex:0];
     [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:0];
+    // gl_fragment_main always declares tex1 [[texture(2)]] / samp1 [[sampler(1)]]
+    // (ARB_multitexture unit 1); bind the fallback so Metal validation passes
+    // (has_texture_unit1=0 here via memset, so the shader never samples it).
+    [ms->currentEncoder setFragmentTexture:ms->fallbackWhiteTexture atIndex:2];
+    [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:1];
     [ms->currentEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 
     GL_METAL_LOG("GLMetalDrawPixels: %dx%d at raster (%.1f, %.1f) zoom (%.1f, %.1f)",
@@ -1616,6 +2080,17 @@ void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *bgra_da
     // Encode draw
     [ms->currentEncoder setRenderPipelineState:pipeline];
     [ms->currentEncoder setDepthStencilState:dsState];
+    // This draw always uses a blend-enabled pipeline
+    // (SrcAlpha/OneMinusSrcAlpha forced above), so the encoder-level blend color
+    // must be defined before it. Without this, a prior GLMetalFlushImmediateMode
+    // that used CONSTANT_COLOR factors would leave a stale blend constant on the
+    // encoder. Bitmap doesn't use a constant-color factor today, but emitting the
+    // color keeps the "blend color is always set before a blend-enabled draw"
+    // invariant intact (mirrors GLMetalFlushImmediateMode's setBlendColorRed:).
+    [ms->currentEncoder setBlendColorRed:ctx->blend_color[0]
+                                  green:ctx->blend_color[1]
+                                   blue:ctx->blend_color[2]
+                                  alpha:ctx->blend_color[3]];
     [ms->currentEncoder setCullMode:MTLCullModeNone];
     [ms->currentEncoder setVertexBytes:verts length:sizeof(verts) atIndex:0];
     {
@@ -1627,6 +2102,11 @@ void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *bgra_da
     [ms->currentEncoder setFragmentBytes:&fu_local2 length:sizeof(GLMetalFragmentUniforms) atIndex:1];
     [ms->currentEncoder setFragmentTexture:tex atIndex:0];
     [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:0];
+    // gl_fragment_main always declares tex1 [[texture(2)]] / samp1 [[sampler(1)]]
+    // (ARB_multitexture unit 1); bind the fallback so Metal validation passes
+    // (has_texture_unit1=0 here via memset, so the shader never samples it).
+    [ms->currentEncoder setFragmentTexture:ms->fallbackWhiteTexture atIndex:2];
+    [ms->currentEncoder setFragmentSamplerState:ms->nearestSampler atIndex:1];
     [ms->currentEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 
     GL_METAL_LOG("GLMetalBitmap: %dx%d at raster (%.1f, %.1f) zoom (%.1f, %.1f)",

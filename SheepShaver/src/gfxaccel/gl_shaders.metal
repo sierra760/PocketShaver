@@ -20,11 +20,12 @@ using namespace metal;
 // ---- Vertex input/output ----
 
 struct GLVertexIn {
-    float4 position  [[attribute(0)]];
-    float4 color     [[attribute(1)]];
-    float3 normal    [[attribute(2)]];
-    float3 texcoord  [[attribute(3)]];   // (s, t, q) unit 0 — q enables projective texturing
-    float3 texcoord1 [[attribute(4)]];   // (s, t, q) unit 1 — for multitexture
+    float4 position        [[attribute(0)]];
+    float4 color           [[attribute(1)]];
+    float3 normal          [[attribute(2)]];
+    float3 texcoord        [[attribute(3)]];   // (s, t, q) unit 0 — q enables projective texturing
+    float3 texcoord1       [[attribute(4)]];   // (s, t, q) unit 1 — for multitexture
+    float3 secondary_color [[attribute(5)]];   // (r, g, b) EXT_secondary_color / GL_COLOR_SUM
 };
 
 struct GLVertexOut {
@@ -34,6 +35,7 @@ struct GLVertexOut {
     float3 eye_normal;
     float3 texcoord;    // (s, t, q) unit 0 — interpolated, then divided per-fragment
     float3 texcoord1;   // (s, t, q) unit 1 — for multitexture
+    float3 secondary_color; // (r, g, b) EXT_secondary_color / GL_COLOR_SUM — added after texturing
     float3 eye_position;
     float  fog_factor;
     float  clip_dist0;  // user clip plane distances (interpolated, discard if < 0)
@@ -77,6 +79,9 @@ struct GLFragmentUniforms {
     int    has_texture;
     int    has_texture_3d;      // 1 = bound texture is 3D, sample from tex3d at index 1
     int    shade_model;         // 0=flat, 1=smooth
+    int    color_sum_enabled;   // GL_COLOR_SUM (EXT_secondary_color): add secondary color after texturing
+    int    has_texture_unit1;   // ARB_multitexture: unit 1 has a bound+enabled 2D texture (sample tex1 with texcoord1)
+    int    texenv1_mode;        // unit-1 texenv mode (0=modulate,1=decal,2=blend,3=replace,4=add)
 };
 
 struct GLLight {
@@ -155,6 +160,8 @@ vertex GLVertexOut gl_vertex_main(
     // 4. Pass through texcoords (s, t, q) for projective texturing
     out.texcoord = in.texcoord;
     out.texcoord1 = in.texcoord1;
+    // Pass through the secondary color (added after texturing, gated on GL_COLOR_SUM)
+    out.secondary_color = in.secondary_color;
 
     // 5. Lighting or pass-through color
     if (uniforms.lighting_enabled) {
@@ -261,7 +268,9 @@ fragment float4 gl_fragment_main(
     constant GLFragmentUniforms &uniforms [[buffer(1)]],
     texture2d<float> tex [[texture(0)]],
     texture3d<float> tex3d [[texture(1)]],
-    sampler samp [[sampler(0)]])
+    texture2d<float> tex1 [[texture(2)]],
+    sampler samp [[sampler(0)]],
+    sampler samp1 [[sampler(1)]])
 {
     // User clip planes: discard if any clip distance is negative
     if (in.num_clip_planes > 0 && in.clip_dist0 < 0.0) discard_fragment();
@@ -303,6 +312,41 @@ fragment float4 gl_fragment_main(
             color.rgb = clamp(color.rgb + tex_color.rgb, 0.0, 1.0);
             color.a *= tex_color.a;
         }
+    }
+
+    // ARB_multitexture unit 1 (glMultiTexCoord*ARB): sample the second 2D
+    // texture with texcoord1 and combine it onto the running color per unit 1's texenv
+    // mode (same modes 0-4 template as unit 0). Scope: 2-unit modulate/add (the standard
+    // texenv modes). The GL_COMBINE crossbar is store-only and
+    // GL_EXT_texture_env_combine is de-advertised — texenv1_mode is one of 0-4 only.
+    if (uniforms.has_texture_unit1) {
+        float2 uv1 = (in.texcoord1.z != 0.0) ? in.texcoord1.xy / in.texcoord1.z : in.texcoord1.xy;
+        float4 t1 = tex1.sample(samp1, uv1);
+
+        if (uniforms.texenv1_mode == 0) {
+            // GL_MODULATE: Cf = Ct1 * Cf
+            color = float4(color.rgb * t1.rgb, color.a * t1.a);
+        } else if (uniforms.texenv1_mode == 1) {
+            // GL_DECAL: Cf.rgb = mix(Cf.rgb, Ct1.rgb, Ct1.a), Cf.a unchanged
+            color.rgb = mix(color.rgb, t1.rgb, t1.a);
+        } else if (uniforms.texenv1_mode == 2) {
+            // GL_BLEND: Cf.rgb = mix(Cf.rgb, Cc.rgb, Ct1.rgb), Cf.a = Cf.a * Ct1.a
+            color.rgb = mix(color.rgb, uniforms.texenv_color.rgb, t1.rgb);
+            color.a *= t1.a;
+        } else if (uniforms.texenv1_mode == 3) {
+            // GL_REPLACE: Cf = Ct1
+            color = t1;
+        } else if (uniforms.texenv1_mode == 4) {
+            // GL_ADD: Cf.rgb = Cf.rgb + Ct1.rgb, Cf.a = Cf.a * Ct1.a
+            color.rgb = clamp(color.rgb + t1.rgb, 0.0, 1.0);
+            color.a *= t1.a;
+        }
+    }
+
+    // Color sum (GL_COLOR_SUM / EXT_secondary_color): per OpenGL 1.2.1 §3.9 the
+    // secondary (specular) color is added AFTER texturing and clamped, before fog.
+    if (uniforms.color_sum_enabled) {
+        color.rgb = saturate(color.rgb + in.secondary_color);
     }
 
     // Fog application
