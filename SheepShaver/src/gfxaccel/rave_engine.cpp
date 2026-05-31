@@ -233,11 +233,12 @@ static const uint32 kAllOptionalFeatures =
 	kQAOptional_ClearDrawBuffer | kQAOptional_ClearZBuffer | // OffscreenDrawContexts removed (not implemented)
 	kQAOptional_OpenGL;  // GL tags 100-153 are stored/retrieved via Set/GetInt — games rely on this for scissor, blend, wrap
 
-// OptionalFeatures2 bitmask -- only advertise what we support
+// OptionalFeatures2 bitmask -- only advertise what we support.
 // Bit assignments now match DDK RAVE 1.6 Specification exactly.
 static const uint32 kAllOptionalFeatures2 =
 	kQAOptional2_TextureDrawContexts | kQAOptional2_BitmapDrawContexts |
-	kQAOptional2_Busy | kQAOptional2_SwapBuffers | kQAOptional2_PriorityBits |  // kQAOptional2_PriorityBits advertised correctly; priority extraction fixed. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
+	kQAOptional2_Busy | kQAOptional2_SwapBuffers |
+	kQAOptional2_PriorityBits |  // kQAOptional2_PriorityBits advertised correctly; priority extraction fixed. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 	kQAOptional2_BitmapScale;
 
 // kQAFast_* bit positions verified against RAVE.h. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
@@ -1055,8 +1056,9 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 	} else {
 		// Direct format -- defer Metal texture creation until first draw.
 		// Some textures (QD3D menu backgrounds) start with empty pixmap data
-		// that gets filled later via QAAccessTexture/End.  Others (game-engine
-		// textures) have valid data immediately.  Deferred creation handles both.
+		// that gets filled later. Others have valid data immediately. Deferred
+		// creation handles both while still honoring normal QATextureNew copy
+		// semantics once non-empty data has been observed.
 		entry->pixmap_mac_addr = pixmap;
 		entry->metal_texture = nullptr;
 		entry->pixels_copied = false;
@@ -1140,6 +1142,8 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
+	const bool whitenedAlphaMask =
+		(pixelType == kQAPixel_ARGB32) && RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
 
 	// Check the whole converted image. Bugdom's ARGB16 sprites commonly
 	// have transparent top-left borders, so a small leading sample can mark
@@ -1166,6 +1170,9 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 
 			uint8_t *mipData = new uint8_t[mw * mh * 4];
 			ConvertPixels(pixelType, mPixmap, mipData, mw, mh, mRowBytes);
+			if (pixelType == kQAPixel_ARGB32) {
+				RaveBGRAWhitenAlphaOnlyMask(mipData, mw * mh);
+			}
 			RaveUploadMipLevel(entry->metal_texture, level, mw, mh, mipData, mw * 4);
 			delete[] mipData;
 
@@ -1181,16 +1188,18 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 	}
 
-	// Record whether any data was present at first realization. This is a
-	// diagnostic/lifecycle marker only: direct-format pixmap-backed textures
-	// remain live and are refreshed on later draws, because QD3D can continue
-	// writing into the same pixmap after first use.
+	// Record whether any data was present at first realization. Normal
+	// QATextureNew calls have copy semantics, so once we have non-empty data
+	// the Metal copy becomes authoritative. If the first realization was empty,
+	// RaveTextureNeedsLivePixmapRefresh keeps polling until the late-filled
+	// pixels show up.
 	entry->pixels_copied = !sourceWasEmpty;
 
-	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u alphaMaskWhite=%d",
 	         pixelType, w, h, mipLevels, pixmap, entry->metal_texture, sourceWasEmpty,
 	         sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
-	         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb);
+	         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb,
+	         whitenedAlphaMask);
 }
 
 
@@ -1595,6 +1604,9 @@ int32_t NativeEngineAccessTextureEnd(uint32_t textureAddr, uint32_t dirtyRectAdd
 		// cpu_pixel_data is in Mac memory, so use its Mac address for conversion
 		uint32_t macAddr = entry->cpu_pixel_mac_addr;
 		ConvertPixels(entry->pixel_type, macAddr, expanded, w, h, entry->row_bytes);
+		if (entry->type == kRaveResourceTexture && entry->pixel_type == kQAPixel_ARGB32) {
+			RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
+		}
 	}
 
 	// Re-upload level 0
@@ -3037,6 +3049,10 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
 		delete[] bgra_data;
 		return kQAError;
 	}
+	bool whitenedAlphaMask = false;
+	if (effectivePixelType == kQAPixel_ARGB32) {
+		whitenedAlphaMask = RaveBGRAWhitenAlphaOnlyMask(bgra_data, width * height);
+	}
 
 	// Re-upload to existing Metal texture at level 0
 	if (entry->metal_texture) {
@@ -3050,8 +3066,8 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
 
 	delete[] bgra_data;
 
-	RAVE_LOG("ATITextureUpdate: updated texture 0x%08x (%dx%d, pixelType=%d->%d)",
-	         textureAddr, width, height, pixelType, effectivePixelType);
+	RAVE_LOG("ATITextureUpdate: updated texture 0x%08x (%dx%d, pixelType=%d->%d, alphaMaskWhite=%d)",
+	         textureAddr, width, height, pixelType, effectivePixelType, whitenedAlphaMask);
 	return kQANoErr;
 }
 

@@ -65,6 +65,28 @@ static inline bool RaveBGRAImageHasData(const uint8_t *pixels, uint32_t pixelCou
 }
 
 /*
+ * Some classic QD3D/RAVE clients hand the engine ARGB32 mask textures whose
+ * alpha channel carries the image and whose RGB channels are entirely black.
+ * With kQATextureOp_Modulate, literal black RGB makes those masks disappear
+ * against dark scenes. Treat the no-RGB case as a coverage mask and provide
+ * white source color, matching Bugdom's own grayscale-is-alpha texture path.
+ */
+static inline bool RaveBGRAWhitenAlphaOnlyMask(uint8_t *pixels, uint32_t pixelCount)
+{
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(pixels, pixelCount);
+	if (!pixels || stats.alpha == 0 || stats.rgb != 0) return false;
+	for (uint32_t i = 0; i < pixelCount; i++) {
+		const uint32_t off = i * 4;
+		if (pixels[off + 3] != 0) {
+			pixels[off] = 0xFF;
+			pixels[off + 1] = 0xFF;
+			pixels[off + 2] = 0xFF;
+		}
+	}
+	return true;
+}
+
+/*
  *  RAVE sub-opcode constants
  *
  *  All RAVE methods are dispatched through a single NATIVE_OP slot
@@ -512,7 +534,8 @@ static inline bool RaveTextureNeedsLivePixmapRefresh(const RaveResourceEntry *en
 	return entry &&
 	       entry->metal_texture != nullptr &&
 	       entry->pixmap_mac_addr != 0 &&
-	       !entry->cpu_pixel_data_is_authoritative;
+	       !entry->cpu_pixel_data_is_authoritative &&
+	       !entry->pixels_copied;
 }
 
 #define RAVE_MAX_RESOURCES 512

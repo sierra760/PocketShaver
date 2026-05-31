@@ -76,6 +76,74 @@ struct FragmentUniforms {
     float    env_color_a;
 };
 
+static int32_t RaveNormalizeATIFogMode(const RaveDrawPrivate *priv)
+{
+	switch ((int)priv->ati_state[2].i) {
+		case 0: return 0;  // kQATIFogDisable -> None
+		case 1: return 3;  // kQATIFogExp -> Exponential
+		case 2: return 4;  // kQATIFogExp2 -> ExponentialSquared
+		case 3: return 1;  // kQATIFogAlpha -> Alpha
+		case 4: return 2;  // kQATIFogLinear -> Linear
+		default: return 0;
+	}
+}
+
+static bool RaveLooksLikeQD3DLinearFog(const RaveDrawPrivate *priv)
+{
+	return priv->state[24].f > 100.0f &&     // QD3D passes yon here in Bugdom
+	       priv->state[22].f >= 0.0f &&
+	       priv->state[22].f < priv->state[23].f &&
+	       priv->state[23].f <= 1.0f;
+}
+
+static int32_t RaveNormalizeStandardFogMode(const RaveDrawPrivate *priv)
+{
+	uint32_t mode = priv->state[17].i;
+	if (mode > 4) return 0;
+
+	/*
+	 * Bugdom's QD3D path describes plane-based linear fog, but reaches RAVE
+	 * as FogMode_ExponentialSquared with normalized start/end and camera yon
+	 * in FogDensity. Literal exp2 fog makes whole meshes collapse to fog color.
+	 */
+	if (mode == 4 && RaveLooksLikeQD3DLinearFog(priv)) return 2;
+	return (int32_t)mode;
+}
+
+static int32_t RaveEffectiveFogMode(const RaveDrawPrivate *priv)
+{
+	return priv->ati_fog_active ? RaveNormalizeATIFogMode(priv) : RaveNormalizeStandardFogMode(priv);
+}
+
+static bool RaveEffectiveFogEnabled(const RaveDrawPrivate *priv)
+{
+	return RaveEffectiveFogMode(priv) != 0;
+}
+
+static void RaveFillFogUniforms(RaveDrawPrivate *priv, FragmentUniforms *fragUniforms)
+{
+	if (priv->ati_fog_active) {
+		fragUniforms->fog_mode = RaveNormalizeATIFogMode(priv);
+		fragUniforms->fog_color_r = priv->ati_state[3].f;   // kATIFogColor_r
+		fragUniforms->fog_color_g = priv->ati_state[4].f;   // kATIFogColor_g
+		fragUniforms->fog_color_b = priv->ati_state[5].f;   // kATIFogColor_b
+		fragUniforms->fog_color_a = priv->ati_state[6].f;   // kATIFogColor_a
+		fragUniforms->fog_density = priv->ati_state[7].f;   // kATIFogDensity
+		fragUniforms->fog_start = priv->ati_state[8].f;     // kATIFogStart
+		fragUniforms->fog_end = priv->ati_state[9].f;       // kATIFogEnd
+	} else {
+		fragUniforms->fog_mode = RaveNormalizeStandardFogMode(priv);
+		fragUniforms->fog_color_a = priv->state[18].f;
+		fragUniforms->fog_color_r = priv->state[19].f;
+		fragUniforms->fog_color_g = priv->state[20].f;
+		fragUniforms->fog_color_b = priv->state[21].f;
+		fragUniforms->fog_start = priv->state[22].f;
+		fragUniforms->fog_end = priv->state[23].f;
+		fragUniforms->fog_density = priv->state[24].f;
+	}
+	fragUniforms->fog_max_depth = priv->state[25].f != 0.0f ? priv->state[25].f : 1.0f;
+}
+
 // kQAContext flag bits
 #define kQAContext_NoZBuffer  (1 << 0)
 
@@ -1017,7 +1085,7 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	int blend_mode = (int)priv->state[9].i;  // kQATag_Blend
 	int func_const_bits = 0;
 	if (textured) func_const_bits |= 1;  // bit 0 = has_texture
-	if (priv->state[17].i != 0 || priv->ati_fog_active) func_const_bits |= 2;  // bit 1: has_fog
+	if (RaveEffectiveFogEnabled(priv)) func_const_bits |= 2;  // bit 1: has_fog
 	if (priv->state[31].i != 0 && priv->state[31].i != 7) func_const_bits |= 4;  // bit 2: has_alpha_test
 	if (priv->multiTextureActive) func_const_bits |= 8;  // bit 3: has_multi_texture
 
@@ -1171,36 +1239,7 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	// Always bind fragment uniforms (needed for fog/alpha_test even without texture)
 	FragmentUniforms fragUniforms = {};
 	if (textured) fragUniforms.texture_op = (int32_t)priv->state[12].i;
-	// Fog parameters: ATI fog overrides standard when ati_fog_active is true
-	if (priv->ati_fog_active) {
-		int ati_fog_mode = (int)priv->ati_state[2].i;  // kATIFogMode (index 2)
-		switch (ati_fog_mode) {
-			case 0: fragUniforms.fog_mode = 0; break;  // kQATIFogDisable -> None
-			case 1: fragUniforms.fog_mode = 3; break;  // kQATIFogExp -> Exponential
-			case 2: fragUniforms.fog_mode = 4; break;  // kQATIFogExp2 -> ExponentialSquared
-			case 3: fragUniforms.fog_mode = 1; break;  // kQATIFogAlpha -> Alpha
-			case 4: fragUniforms.fog_mode = 2; break;  // kQATIFogLinear -> Linear
-			default: fragUniforms.fog_mode = 0; break;
-		}
-		fragUniforms.fog_color_r = priv->ati_state[3].f;   // kATIFogColor_r
-		fragUniforms.fog_color_g = priv->ati_state[4].f;   // kATIFogColor_g
-		fragUniforms.fog_color_b = priv->ati_state[5].f;   // kATIFogColor_b
-		fragUniforms.fog_color_a = priv->ati_state[6].f;   // kATIFogColor_a
-		fragUniforms.fog_density = priv->ati_state[7].f;    // kATIFogDensity
-		fragUniforms.fog_start   = priv->ati_state[8].f;    // kATIFogStart
-		fragUniforms.fog_end     = priv->ati_state[9].f;    // kATIFogEnd
-		fragUniforms.fog_max_depth = priv->state[25].f != 0.0f ? priv->state[25].f : 1.0f;
-	} else {
-		fragUniforms.fog_mode       = (int32_t)priv->state[17].i;
-		fragUniforms.fog_color_a    = priv->state[18].f;
-		fragUniforms.fog_color_r    = priv->state[19].f;
-		fragUniforms.fog_color_g    = priv->state[20].f;
-		fragUniforms.fog_color_b    = priv->state[21].f;
-		fragUniforms.fog_start      = priv->state[22].f;
-		fragUniforms.fog_end        = priv->state[23].f;
-		fragUniforms.fog_density    = priv->state[24].f;
-		fragUniforms.fog_max_depth  = priv->state[25].f != 0.0f ? priv->state[25].f : 1.0f;
-	}
+	RaveFillFogUniforms(priv, &fragUniforms);
 	fragUniforms.alpha_test_func = (int32_t)priv->state[31].i;
 	fragUniforms.alpha_test_ref = priv->state[46].f;
 	fragUniforms.multi_texture_op = priv->state[35].i;      // kQATag_MultiTextureOp
@@ -1324,35 +1363,7 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 
 	// Build fragment uniforms once (fog/alpha state is per-context, not per-triangle)
 	FragmentUniforms fragUniforms = {};
-	if (priv->ati_fog_active) {
-		int ati_fog_mode = (int)priv->ati_state[2].i;
-		switch (ati_fog_mode) {
-			case 0: fragUniforms.fog_mode = 0; break;
-			case 1: fragUniforms.fog_mode = 3; break;
-			case 2: fragUniforms.fog_mode = 4; break;
-			case 3: fragUniforms.fog_mode = 1; break;
-			case 4: fragUniforms.fog_mode = 2; break;
-			default: fragUniforms.fog_mode = 0; break;
-		}
-		fragUniforms.fog_color_r = priv->ati_state[3].f;
-		fragUniforms.fog_color_g = priv->ati_state[4].f;
-		fragUniforms.fog_color_b = priv->ati_state[5].f;
-		fragUniforms.fog_color_a = priv->ati_state[6].f;
-		fragUniforms.fog_density = priv->ati_state[7].f;
-		fragUniforms.fog_start   = priv->ati_state[8].f;
-		fragUniforms.fog_end     = priv->ati_state[9].f;
-		fragUniforms.fog_max_depth = priv->state[25].f != 0.0f ? priv->state[25].f : 1.0f;
-	} else {
-		fragUniforms.fog_mode       = (int32_t)priv->state[17].i;
-		fragUniforms.fog_color_a    = priv->state[18].f;
-		fragUniforms.fog_color_r    = priv->state[19].f;
-		fragUniforms.fog_color_g    = priv->state[20].f;
-		fragUniforms.fog_color_b    = priv->state[21].f;
-		fragUniforms.fog_start      = priv->state[22].f;
-		fragUniforms.fog_end        = priv->state[23].f;
-		fragUniforms.fog_density    = priv->state[24].f;
-		fragUniforms.fog_max_depth  = priv->state[25].f != 0.0f ? priv->state[25].f : 1.0f;
-	}
+	RaveFillFogUniforms(priv, &fragUniforms);
 	fragUniforms.alpha_test_func = (int32_t)priv->state[31].i;
 	fragUniforms.alpha_test_ref = priv->state[46].f;
 	fragUniforms.mipmap_bias = priv->state[41].f;
@@ -1367,7 +1378,7 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 	if (vertUniforms.point_width < 1.0f) vertUniforms.point_width = 1.0f;
 	[ms->currentEncoder setVertexBytes:&vertUniforms length:sizeof(vertUniforms) atIndex:2];
 
-	bool hasFog = (priv->state[17].i != 0 || priv->ati_fog_active);
+	bool hasFog = RaveEffectiveFogEnabled(priv);
 	bool hasAlphaTest = (priv->state[31].i != 0 && priv->state[31].i != 7);
 
 	// Batch consecutive triangles that share the same render state into single
@@ -2600,11 +2611,19 @@ int32 NativeDrawTriMeshTexture(uint32 drawContextAddr, uint32 numTriangles, uint
 			raw2 = ReadMacInt32(trianglesAddr + 8);
 			raw3 = ReadMacInt32(trianglesAddr + 12);
 		}
-		RAVE_LOG("MeshTex: f=%u tris=%u/%u(oob=%u) staged=%u zfunc=%d blend=%d tex=0x%08x texOp=%d raw0=[%u,%u,%u,%u]",
+		RAVE_LOG("MeshTex: f=%u tris=%u/%u(oob=%u) staged=%u zfunc=%d zmask=%d blend=%d tex=0x%08x texOp=%d alpha=%d/%.3f fog=%d->%d atiFog=%d fogRGBA=[%.3f,%.3f,%.3f,%.3f] fogRange=[%.3f,%.3f] fogDensity=%.6f fogMax=%.3f filter=%d wrap=%u/%u raw0=[%u,%u,%u,%u]",
 		         priv->frameCount, outIdx / 3, numTriangles, oobCount,
 		         priv->vertexStagingCount,
-		         (int)priv->state[0].i, (int)priv->state[9].i,
+		         (int)priv->state[0].i, (int)priv->state[28].i,
+		         (int)priv->state[9].i,
 		         priv->state[13].i, (int)priv->state[12].i,
+		         (int)priv->state[31].i, priv->state[46].f,
+		         (int)priv->state[17].i, (int)RaveEffectiveFogMode(priv),
+		         priv->ati_fog_active ? 1 : 0,
+		         priv->state[18].f, priv->state[19].f, priv->state[20].f, priv->state[21].f,
+		         priv->state[22].f, priv->state[23].f, priv->state[24].f, priv->state[25].f,
+		         (int)priv->state[11].i,
+		         priv->state[101].i, priv->state[102].i,
 		         raw0, raw1, raw2, raw3);
 	}
 
@@ -4225,10 +4244,10 @@ void RaveReleaseTexture(void *metalTexture)
 /*
  *  RaveRefreshTextureFromPixmap - re-read pixmap and re-upload to Metal texture
  *
- *  Called every draw for deferred direct-format textures that still point at a
- *  live pixmap. The original RAVE software renderer reads the pixmap live, so
- *  QD3D's IR can keep writing into the same pixmap after the first non-zero
- *  pixels appear. We must mirror this and avoid freezing partial textures.
+ *  Called for deferred direct-format textures that were empty when first
+ *  realized. Standard QATextureNew has copy semantics unless kQATexture_NoCopy
+ *  is explicitly used; since Bugdom's calls have flags=0, stop polling once
+ *  non-empty data is captured so later heap reuse cannot corrupt the texture.
  */
 void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 {
@@ -4251,9 +4270,11 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 		pixmap = entry->cpu_pixel_mac_addr;
 	}
 
-	// Always re-read and re-upload — the pixmap is a live buffer
+	// Re-read until non-empty data appears.
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
+	const bool whitenedAlphaMask =
+		(pixelType == 4) && RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);  // kQAPixel_ARGB32
 
 	// Check the whole converted image. ARGB16 sprites can have transparent
 	// leading scanlines, so a top-left sample is not enough to decide whether
@@ -4272,16 +4293,17 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 		// First non-empty data observed. Under R2 authoritative read path
 		// `pixmap == cpu_pixel_mac_addr`, so this copy is a no-op
 		// (self-copy). Under the classic path it mirrors the pixmap data
-		// into cpu_pixel_data for AccessTexture consumers. Refresh still
-		// continues on later draws because live pixmaps may change again.
+		// into cpu_pixel_data for AccessTexture consumers. No further refresh
+		// is needed for normal copy-semantics textures.
 		if (entry->cpu_pixel_data && entry->cpu_pixel_mac_addr) {
 			Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 		}
 		entry->pixels_copied = true;
-		RAVE_LOG("TextureRefresh: pixelType=%d %dx%d pixmap=0x%08x -> first non-empty data observed nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+		RAVE_LOG("TextureRefresh: pixelType=%d %dx%d pixmap=0x%08x -> first non-empty data observed nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u alphaMaskWhite=%d",
 		       pixelType, w, h, pixmap,
 		       sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
-		       sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb);
+		       sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb,
+		       whitenedAlphaMask);
 	}
 }
 

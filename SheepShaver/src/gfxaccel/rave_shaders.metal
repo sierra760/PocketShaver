@@ -213,7 +213,7 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
             // Alpha-based fog: vertex alpha IS the fog interpolation factor
             fog_factor = color.a;
         } else if (uniforms.fog_mode == 2) {
-            // Linear fog: z = 1/invW, fog = clamp((end - z) / (end - start), 0, 1)
+            // Linear fog: use perspective depth; submitted z is post-projection depth and over-fogs QD3D menu billboards.
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             fog_factor = clamp((uniforms.fog_end - z) / (uniforms.fog_end - uniforms.fog_start), 0.0, 1.0);
         } else if (uniforms.fog_mode == 3) {
