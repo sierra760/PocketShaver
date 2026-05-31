@@ -29,9 +29,57 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <cstdarg>
 
 #define DEBUG 0
 #include "debug.h"
+
+#if ACCEL_LOGGING_ENABLED
+static FILE *RaveDiagFile()
+{
+	static bool initialized = false;
+	static FILE *file = nullptr;
+
+	if (initialized) return file;
+	initialized = true;
+
+	const char *dumpDir = getenv("TMPDIR");
+	if (dumpDir == nullptr || dumpDir[0] == '\0') dumpDir = "/tmp";
+	size_t dumpDirLen = strlen(dumpDir);
+	const char *slash = (dumpDirLen > 0 && dumpDir[dumpDirLen - 1] == '/') ? "" : "/";
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s%srave_diag.txt", dumpDir, slash);
+	file = fopen(path, "w");
+	if (file != nullptr) {
+		printf("RAVE DIAG: verbose log path=%s\n", path);
+		fflush(stdout);
+	} else {
+		printf("RAVE DIAG: verbose log fopen_failed path=%s errno=%d (%s)\n",
+		       path, errno, strerror(errno));
+		fflush(stdout);
+	}
+	return file;
+}
+
+void RaveDiagLog(const char *fmt, ...)
+{
+	if (!rave_logging_enabled) return;
+	FILE *file = RaveDiagFile();
+	if (file == nullptr) return;
+
+	va_list args;
+	va_start(args, fmt);
+	fprintf(file, "RAVE DIAG: ");
+	vfprintf(file, fmt, args);
+	fprintf(file, "\n");
+	fflush(file);
+	va_end(args);
+}
+#endif
 
 #ifdef TESTING_BUILD
 // ---------------------------------------------------------------------------
@@ -936,11 +984,11 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 			memcpy(&px[i], &dst[i * 4], 4);
 		}
 		RaveBGRAImageStats stats = RaveBGRAImageAnalyze(dst, numPx);
-		printf("RAVE DIAG: ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u\n",
-		       RavePixelFormatName(pixelType), pixelType, width, height,
-		       px[0], px[1], px[2], px[3],
-		       stats.nonzero, stats.alpha, stats.rgb, stats.white,
-		       stats.first_nonzero, stats.first_alpha, stats.first_rgb);
+		RaveDiagLog("ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+		            RavePixelFormatName(pixelType), pixelType, width, height,
+		            px[0], px[1], px[2], px[3],
+		            stats.nonzero, stats.alpha, stats.rgb, stats.white,
+		            stats.first_nonzero, stats.first_alpha, stats.first_rgb);
 	}
 
 	return converted;
@@ -1008,9 +1056,9 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 
 	// [DIAG-T03] Texture creation diagnostic: format, dimensions, flags
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: TextureCreate fmt=%s(%d) %dx%d mips=%d indexed=%d flags=0x%08X rowBytes=%d\n",
-		       RavePixelFormatName(pixelType), pixelType, w, h, mipLevels,
-		       isIndexed ? 1 : 0, flags, rowBytes);
+		RaveDiagLog("TextureCreate fmt=%s(%d) %dx%d mips=%d indexed=%d flags=0x%08X rowBytes=%d",
+		            RavePixelFormatName(pixelType), pixelType, w, h, mipLevels,
+		            isIndexed ? 1 : 0, flags, rowBytes);
 	}
 
 	if (isIndexed) {
@@ -1136,8 +1184,8 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		for (int s = 0; s < 4 && s < (int)(w * h); s++) {
 			raw[s] = (uint16_t)ReadMacInt16(pixmap + s * 2);
 		}
-		printf("RAVE DIAG: Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x (%s)\n",
-		       raw[0], raw[1], raw[2], raw[3], pixmap, readSrcName);
+		RaveDiagLog("Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x (%s)",
+		            raw[0], raw[1], raw[2], raw[3], pixmap, readSrcName);
 	}
 
 	uint8_t *expanded = new uint8_t[w * h * 4];
@@ -1226,9 +1274,9 @@ static void RaveCreateBitmapFromImage(uint32_t pixelType, uint32 imageAddr,
 
 	// [DIAG-T03] Bitmap creation diagnostic: format, dimensions, flags
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: BitmapCreate fmt=%s(%d) %dx%d indexed=%d rowBytes=%d\n",
-		       RavePixelFormatName(pixelType), pixelType, w, h,
-		       isIndexed ? 1 : 0, rowBytes);
+		RaveDiagLog("BitmapCreate fmt=%s(%d) %dx%d indexed=%d rowBytes=%d",
+		            RavePixelFormatName(pixelType), pixelType, w, h,
+		            isIndexed ? 1 : 0, rowBytes);
 	}
 
 	if (isIndexed) {
@@ -1360,16 +1408,126 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 		               texEntry->row_bytes, clutEntry->clut_data, clutEntry->clut_count);
 	}
 
-	// [DIAG-T03] Log first 4 BGRA pixels after CLUT expansion
+	// [DIAG-T03] Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
 	if (rave_logging_enabled && w > 0 && h > 0) {
+		static uint32_t sClutDumpCount = 0;
 		uint32_t px[4] = {0, 0, 0, 0};
 		uint32_t numPx = w * h;
+		uint32_t alphaZero = 0;
+		uint32_t indexZero = 0;
 		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
 			memcpy(&px[i], &expanded[i * 4], 4);
 		}
-		printf("RAVE DIAG: CLUTExpand fmt=%s(%d) %dx%d clut=%d px[0-3]=%08X %08X %08X %08X\n",
-		       RavePixelFormatName(texEntry->pixel_type), texEntry->pixel_type, w, h,
-		       clutEntry->clut_count, px[0], px[1], px[2], px[3]);
+		for (uint32_t i = 0; i < numPx; i++) {
+			if (expanded[i * 4 + 3] == 0) alphaZero++;
+		}
+		if (texEntry->pixel_type == kQAPixel_CL8) {
+			for (uint32_t y = 0; y < h; y++) {
+				for (uint32_t x = 0; x < w; x++) {
+					if (texEntry->original_pixels[y * texEntry->row_bytes + x] == 0) indexZero++;
+				}
+			}
+		} else if (texEntry->pixel_type == kQAPixel_CL4) {
+			for (uint32_t y = 0; y < h; y++) {
+				for (uint32_t x = 0; x < w; x++) {
+					uint8_t byte = texEntry->original_pixels[y * texEntry->row_bytes + x / 2];
+					uint8_t idx = (x & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+					if (idx == 0) indexZero++;
+				}
+			}
+		}
+		texEntry->diag_alpha_zero = alphaZero;
+		texEntry->diag_index_zero = indexZero;
+		RaveDiagLog("CLUTExpand fmt=%s(%d) %dx%d clut=%d px[0-3]=%08X %08X %08X %08X alpha0=%u idx0=%u transIdx=%d",
+		            RavePixelFormatName(texEntry->pixel_type), texEntry->pixel_type, w, h,
+		            clutEntry->clut_count, px[0], px[1], px[2], px[3],
+		            alphaZero, indexZero, clutEntry->transparent_index);
+
+		if (alphaZero > 0 && sClutDumpCount < 8) {
+			sClutDumpCount++;
+			const char *dumpDir = getenv("TMPDIR");
+			if (dumpDir == nullptr || dumpDir[0] == '\0') dumpDir = "/tmp";
+			size_t dumpDirLen = strlen(dumpDir);
+			const char *slash = (dumpDirLen > 0 && dumpDir[dumpDirLen - 1] == '/') ? "" : "/";
+			char path[192];
+			snprintf(path, sizeof(path),
+			         "%s%srave_clut_%02u_mac%08x_%ux%u_a0%u.ppm",
+			         dumpDir, slash, sClutDumpCount, texEntry->mac_addr, w, h, alphaZero);
+			FILE *f = fopen(path, "wb");
+			if (f != nullptr) {
+				fprintf(f, "P6\n%u %u\n255\n", w, h);
+				for (uint32_t y = 0; y < h; y++) {
+					for (uint32_t x = 0; x < w; x++) {
+						uint32_t p = (y * w + x) * 4;
+						uint8_t b = expanded[p + 0];
+						uint8_t g = expanded[p + 1];
+						uint8_t r = expanded[p + 2];
+						uint8_t a = expanded[p + 3];
+						uint8_t rgb[3];
+						if (a == 0) {
+							bool checker = (((x >> 3) ^ (y >> 3)) & 1) != 0;
+							rgb[0] = checker ? 0x40 : 0x20;
+							rgb[1] = 0x00;
+							rgb[2] = checker ? 0x40 : 0x20;
+						} else {
+							rgb[0] = r;
+							rgb[1] = g;
+							rgb[2] = b;
+						}
+						fwrite(rgb, 1, sizeof(rgb), f);
+					}
+				}
+				fclose(f);
+				RaveDiagLog("CLUTDump path=%s", path);
+			} else {
+				RaveDiagLog("CLUTDump fopen_failed path=%s errno=%d (%s)",
+				            path, errno, strerror(errno));
+			}
+
+			if (sClutDumpCount <= 3) {
+				const uint32_t cols = 64;
+				const uint32_t rows = 64;
+				const char ramp[] = " .:-=+*#%@";
+				RaveDiagLog("CLUTAscii[%u] mac=0x%08x %ux%u alpha0=%u begin",
+				            sClutDumpCount, texEntry->mac_addr, w, h, alphaZero);
+				for (uint32_t row = 0; row < rows; row++) {
+					char line[cols + 1];
+					uint32_t y0 = (row * h) / rows;
+					uint32_t y1 = ((row + 1) * h) / rows;
+					if (y1 <= y0) y1 = y0 + 1;
+					for (uint32_t col = 0; col < cols; col++) {
+						uint32_t x0 = (col * w) / cols;
+						uint32_t x1 = ((col + 1) * w) / cols;
+						if (x1 <= x0) x1 = x0 + 1;
+						uint32_t opaqueCount = 0;
+						uint32_t lumSum = 0;
+						for (uint32_t yy = y0; yy < y1 && yy < h; yy++) {
+							for (uint32_t xx = x0; xx < x1 && xx < w; xx++) {
+								uint32_t p = (yy * w + xx) * 4;
+								uint8_t b = expanded[p + 0];
+								uint8_t g = expanded[p + 1];
+								uint8_t r = expanded[p + 2];
+								uint8_t a = expanded[p + 3];
+								if (a != 0) {
+									opaqueCount++;
+									lumSum += (uint32_t)r * 30 + (uint32_t)g * 59 + (uint32_t)b * 11;
+								}
+							}
+						}
+						if (opaqueCount == 0) {
+							line[col] = ' ';
+						} else {
+							uint32_t lum = lumSum / (opaqueCount * 100);
+							uint32_t rampIdx = (lum * 9) / 255;
+							line[col] = ramp[rampIdx];
+						}
+					}
+					line[cols] = '\0';
+					RaveDiagLog("CLUTAscii[%u] |%s|", sClutDumpCount, line);
+				}
+				RaveDiagLog("CLUTAscii[%u] end", sClutDumpCount);
+			}
+		}
 	}
 
 	texEntry->metal_texture = RaveCreateMetalTexture(w, h, texEntry->mip_levels, expanded, w * 4);

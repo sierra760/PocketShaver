@@ -182,6 +182,7 @@ static void InitStateDefaults(RaveDrawPrivate *ctx, uint32 flags)
 	// ATI state defaults (all zero from memset in RaveDrawPrivate allocation)
 	ctx->ati_fog_active = false;
 	memset(ctx->ati_state, 0, sizeof(ctx->ati_state));
+	ctx->ati_state[kRaveATIDepthWriteEnableIndex].i = 1;
 }
 
 /*
@@ -436,6 +437,9 @@ int32 NativeSetFloat(uint32 drawContextAddr, uint32 tag, uint32 valueBits)
 			float value;
 			memcpy(&value, &valueBits, sizeof(float));
 			ctx->ati_state[ati_idx].f = value;
+			if (ati_idx == kRaveATIDepthWriteEnableIndex) {
+				ctx->dirty_flags |= 1;
+			}
 			// Activate ATI fog override when fog-related tags are set (indices 2-9)
 			if (ati_idx >= 2 && ati_idx <= 9) {
 				ctx->ati_fog_active = true;
@@ -480,6 +484,9 @@ int32 NativeSetInt(uint32 drawContextAddr, uint32 tag, uint32 value)
 		uint32_t ati_idx = tag - 1000;
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
 			ctx->ati_state[ati_idx].i = value;
+			if (ati_idx == kRaveATIDepthWriteEnableIndex) {
+				ctx->dirty_flags |= 1;
+			}
 			// Activate ATI fog override when fog-related tags are set (indices 2-9)
 			if (ati_idx >= 2 && ati_idx <= 9) {
 				ctx->ati_fog_active = true;

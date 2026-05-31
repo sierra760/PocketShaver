@@ -232,6 +232,22 @@ enum {
 #define RAVE_MAX_TAG 154  // covers GL tags up to kQATagGL_TextureEnvColor_b (153)
 #define RAVE_ATI_TAG_COUNT 43  // kATITriCache(0) through kATIMeshAsStrip(42)
 
+static constexpr uint32_t kRaveATIDepthWriteEnableTag = 1022;
+static constexpr uint32_t kRaveATIDepthWriteEnableIndex = kRaveATIDepthWriteEnableTag - 1000;
+
+static inline bool RaveEffectiveDepthWriteEnabled(uint32_t standardZBufferMask,
+                                                  uint32_t atiDepthWriteEnable)
+{
+	return standardZBufferMask != 0 && atiDepthWriteEnable != 0;
+}
+
+static inline float RaveClampMetalDepth(float z)
+{
+	if (!(z >= 0.0f)) return 0.0f;
+	if (z > 1.0f) return 1.0f;
+	return z;
+}
+
 union RaveStateValue {
 	float    f;
 	uint32_t i;
@@ -458,6 +474,12 @@ extern os_log_t rave_log;
 
 extern bool rave_logging_enabled;
 
+#if defined(__GNUC__)
+void RaveDiagLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#else
+void RaveDiagLog(const char *fmt, ...);
+#endif
+
 #ifdef __APPLE__
 #define RAVE_LOG(fmt, ...) do { \
 	if (rave_logging_enabled) \
@@ -474,6 +496,7 @@ extern bool rave_logging_enabled;
 
 static constexpr bool rave_logging_enabled = false;
 #define RAVE_LOG(fmt, ...) do {} while (0)
+static inline void RaveDiagLog(const char *, ...) {}
 
 #endif /* ACCEL_LOGGING_ENABLED */
 
@@ -506,6 +529,8 @@ struct RaveResourceEntry {
 	uint8_t          priority;        // 4-bit priority (0-15) from bits [31:28] per RAVE 1.6 spec
 	uint32_t         pixmap_mac_addr; // deferred direct texture Mac address
 	bool             pixels_copied;   // true once non-empty direct texture data has been observed
+	uint32_t         diag_alpha_zero; // diagnostic: transparent pixels after latest CLUT expansion
+	uint32_t         diag_index_zero; // diagnostic: source index-zero pixels after latest CLUT expansion
 
 	// CPU pixel access (AccessTexture/AccessBitmap support)
 	uint8_t         *cpu_pixel_data;       // permanent CPU copy in original Mac format

@@ -19,6 +19,7 @@
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -202,6 +203,7 @@ struct RaveMetalState {
 	uint32_t                    bitmapCount;        // DrawBitmap calls
 	uint32_t                    pointCount;         // DrawPoint calls
 	uint32_t                    lineCount;          // DrawLine calls
+	uint32_t                    textureDrawCounts[RAVE_MAX_RESOURCES + 1]; // 1-based resource handle draw counts
 
 	// Buffer access staging (AccessDrawBuffer/AccessZBuffer)
 	id<MTLTexture>              stagingDrawBuffer;    // CPU-readable color staging (MTLStorageModeShared)
@@ -1131,7 +1133,8 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	if (forceAll || (priv->dirty_flags & 1)) {
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc]) {
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -1295,17 +1298,195 @@ static inline float ReadMacFloat(uint32 addr) {
 	return f;
 }
 
+static uint32_t RaveVertexPrimitiveCount(uint32_t nVertices, uint32_t vertexMode)
+{
+	switch (vertexMode) {
+	case 0: return nVertices;                 // points
+	case 1: return nVertices / 2;             // independent lines
+	case 2: return nVertices > 1 ? nVertices - 1 : 0;  // line strip
+	case 3: return nVertices / 3;             // triangle list
+	case 4:
+	case 5: return nVertices > 2 ? nVertices - 2 : 0;  // triangle strip/fan
+	default: return 0;
+	}
+}
+
+static void RaveTrackTextureDraw(RaveDrawPrivate *priv)
+{
+	if (!priv || !priv->metal) return;
+	uint32_t texAddr = priv->state[13].i;
+	uint32_t texHandle = RaveResourceFindByAddr(texAddr);
+	if (texHandle > 0 && texHandle <= RAVE_MAX_RESOURCES) {
+		priv->metal->textureDrawCounts[texHandle]++;
+	}
+}
+
+static void RaveLogLineDiagnostics(const char *source, const RaveDrawPrivate *priv,
+                                   const RaveVertex *verts, uint32_t vertexCount,
+                                   uint32_t primitiveCount, uint32_t vertexMode,
+                                   bool textured)
+{
+	static uint32_t sLineDiagCount = 0;
+	if (sLineDiagCount >= 96 || vertexCount == 0 || !verts) return;
+	sLineDiagCount++;
+
+	float minX = verts[0].pos[0], maxX = verts[0].pos[0];
+	float minY = verts[0].pos[1], maxY = verts[0].pos[1];
+	float minZ = verts[0].pos[2], maxZ = verts[0].pos[2];
+	float minA = verts[0].color[3], maxA = verts[0].color[3];
+	float minR = verts[0].color[0], maxR = verts[0].color[0];
+	float minG = verts[0].color[1], maxG = verts[0].color[1];
+	float minB = verts[0].color[2], maxB = verts[0].color[2];
+	for (uint32_t i = 1; i < vertexCount; i++) {
+		minX = std::min(minX, verts[i].pos[0]);
+		maxX = std::max(maxX, verts[i].pos[0]);
+		minY = std::min(minY, verts[i].pos[1]);
+		maxY = std::max(maxY, verts[i].pos[1]);
+		minZ = std::min(minZ, verts[i].pos[2]);
+		maxZ = std::max(maxZ, verts[i].pos[2]);
+		minA = std::min(minA, verts[i].color[3]);
+		maxA = std::max(maxA, verts[i].color[3]);
+		minR = std::min(minR, verts[i].color[0]);
+		maxR = std::max(maxR, verts[i].color[0]);
+		minG = std::min(minG, verts[i].color[1]);
+		maxG = std::max(maxG, verts[i].color[1]);
+		minB = std::min(minB, verts[i].color[2]);
+		maxB = std::max(maxB, verts[i].color[2]);
+	}
+
+	RaveDiagLog("LineDiag[%u] %s frame=%u mode=%u verts=%u prims=%u textured=%d tex=0x%08x "
+	            "x=[%.1f,%.1f] y=[%.1f,%.1f] z=[%.3f,%.3f] a=[%.2f,%.2f] "
+	            "rgb=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] width=%.2f blend=%u zfunc=%u zmask=%u atizwrite=%u chan=0x%x",
+	            sLineDiagCount, source, priv->frameCount, vertexMode, vertexCount, primitiveCount,
+	            textured ? 1 : 0, textured ? priv->state[13].i : 0,
+	            minX, maxX, minY, maxY, minZ, maxZ, minA, maxA,
+	            minR, maxR, minG, maxG, minB, maxB,
+	            priv->state[5].f, priv->state[9].i, priv->state[0].i, priv->state[28].i,
+	            priv->ati_state[kRaveATIDepthWriteEnableIndex].i, priv->state[27].i);
+}
+
+static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate *priv,
+                                       const RaveVertex *verts, uint32_t vertexCount,
+                                       uint32_t primitiveCount, uint32_t vertexMode)
+{
+	static uint32_t sTexDiagCount = 0;
+	static uint32_t sHighAlphaTexDiagCount = 0;
+	if (vertexCount == 0 || !verts) return;
+
+	uint32_t texAddr = priv->state[13].i;
+	uint32_t texHandle = RaveResourceFindByAddr(texAddr);
+	RaveResourceEntry *texEntry = RaveResourceGet(texHandle);
+	uint32_t texW = texEntry ? texEntry->width : 0;
+	uint32_t texH = texEntry ? texEntry->height : 0;
+	uint32_t texType = texEntry ? texEntry->pixel_type : 0;
+	uint32_t texClut = texEntry ? texEntry->bound_clut : 0;
+	uint32_t texPixels = texW * texH;
+	bool highAlphaTexture = texEntry && texPixels != 0 && texEntry->diag_alpha_zero > (texPixels / 2);
+	const char *diagName = "VTexDiag";
+	uint32_t diagSeq = 0;
+	if (sTexDiagCount < 192) {
+		diagSeq = ++sTexDiagCount;
+	} else if (highAlphaTexture && sHighAlphaTexDiagCount < 160) {
+		diagSeq = ++sHighAlphaTexDiagCount;
+		diagName = "HighAlphaTexDiag";
+	} else {
+		return;
+	}
+
+	float minX = verts[0].pos[0], maxX = verts[0].pos[0];
+	float minY = verts[0].pos[1], maxY = verts[0].pos[1];
+	float minZ = verts[0].pos[2], maxZ = verts[0].pos[2];
+	float minA = verts[0].color[3], maxA = verts[0].color[3];
+	float minR = verts[0].color[0], maxR = verts[0].color[0];
+	float minG = verts[0].color[1], maxG = verts[0].color[1];
+	float minB = verts[0].color[2], maxB = verts[0].color[2];
+	float minKdR = verts[0].diffuse[0], maxKdR = verts[0].diffuse[0];
+	float minKdG = verts[0].diffuse[1], maxKdG = verts[0].diffuse[1];
+	float minKdB = verts[0].diffuse[2], maxKdB = verts[0].diffuse[2];
+	float minKsR = verts[0].specular[0], maxKsR = verts[0].specular[0];
+	float minKsG = verts[0].specular[1], maxKsG = verts[0].specular[1];
+	float minKsB = verts[0].specular[2], maxKsB = verts[0].specular[2];
+	float minU = (verts[0].uv[2] != 0.0f) ? (verts[0].uv[0] / verts[0].uv[2]) : 0.0f;
+	float maxU = minU;
+	float minV = (verts[0].uv[2] != 0.0f) ? (verts[0].uv[1] / verts[0].uv[2]) : 0.0f;
+	float maxV = minV;
+	float minInvW = verts[0].uv[2], maxInvW = verts[0].uv[2];
+
+	for (uint32_t i = 1; i < vertexCount; i++) {
+		minX = std::min(minX, verts[i].pos[0]);
+		maxX = std::max(maxX, verts[i].pos[0]);
+		minY = std::min(minY, verts[i].pos[1]);
+		maxY = std::max(maxY, verts[i].pos[1]);
+		minZ = std::min(minZ, verts[i].pos[2]);
+		maxZ = std::max(maxZ, verts[i].pos[2]);
+		minA = std::min(minA, verts[i].color[3]);
+		maxA = std::max(maxA, verts[i].color[3]);
+		minR = std::min(minR, verts[i].color[0]);
+		maxR = std::max(maxR, verts[i].color[0]);
+		minG = std::min(minG, verts[i].color[1]);
+		maxG = std::max(maxG, verts[i].color[1]);
+		minB = std::min(minB, verts[i].color[2]);
+		maxB = std::max(maxB, verts[i].color[2]);
+		minKdR = std::min(minKdR, verts[i].diffuse[0]);
+		maxKdR = std::max(maxKdR, verts[i].diffuse[0]);
+		minKdG = std::min(minKdG, verts[i].diffuse[1]);
+		maxKdG = std::max(maxKdG, verts[i].diffuse[1]);
+		minKdB = std::min(minKdB, verts[i].diffuse[2]);
+		maxKdB = std::max(maxKdB, verts[i].diffuse[2]);
+		minKsR = std::min(minKsR, verts[i].specular[0]);
+		maxKsR = std::max(maxKsR, verts[i].specular[0]);
+		minKsG = std::min(minKsG, verts[i].specular[1]);
+		maxKsG = std::max(maxKsG, verts[i].specular[1]);
+		minKsB = std::min(minKsB, verts[i].specular[2]);
+		maxKsB = std::max(maxKsB, verts[i].specular[2]);
+		float u = (verts[i].uv[2] != 0.0f) ? (verts[i].uv[0] / verts[i].uv[2]) : 0.0f;
+		float v = (verts[i].uv[2] != 0.0f) ? (verts[i].uv[1] / verts[i].uv[2]) : 0.0f;
+		minU = std::min(minU, u);
+		maxU = std::max(maxU, u);
+		minV = std::min(minV, v);
+		maxV = std::max(maxV, v);
+		minInvW = std::min(minInvW, verts[i].uv[2]);
+		maxInvW = std::max(maxInvW, verts[i].uv[2]);
+	}
+
+	RaveDiagLog("%s[%u] %s frame=%u mode=%u verts=%u prims=%u tex=0x%08x h=%u "
+	            "size=%ux%u fmt=%u clut=%u x=[%.1f,%.1f] y=[%.1f,%.1f] z=[%.3f,%.3f] "
+	            "uv=[%.4f,%.4f]x[%.4f,%.4f] invW=[%.6f,%.6f] a=[%.2f,%.2f] "
+	            "rgb=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] kd=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] "
+	            "ks=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] texOp=%u filt=%u blend=%u zfunc=%u zmask=%u atizwrite=%u "
+	            "chan=0x%x alpha=%u/%.3f fog=%d atiFog=%d fogRange=[%.3f,%.3f] fogDensity=%.6f multi=%u/%u",
+	            diagName, diagSeq, source, priv->frameCount, vertexMode, vertexCount, primitiveCount,
+	            texAddr, texHandle, texW, texH, texType, texClut,
+	            minX, maxX, minY, maxY, minZ, maxZ,
+	            minU, maxU, minV, maxV, minInvW, maxInvW, minA, maxA,
+	            minR, maxR, minG, maxG, minB, maxB,
+	            minKdR, maxKdR, minKdG, maxKdG, minKdB, maxKdB,
+	            minKsR, maxKsR, minKsG, maxKsG, minKsB, maxKsB,
+	            priv->state[12].i, priv->state[11].i, priv->state[9].i,
+	            priv->state[0].i, priv->state[28].i,
+	            priv->ati_state[kRaveATIDepthWriteEnableIndex].i, priv->state[27].i,
+	            priv->state[31].i, priv->state[46].f,
+	            RaveEffectiveFogMode(priv), priv->ati_fog_active ? 1 : 0,
+	            priv->ati_fog_active ? priv->ati_state[8].f : priv->state[22].f,
+	            priv->ati_fog_active ? priv->ati_state[9].f : priv->state[23].f,
+	            priv->ati_fog_active ? priv->ati_state[7].f : priv->state[24].f,
+	            priv->multiTextureActive ? 1 : 0, priv->multiTextureHandle);
+}
+
 static void ConvertGouraudVertex(uint32 srcAddr, RaveVertex *dst, bool perspZ) {
 	dst->pos[0] = ReadMacFloat(srcAddr + 0);   // x (pixel)
 	dst->pos[1] = ReadMacFloat(srcAddr + 4);   // y (pixel)
 	float z    = ReadMacFloat(srcAddr + 8);     // z (0..1)
 	float invW = ReadMacFloat(srcAddr + 12);    // 1/w
-	// Always use raw z for depth buffer. The perspZ flag (kQATag_PerspectiveZ)
+	// Clamp RAVE's submitted depth into Metal's clip range. Tomb Raider Gold's
+	// QD3D menu text can submit large negative z while still expecting rasterization.
+	// Metal clips those vertices before depth testing unless we normalize here.
+	// The perspZ flag (kQATag_PerspectiveZ)
 	// tells the hardware about z-value distribution (linear vs 1/z) for
 	// precision, but z is already in [0,1] range for the depth buffer.
 	// Using 1/invW (= w) produces values like 95.0 for Tomb Raider,
 	// which are clipped by Metal's [0,1] depth range.
-	dst->pos[2] = z;
+	dst->pos[2] = RaveClampMetalDepth(z);
 	dst->pos[3] = 1.0f;
 
 	dst->color[0] = ReadMacFloat(srcAddr + 16); // r
@@ -1566,8 +1747,7 @@ static void ConvertTextureVertex(uint32 srcAddr, RaveVertex *dst, bool perspZ) {
 	dst->pos[1] = ReadMacFloat(srcAddr + 4);   // y
 	float z     = ReadMacFloat(srcAddr + 8);    // z
 	float invW  = ReadMacFloat(srcAddr + 12);   // invW
-	// Always use raw z for depth buffer (see ConvertGouraudVertex comment).
-	dst->pos[2] = z;
+	dst->pos[2] = RaveClampMetalDepth(z);
 	dst->pos[3] = 1.0f;
 
 	dst->color[0] = ReadMacFloat(srcAddr + 16);  // r
@@ -1623,6 +1803,8 @@ int32 NativeDrawTriTexture(uint32 drawContextAddr, uint32 v0Addr, uint32 v1Addr,
 	ConvertTextureVertex(v0Addr, &verts[0], perspZ);
 	ConvertTextureVertex(v1Addr, &verts[1], perspZ);
 	ConvertTextureVertex(v2Addr, &verts[2], perspZ);
+	RaveTrackTextureDraw(priv);
+	RaveLogTexturedDiagnostics("DrawTriTexture", priv, verts, 3, 1, 3);
 
 	// Z-sorted transparency: buffer instead of drawing immediately
 	if (priv->state[29].i == 1) {  // kQATag_ZSortedHint
@@ -1671,6 +1853,16 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 	RaveMetalState *ms = priv->metal;
 	ms->drawCallCount++;
 	ms->vGouraudCount++;
+	uint32 primitiveCount = RaveVertexPrimitiveCount(nVertices, vertexMode);
+	switch (vertexMode) {
+	case 0: ms->pointCount += primitiveCount; break;
+	case 1:
+	case 2: ms->lineCount += primitiveCount; break;
+	case 3:
+	case 4:
+	case 5: ms->triangleCount += primitiveCount; break;
+	default: break;
+	}
 	bool perspZ = (priv->state[10].i != 0);
 
 	ApplyDirtyState(priv, false);
@@ -1709,6 +1901,7 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < count; i++) {
 			ConvertGouraudVertex(verticesAddr + i * 32, &verts[i], perspZ);
 		}
+		RaveLogLineDiagnostics("DrawVGouraud", priv, verts, count, nLines, vertexMode, false);
 		size_t dataSize = count * sizeof(RaveVertex);
 		if (dataSize > 4096) {
 			uint32_t ringOffset = 0;
@@ -1734,6 +1927,7 @@ int32 NativeDrawVGouraud(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < nVertices; i++) {
 			ConvertGouraudVertex(verticesAddr + i * 32, &verts[i], perspZ);
 		}
+		RaveLogLineDiagnostics("DrawVGouraud", priv, verts, nVertices, nVertices - 1, vertexMode, false);
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
 			uint32_t ringOffset = 0;
@@ -1942,6 +2136,17 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 	RaveMetalState *ms = priv->metal;
 	ms->drawCallCount++;
 	ms->vTextureCount++;
+	RaveTrackTextureDraw(priv);
+	uint32 primitiveCount = RaveVertexPrimitiveCount(nVertices, vertexMode);
+	switch (vertexMode) {
+	case 0: ms->pointCount += primitiveCount; break;
+	case 1:
+	case 2: ms->lineCount += primitiveCount; break;
+	case 3:
+	case 4:
+	case 5: ms->triangleCount += primitiveCount; break;
+	default: break;
+	}
 	bool perspZ = (priv->state[10].i != 0);
 
 	ApplyDirtyState(priv, false, true);  // textured=true
@@ -1987,6 +2192,7 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < count; i++) {
 			ConvertTextureVertex(verticesAddr + i * 64, &verts[i], perspZ);
 		}
+		RaveLogLineDiagnostics("DrawVTexture", priv, verts, count, nLines, vertexMode, true);
 		size_t dataSize = count * sizeof(RaveVertex);
 		if (dataSize > 4096) {
 			uint32_t ringOffset = 0;
@@ -2012,6 +2218,7 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < nVertices; i++) {
 			ConvertTextureVertex(verticesAddr + i * 64, &verts[i], perspZ);
 		}
+		RaveLogLineDiagnostics("DrawVTexture", priv, verts, nVertices, nVertices - 1, vertexMode, true);
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
 			uint32_t ringOffset = 0;
@@ -2041,6 +2248,7 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < totalVerts; i++) {
 			ConvertTextureVertex(verticesAddr + i * 64, &allVerts[i], perspZ);
 		}
+		RaveLogTexturedDiagnostics("DrawVTexture", priv, allVerts, totalVerts, nTris, vertexMode);
 
 		size_t dataSize = totalVerts * sizeof(RaveVertex);
 		if (dataSize > 4096) {
@@ -2069,6 +2277,7 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 		for (uint32 i = 0; i < nVertices; i++) {
 			ConvertTextureVertex(verticesAddr + i * 64, &allVerts[i], perspZ);
 		}
+		RaveLogTexturedDiagnostics("DrawVTexture", priv, allVerts, nVertices, nVertices - 2, vertexMode);
 
 		size_t dataSize = nVertices * sizeof(RaveVertex);
 		if (dataSize > 4096) {
@@ -2107,6 +2316,7 @@ int32 NativeDrawVTexture(uint32 drawContextAddr, uint32 nVertices, uint32 vertex
 			expanded[outIdx++] = allVerts[t + 1];
 			expanded[outIdx++] = allVerts[t + 2];
 		}
+		RaveLogTexturedDiagnostics("DrawVTexture", priv, expanded, outIdx, nTris, vertexMode);
 		size_t dataSize = outIdx * sizeof(RaveVertex);
 		if (dataSize > 4096) {
 			uint32_t ringOffset = 0;
@@ -2723,6 +2933,7 @@ int32 NativeDrawLine(uint32 drawContextAddr, uint32 v0Addr, uint32 v1Addr)
 	RaveVertex verts[2];
 	ConvertGouraudVertex(v0Addr, &verts[0], perspZ);
 	ConvertGouraudVertex(v1Addr, &verts[1], perspZ);
+	RaveLogLineDiagnostics("DrawLine", priv, verts, 2, 1, 1, false);
 
 	ApplyDirtyState(priv, false);
 	[ms->currentEncoder setVertexBytes:verts length:sizeof(verts) atIndex:0];
@@ -3150,7 +3361,8 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	{
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc]) {
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -3173,6 +3385,7 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	ms->bitmapCount = 0;
 	ms->pointCount = 0;
 	ms->lineCount = 0;
+	memset(ms->textureDrawCounts, 0, sizeof(ms->textureDrawCounts));
 
 	// Reset Z-sort buffer for this frame
 	priv->zsortCount = 0;
@@ -3196,8 +3409,9 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	s_rave_dst_width  = priv->width;
 	s_rave_dst_height = priv->height;
 
-	RAVE_LOG("RenderStart: ctx=0x%08x clear=(%.2f,%.2f,%.2f,%.2f) size=%dx%d",
+	RAVE_LOG("RenderStart: ctx=0x%08x dirty=0x%08x initial=0x%08x clear=(%.2f,%.2f,%.2f,%.2f) size=%dx%d",
 	         drawContextAddr,
+	         dirtyRectAddr, initialContextAddr,
 	         priv->state[2].f, priv->state[3].f, priv->state[4].f, priv->state[1].f,
 	         priv->width, priv->height);
 
@@ -3294,6 +3508,16 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 	FireNoticeMethod(priv, 0);
 
 	if (rave_logging_enabled) {
+		if (priv->frameCount <= 120) {
+			for (uint32_t handle = 1; handle <= RAVE_MAX_RESOURCES; handle++) {
+				RaveResourceEntry *entry = RaveResourceGet(handle);
+				if (!entry || entry->type != kRaveResourceTexture || entry->diag_alpha_zero == 0) continue;
+				RaveDiagLog("TexFrameTransparent frame=%u h=%u mac=0x%08x size=%ux%u alpha0=%u idx0=%u draws=%u",
+				            priv->frameCount, handle, entry->mac_addr, entry->width, entry->height,
+				            entry->diag_alpha_zero, entry->diag_index_zero,
+				            ms->textureDrawCounts[handle]);
+			}
+		}
 		RAVE_LOG("RenderEnd: ctx=0x%08x draws=%u tris=%u [tG=%u tT=%u vG=%u vT=%u mG=%u mT=%u bm=%u pt=%u ln=%u] %s",
 		         drawContextAddr, ms->drawCallCount, ms->triangleCount,
 		         ms->triGouraudCount, ms->triTextureCount,
@@ -3680,7 +3904,8 @@ int32 NativeFlush(uint32 drawContextAddr)
 	{
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc]) {
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -3798,7 +4023,8 @@ static int32_t RestartRenderPassWithLoad(RaveDrawPrivate *priv)
 	{
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc])
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -4044,7 +4270,8 @@ int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint3
 	{
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc])
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -4063,10 +4290,10 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 	RaveMetalState *ms = priv->metal;
 	if (!ms->renderPassActive || !ms->currentEncoder) return kQAError;
 
-	// ZBufferMask=0 skips depth clear per kQAZBufferMask_Disable spec.
+	// Disabled depth writes skip depth clear per kQAZBufferMask_Disable and ATI tag 1022.
 	// Test: RAVERenderingStateTests.testZBufferMask_skipClear
-	if (priv->state[28].i == 0) {
-		RAVE_LOG("ClearZBuffer: skipped (ZBufferMask=0, depth writes disabled)");
+	if (!RaveEffectiveDepthWriteEnabled(priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i)) {
+		RAVE_LOG("ClearZBuffer: skipped (depth writes disabled)");
 		return kQANoErr;
 	}
 	int32_t left   = (int32_t)ReadMacInt32(rectAddr + 0);
@@ -4135,7 +4362,8 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 	{
 		int zfunc = (int)priv->state[0].i;
 		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = (priv->state[28].i != 0);
+			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
+				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
 			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
 			if (dsArray[zfunc])
 				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
@@ -4161,8 +4389,8 @@ void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels
 
 	// [DIAG-T03] Metal texture creation diagnostic
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: MetalTexCreate %dx%d mips=%d bytesPerRow=%d shaderWrite=%d\n",
-		       width, height, mipLevels, bytesPerRow, (mipLevels > 1) ? 1 : 0);
+		RaveDiagLog("MetalTexCreate %dx%d mips=%d bytesPerRow=%d shaderWrite=%d",
+		            width, height, mipLevels, bytesPerRow, (mipLevels > 1) ? 1 : 0);
 	}
 
 	MTLTextureDescriptor *desc = [MTLTextureDescriptor
@@ -4200,8 +4428,8 @@ void RaveUploadMipLevel(void *metalTexture, uint32_t level, uint32_t width, uint
 
 	// [DIAG-T03] Upload diagnostic: log bytesPerRow, region, and mip level
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: UploadMip level=%d %dx%d bytesPerRow=%d origin=(0,0)\n",
-		       level, width, height, bytesPerRow);
+		RaveDiagLog("UploadMip level=%d %dx%d bytesPerRow=%d origin=(0,0)",
+		            level, width, height, bytesPerRow);
 	}
 
 	id<MTLTexture> tex = (__bridge id<MTLTexture>)metalTexture;
