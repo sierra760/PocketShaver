@@ -48,7 +48,7 @@ enum {
 extern bool nqd_metal_available;    // true after successful NQDMetalInit()
 #include "accel_logging.h"
 #if ACCEL_LOGGING_ENABLED
-extern bool nqd_logging_enabled;    // toggle for NQD_LOG diagnostic output (default false)
+extern bool nqd_logging_enabled;    // toggle for NQD_LOG diagnostic output (default true while debugging)
 #else
 static constexpr bool nqd_logging_enabled = false;
 #endif

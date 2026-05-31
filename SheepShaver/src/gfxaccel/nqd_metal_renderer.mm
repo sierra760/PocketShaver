@@ -28,7 +28,7 @@
 // ---------------------------------------------------------------------------
 
 #if ACCEL_LOGGING_ENABLED
-bool nqd_logging_enabled = false;
+bool nqd_logging_enabled = true;
 
 #define NQD_LOG(fmt, ...) \
     do { if (nqd_logging_enabled) printf("[NQD Metal] " fmt "\n", ##__VA_ARGS__); } while (0)

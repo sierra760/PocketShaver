@@ -22,9 +22,9 @@
 #include "gl_engine.h"
 #include "accel_logging.h"
 
-// Logging state -- disabled by default for GL (high call volume)
+// Logging state -- enabled while GL acceleration is under active debug.
 #if ACCEL_LOGGING_ENABLED
-bool gl_logging_enabled = false;
+bool gl_logging_enabled = true;
 #endif
 
 // PPC stack pointer, saved by glue code before dispatch for 9+ arg access

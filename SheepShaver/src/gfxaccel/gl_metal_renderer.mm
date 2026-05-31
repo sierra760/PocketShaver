@@ -36,6 +36,8 @@
 #include "display_mode_controller.h"  // dmc_current_snapshot() for FrameDescriptor generation
 #include "accel_logging.h"
 #include "metal_device_shared.h"
+#include "gl_metal_coordinates.h"
+#include "gl_metal_draw_state.h"
 
 // Logging macro (matches gl_dispatch.cpp pattern)
 #if ACCEL_LOGGING_ENABLED
@@ -551,6 +553,159 @@ struct GLMetalState {
 // Forward declarations
 static id<MTLSamplerState> GLMetalGetSampler(GLMetalState *ms, GLTextureObject *texObj);
 
+#if ACCEL_LOGGING_ENABLED
+static void GLMetalLogDrawState(GLContext *ctx, const GLMetalVertex *verts,
+                                size_t vertCount, int mtlPrim,
+                                const GLMetalVertexUniforms &vu,
+                                const GLMetalFragmentUniforms &fu,
+                                int texUnit, int nextOffset)
+{
+    float min_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float max_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float min_sec[3] = {0.0f, 0.0f, 0.0f};
+    float max_sec[3] = {0.0f, 0.0f, 0.0f};
+    float min_pos[3] = {0.0f, 0.0f, 0.0f};
+    float max_pos[3] = {0.0f, 0.0f, 0.0f};
+
+    if (vertCount > 0) {
+        for (int c = 0; c < 4; c++) {
+            min_color[c] = max_color[c] = verts[0].color[c];
+        }
+        for (int c = 0; c < 3; c++) {
+            min_sec[c] = max_sec[c] = verts[0].secondary_color[c];
+            min_pos[c] = max_pos[c] = verts[0].position[c];
+        }
+
+        for (size_t i = 1; i < vertCount; i++) {
+            for (int c = 0; c < 4; c++) {
+                float v = verts[i].color[c];
+                if (v < min_color[c]) min_color[c] = v;
+                if (v > max_color[c]) max_color[c] = v;
+            }
+            for (int c = 0; c < 3; c++) {
+                float s = verts[i].secondary_color[c];
+                if (s < min_sec[c]) min_sec[c] = s;
+                if (s > max_sec[c]) max_sec[c] = s;
+                float p = verts[i].position[c];
+                if (p < min_pos[c]) min_pos[c] = p;
+                if (p > max_pos[c]) max_pos[c] = p;
+            }
+        }
+    }
+
+    uint32_t tex0Name = fu.has_texture_3d
+        ? ctx->tex_units[texUnit].bound_texture_3d
+        : ctx->tex_units[texUnit].bound_texture_2d;
+    int tex0W = 0;
+    int tex0H = 0;
+    auto tex0It = ctx->texture_objects.find(tex0Name);
+    if (tex0It != ctx->texture_objects.end()) {
+        tex0W = tex0It->second.width;
+        tex0H = tex0It->second.height;
+    }
+
+    uint32_t tex1Name = ctx->tex_units[1].bound_texture_2d;
+    int tex1W = 0;
+    int tex1H = 0;
+    auto tex1It = ctx->texture_objects.find(tex1Name);
+    if (tex1It != ctx->texture_objects.end()) {
+        tex1W = tex1It->second.width;
+        tex1H = tex1It->second.height;
+    }
+
+    GL_METAL_LOG("GLMetalDrawState: verts=%zu prim=%d nextOffset=%d activeTex=%d "
+                 "tex0(unit=%d has=%d has3=%d en2=%d en3=%d name=%u %dx%d env=0x%x shader=%d) "
+                 "tex1(has=%d en2=%d name=%u %dx%d env=0x%x shader=%d) "
+                 "blend=%d src=0x%x dst=0x%x eq=0x%x alpha=%d func=0x%x ref=%.3f "
+                 "depth=%d func=0x%x mask=%d lighting=%d lights=%d localViewer=%d twoSide=%d "
+                 "colorSum=%d fog=%d cull=%d shade=0x%x colorMask=%d%d%d%d overlayMask=0x%x "
+                 "arrays(v=%d c=%d ct=0x%x n=%d t0=%d t1=%d) "
+                 "color(r %.3f..%.3f g %.3f..%.3f b %.3f..%.3f a %.3f..%.3f) "
+                 "sec(r %.3f..%.3f g %.3f..%.3f b %.3f..%.3f) "
+                 "pos(x %.3f..%.3f y %.3f..%.3f z %.3f..%.3f)",
+                 vertCount, mtlPrim, nextOffset, ctx->active_texture,
+                 texUnit, fu.has_texture, fu.has_texture_3d,
+                 ctx->tex_units[texUnit].enabled_2d ? 1 : 0,
+                 ctx->tex_units[texUnit].enabled_3d ? 1 : 0,
+                 tex0Name, tex0W, tex0H, ctx->tex_units[texUnit].env_mode, fu.texenv_mode,
+                 fu.has_texture_unit1, ctx->tex_units[1].enabled_2d ? 1 : 0,
+                 tex1Name, tex1W, tex1H, ctx->tex_units[1].env_mode, fu.texenv1_mode,
+                 ctx->blend ? 1 : 0, ctx->blend_src, ctx->blend_dst, ctx->blend_equation,
+                 ctx->alpha_test ? 1 : 0, ctx->alpha_func, ctx->alpha_ref,
+                 ctx->depth_test ? 1 : 0, ctx->depth_func, ctx->depth_mask ? 1 : 0,
+                 ctx->lighting_enabled ? 1 : 0, vu.num_active_lights,
+                 ctx->light_model_local_viewer ? 1 : 0, ctx->light_model_two_side ? 1 : 0,
+                 ctx->color_sum ? 1 : 0, ctx->fog_enabled ? 1 : 0,
+                 ctx->cull_face_enabled ? 1 : 0, ctx->shade_model,
+                 ctx->color_mask[0] ? 1 : 0, ctx->color_mask[1] ? 1 : 0,
+                 ctx->color_mask[2] ? 1 : 0, ctx->color_mask[3] ? 1 : 0,
+                 GLMetalOverlayColorWriteMask(ctx->color_mask[0], ctx->color_mask[1],
+                                              ctx->color_mask[2], ctx->color_mask[3]),
+                 ctx->vertex_array.enabled ? 1 : 0,
+                 ctx->color_array.enabled ? 1 : 0, ctx->color_array.type,
+                 ctx->normal_array.enabled ? 1 : 0,
+                 ctx->texcoord_array[0].enabled ? 1 : 0,
+                 ctx->texcoord_array[1].enabled ? 1 : 0,
+                 min_color[0], max_color[0], min_color[1], max_color[1],
+                 min_color[2], max_color[2], min_color[3], max_color[3],
+                 min_sec[0], max_sec[0], min_sec[1], max_sec[1], min_sec[2], max_sec[2],
+                 min_pos[0], max_pos[0], min_pos[1], max_pos[1], min_pos[2], max_pos[2]);
+}
+#endif
+
+static void GLMetalApplyViewportAndScissor(GLMetalState *ms, GLContext *ctx,
+                                           uint32_t target_w, uint32_t target_h)
+{
+    GLMetalViewportRect rect = GLMetalMakeViewportRect(
+        ctx->viewport[0], ctx->viewport[1], ctx->viewport[2], ctx->viewport[3],
+        target_h, ctx->depth_range_near, ctx->depth_range_far);
+
+    MTLViewport vp;
+    vp.originX = rect.origin_x;
+    vp.originY = rect.origin_y;
+    vp.width   = rect.width;
+    vp.height  = rect.height;
+    vp.znear   = rect.znear;
+    vp.zfar    = rect.zfar;
+    [ms->currentEncoder setViewport:vp];
+
+    if (ctx->scissor_test) {
+        GLMetalScissorRect converted = GLMetalMakeScissorRect(
+            ctx->scissor_box[0], ctx->scissor_box[1],
+            ctx->scissor_box[2], ctx->scissor_box[3],
+            target_w, target_h);
+        MTLScissorRect sr;
+        sr.x = converted.x;
+        sr.y = converted.y;
+        sr.width = converted.width;
+        sr.height = converted.height;
+        [ms->currentEncoder setScissorRect:sr];
+    }
+}
+
+static void GLMetalFillPixelQuadVertices(GLMetalVertex verts[4],
+                                         float ndc_x0, float ndc_y0,
+                                         float ndc_x1, float ndc_y1)
+{
+    GLMetalPixelQuadVertex quad[4];
+    GLMetalBuildPixelQuadVertices(quad, ndc_x0, ndc_y0, ndc_x1, ndc_y1);
+
+    memset(verts, 0, sizeof(GLMetalVertex) * 4);
+    for (int i = 0; i < 4; i++) {
+        verts[i].position[0] = quad[i].x;
+        verts[i].position[1] = quad[i].y;
+        verts[i].position[2] = 0.0f;
+        verts[i].position[3] = 1.0f;
+        verts[i].color[0] = 1.0f;
+        verts[i].color[1] = 1.0f;
+        verts[i].color[2] = 1.0f;
+        verts[i].color[3] = 1.0f;
+        verts[i].texcoord[0] = quad[i].u;
+        verts[i].texcoord[1] = quad[i].v;
+        verts[i].texcoord[2] = 1.0f;
+    }
+}
+
 // Sampler cache -- keyed by (minFilter, magFilter, wrapS, wrapT)
 // Declared here (used by GLMetalRelease and GLMetalGetSampler)
 static std::unordered_map<uint64_t, id<MTLSamplerState>> gl_sampler_cache;
@@ -877,12 +1032,15 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
     uint32_t blend_src = ctx->blend_src;
     uint32_t blend_dst = ctx->blend_dst;
     bool depth_write = ctx->depth_mask;
-    uint32_t color_mask_bits = (ctx->color_mask[0] ? 1 : 0) | (ctx->color_mask[1] ? 2 : 0) |
-                               (ctx->color_mask[2] ? 4 : 0) | (ctx->color_mask[3] ? 8 : 0);
-    bool has_texture = (ctx->tex_units[ctx->active_texture].enabled_2d &&
-                        ctx->tex_units[ctx->active_texture].bound_texture_2d != 0) ||
-                       (ctx->tex_units[ctx->active_texture].enabled_3d &&
-                        ctx->tex_units[ctx->active_texture].bound_texture_3d != 0);
+    uint32_t color_mask_bits = GLMetalOverlayColorWriteMask(ctx->color_mask[0],
+                                                            ctx->color_mask[1],
+                                                            ctx->color_mask[2],
+                                                            ctx->color_mask[3]);
+    int texUnit = GLMetalPrimaryTextureUnitForDraw(ctx->active_texture);
+    bool has_texture = (ctx->tex_units[texUnit].enabled_2d &&
+                        ctx->tex_units[texUnit].bound_texture_2d != 0) ||
+                       (ctx->tex_units[texUnit].enabled_3d &&
+                        ctx->tex_units[texUnit].bound_texture_3d != 0);
 
     uint64_t key = MakePipelineKey(blend_enabled, blend_src, blend_dst,
                                     depth_write, color_mask_bits, has_texture,
@@ -924,8 +1082,8 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
         pipeDesc.colorAttachments[0].blendingEnabled = NO;
     }
 
-    // Color write mask — strip alpha to preserve overlay's alpha=1.0 for
-    // compositor compositing (same approach as RAVE).
+    // Color write mask: alpha is intentionally stripped by color_mask_bits to
+    // preserve overlay alpha=1.0 for compositor compositing.
     MTLColorWriteMask mask = MTLColorWriteMaskNone;
     if (color_mask_bits & 1) mask |= MTLColorWriteMaskRed;
     if (color_mask_bits & 2) mask |= MTLColorWriteMaskGreen;
@@ -1130,40 +1288,7 @@ void GLMetalBeginFrame(GLContext *ctx)
 
     ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
 
-    // Set viewport
-    // AUDIT: VIEWPORT Y-ORIGIN (M003/S04/T01)
-    // GL uses bottom-left origin; Metal uses top-left origin. Currently we pass
-    // the GL viewport values directly to Metal without any Y-flip. This is
-    // intentional: the game's projection matrix (glFrustum/glOrtho) already
-    // encodes the coordinate space, and Metal's NDC Y-axis runs from -1 (bottom)
-    // to +1 (top) — same as GL's NDC. The viewport Y origin only matters for
-    // mapping NDC to framebuffer pixels. If games assume GL's bottom-left
-    // viewport origin AND pass viewport.y != 0, rendering may be vertically
-    // offset. However, most Mac OS 9 games set viewport to (0,0,w,h), where
-    // the origin convention is irrelevant.
-    //
-    // STATUS: No speculative fix applied. Flagged for on-device investigation.
-    // DIAGNOSTIC: If vertical offset is observed, try:
-    //   vp.originY = drawable_height - (ctx->viewport[1] + ctx->viewport[3]);
-    // to convert GL bottom-left to Metal top-left viewport origin.
-    MTLViewport vp;
-    vp.originX = ctx->viewport[0];
-    vp.originY = ctx->viewport[1];
-    vp.width   = ctx->viewport[2];
-    vp.height  = ctx->viewport[3];
-    vp.znear   = ctx->depth_range_near;
-    vp.zfar    = ctx->depth_range_far;
-    [ms->currentEncoder setViewport:vp];
-
-    // Set scissor if enabled
-    if (ctx->scissor_test) {
-        MTLScissorRect sr;
-        sr.x = ctx->scissor_box[0];
-        sr.y = ctx->scissor_box[1];
-        sr.width = ctx->scissor_box[2];
-        sr.height = ctx->scissor_box[3];
-        [ms->currentEncoder setScissorRect:sr];
-    }
+    GLMetalApplyViewportAndScissor(ms, ctx, (uint32_t)w, (uint32_t)h);
 
     ms->renderPassActive = true;
     ms->bufferOffset = 0;  // Reset ring buffer offset for new frame
@@ -1465,26 +1590,12 @@ static bool GLMetalFlushAndResetRingBuffer(GLContext *ctx)
         return false;
     }
 
-    // (g) Restore viewport and scissor on the new encoder
-    //     (pipeline, depth-stencil, cull, textures, uniforms are set per-draw
-    //      by GLMetalFlushImmediateMode after we return)
-    MTLViewport vp;
-    vp.originX = ctx->viewport[0];
-    vp.originY = ctx->viewport[1];
-    vp.width   = ctx->viewport[2];
-    vp.height  = ctx->viewport[3];
-    vp.znear   = ctx->depth_range_near;
-    vp.zfar    = ctx->depth_range_far;
-    [ms->currentEncoder setViewport:vp];
-
-    if (ctx->scissor_test) {
-        MTLScissorRect sr;
-        sr.x = ctx->scissor_box[0];
-        sr.y = ctx->scissor_box[1];
-        sr.width = ctx->scissor_box[2];
-        sr.height = ctx->scissor_box[3];
-        [ms->currentEncoder setScissorRect:sr];
-    }
+    // (g) Restore viewport and scissor on the new encoder.
+    //     Pipeline, depth-stencil, cull, textures, and uniforms are set
+    //     per-draw by GLMetalFlushImmediateMode after we return.
+    GLMetalApplyViewportAndScissor(ms, ctx,
+                                   (uint32_t)[ms->overlayTexture width],
+                                   (uint32_t)[ms->overlayTexture height]);
 
     GL_METAL_LOG("GLMetalFlushAndResetRingBuffer: mid-frame flush complete, encoder restarted");
     return true;
@@ -1621,7 +1732,7 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
 
     // ---- Upload fragment uniforms ----
     GLMetalFragmentUniforms fu;
-    int texUnit = ctx->active_texture;
+    int texUnit = GLMetalPrimaryTextureUnitForDraw(ctx->active_texture);
     fu.texenv_mode = GLTexEnvModeToShader(ctx->tex_units[texUnit].env_mode);
     memcpy(fu.texenv_color, ctx->tex_units[texUnit].env_color, sizeof(float) * 4);
     if (ctx->fog_enabled) {
@@ -1814,6 +1925,10 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     // Align to 256 bytes for Metal buffer offset requirements
     ms->bufferOffset = (ms->bufferOffset + 255) & ~255;
 
+#if ACCEL_LOGGING_ENABLED
+    GLMetalLogDrawState(ctx, vertData, vertCount, (int)mtlPrim, vu, fu, texUnit, ms->bufferOffset);
+#endif
+
     GL_METAL_LOG("GLMetalFlushImmediateMode: drew %zu verts as prim %d, offset now %d",
                  vertCount, (int)mtlPrim, ms->bufferOffset);
 }
@@ -1870,25 +1985,9 @@ void GLMetalDrawPixels(GLContext *ctx, int width, int height, const uint8_t *bgr
     float ndc_x1 = ndc_x0 + quad_w / vp_w * 2.0f;
     float ndc_y1 = ndc_y0 + quad_h / vp_h * 2.0f;
 
-    // Build 4 vertices for triangle strip (positions in NDC, white color, texcoords 0→1)
+    // Build 4 vertices for triangle strip (positions in NDC, white color, texcoords 0->1)
     GLMetalVertex verts[4];
-    memset(verts, 0, sizeof(verts));
-    // v0: bottom-left
-    verts[0].position[0] = ndc_x0; verts[0].position[1] = ndc_y0; verts[0].position[2] = 0; verts[0].position[3] = 1;
-    verts[0].color[0] = 1; verts[0].color[1] = 1; verts[0].color[2] = 1; verts[0].color[3] = 1;
-    verts[0].texcoord[0] = 0; verts[0].texcoord[1] = 1; verts[0].texcoord[2] = 1;  // GL bottom row = texture V=1
-    // v1: bottom-right
-    verts[1].position[0] = ndc_x1; verts[1].position[1] = ndc_y0; verts[1].position[2] = 0; verts[1].position[3] = 1;
-    verts[1].color[0] = 1; verts[1].color[1] = 1; verts[1].color[2] = 1; verts[1].color[3] = 1;
-    verts[1].texcoord[0] = 1; verts[1].texcoord[1] = 1; verts[1].texcoord[2] = 1;
-    // v2: top-left
-    verts[2].position[0] = ndc_x0; verts[2].position[1] = ndc_y1; verts[2].position[2] = 0; verts[2].position[3] = 1;
-    verts[2].color[0] = 1; verts[2].color[1] = 1; verts[2].color[2] = 1; verts[2].color[3] = 1;
-    verts[2].texcoord[0] = 0; verts[2].texcoord[1] = 0; verts[2].texcoord[2] = 1;
-    // v3: top-right
-    verts[3].position[0] = ndc_x1; verts[3].position[1] = ndc_y1; verts[3].position[2] = 0; verts[3].position[3] = 1;
-    verts[3].color[0] = 1; verts[3].color[1] = 1; verts[3].color[2] = 1; verts[3].color[3] = 1;
-    verts[3].texcoord[0] = 1; verts[3].texcoord[1] = 0; verts[3].texcoord[2] = 1;
+    GLMetalFillPixelQuadVertices(verts, ndc_x0, ndc_y0, ndc_x1, ndc_y1);
 
     // Set up identity MVP (NDC pass-through)
     GLMetalVertexUniforms vu_local;
@@ -2012,19 +2111,7 @@ void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *bgra_da
 
     // Build 4 vertices for triangle strip
     GLMetalVertex verts[4];
-    memset(verts, 0, sizeof(verts));
-    verts[0].position[0] = ndc_x0; verts[0].position[1] = ndc_y0; verts[0].position[2] = 0; verts[0].position[3] = 1;
-    verts[0].color[0] = 1; verts[0].color[1] = 1; verts[0].color[2] = 1; verts[0].color[3] = 1;
-    verts[0].texcoord[0] = 0; verts[0].texcoord[1] = 1; verts[0].texcoord[2] = 1;
-    verts[1].position[0] = ndc_x1; verts[1].position[1] = ndc_y0; verts[1].position[2] = 0; verts[1].position[3] = 1;
-    verts[1].color[0] = 1; verts[1].color[1] = 1; verts[1].color[2] = 1; verts[1].color[3] = 1;
-    verts[1].texcoord[0] = 1; verts[1].texcoord[1] = 1; verts[1].texcoord[2] = 1;
-    verts[2].position[0] = ndc_x0; verts[2].position[1] = ndc_y1; verts[2].position[2] = 0; verts[2].position[3] = 1;
-    verts[2].color[0] = 1; verts[2].color[1] = 1; verts[2].color[2] = 1; verts[2].color[3] = 1;
-    verts[2].texcoord[0] = 0; verts[2].texcoord[1] = 0; verts[2].texcoord[2] = 1;
-    verts[3].position[0] = ndc_x1; verts[3].position[1] = ndc_y1; verts[3].position[2] = 0; verts[3].position[3] = 1;
-    verts[3].color[0] = 1; verts[3].color[1] = 1; verts[3].color[2] = 1; verts[3].color[3] = 1;
-    verts[3].texcoord[0] = 1; verts[3].texcoord[1] = 0; verts[3].texcoord[2] = 1;
+    GLMetalFillPixelQuadVertices(verts, ndc_x0, ndc_y0, ndc_x1, ndc_y1);
 
     // Set up identity MVP (NDC pass-through)
     GLMetalVertexUniforms vu_local2;
