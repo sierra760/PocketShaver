@@ -22,6 +22,8 @@ struct VertexIn {
     float4 position [[attribute(0)]];
     float4 color    [[attribute(1)]];
     float4 texcoord [[attribute(2)]];  // (uOverW, vOverW, invW, 0) for textured; (0,0,0,0) for Gouraud
+    float4 diffuse  [[attribute(3)]];
+    float4 specular [[attribute(4)]];
 };
 
 struct VertexOut {
@@ -30,6 +32,8 @@ struct VertexOut {
     float4 color;
     float4 texcoord;  // pass all 4 for perspective-correct interpolation
     float4 texcoord2; // second UV pair for multi-texture (uOverW2, vOverW2, invW2, 0)
+    float4 diffuse;
+    float4 specular;
 };
 
 struct Viewport {
@@ -80,6 +84,8 @@ vertex VertexOut rave_vertex(VertexIn in [[stage_in]],
     out.position.w = in.position.w;  // always 1.0 for now
     out.pointSize = vertUniforms.point_width;
     out.color = in.color;
+    out.diffuse = in.diffuse;
+    out.specular = in.specular;
     if (has_texture || has_fog) {
         out.texcoord = in.texcoord;  // pass through all 4 components (fog needs texcoord.z = invW)
     }
@@ -113,8 +119,8 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
 
         float4 texPix = tex.sample(samp, uv, bias(uniforms.mipmap_bias));
 
-        // TextureOp processing per RAVE spec
-        // Per RAVE spec, Decal takes precedence over Modulate when both bits set
+        // TextureOp processing per RAVE spec: TextureOp is a mask, so the
+        // decal/base step can be followed by diffuse modulation and highlight.
         if (uniforms.texture_op & 4) {  // Decal
             texPix.rgb = texPix.a * texPix.rgb + (1.0 - texPix.a) * color.rgb;
             texPix.a = color.a;
@@ -123,15 +129,16 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
             float3 envColor = float3(uniforms.env_color_r, uniforms.env_color_g, uniforms.env_color_b);
             texPix.rgb = (1.0 - texPix.rgb) * envColor + texPix.rgb * color.rgb;
             texPix.a *= color.a;
-        } else if (uniforms.texture_op & 1) {  // Modulate: color.rgb carries kd_rgb (only if Decal/Blend not set)
-            texPix.rgb = saturate(texPix.rgb * color.rgb);
-            texPix.a *= color.a;
         } else {
             texPix.a *= color.a;
         }
 
-        if (uniforms.texture_op & 2) {  // Highlight: color.rgb carries ks_rgb (additive)
-            texPix.rgb = saturate(texPix.rgb + color.rgb);
+        if (uniforms.texture_op & 1) {  // Modulate: multiply by kd_rgb
+            texPix.rgb = saturate(texPix.rgb * in.diffuse.rgb);
+        }
+
+        if (uniforms.texture_op & 2) {  // Highlight: add ks_rgb
+            texPix.rgb = saturate(texPix.rgb + in.specular.rgb);
         }
 
         color = texPix;

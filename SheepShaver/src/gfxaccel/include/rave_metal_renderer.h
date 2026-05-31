@@ -101,10 +101,10 @@ extern int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr
 extern int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t initialContextAddr);
 
 // RAVE 1.6 swap control, busy query, and render-to-texture (called from rave_dispatch.cpp)
-extern int32_t NativeSwapBuffers(uint32_t drawContextAddr);
+extern int32_t NativeSwapBuffers(uint32_t drawContextAddr, uint32_t dirtyRectAddr);
 extern int32_t NativeBusy(uint32_t drawContextAddr);
-extern uint32_t NativeTextureNewFromDrawContext(uint32_t drawContextAddr);
-extern uint32_t NativeBitmapNewFromDrawContext(uint32_t drawContextAddr);
+extern int32_t NativeTextureNewFromDrawContext(uint32_t drawContextAddr, uint32_t flags, uint32_t newTexturePtr);
+extern int32_t NativeBitmapNewFromDrawContext(uint32_t drawContextAddr, uint32_t flags, uint32_t newBitmapPtr);
 
 // Metal texture creation/upload functions (called from rave_engine.cpp via void* bridge)
 extern void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels,

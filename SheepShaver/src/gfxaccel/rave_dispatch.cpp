@@ -242,13 +242,13 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 		case kRaveDrawClearZBuffer:         // 30
 			return (uint32)NativeClearZBuffer(r3, r4, r5);
 		case kRaveDrawTextureFromContext:   // 31
-			return (uint32)NativeTextureNewFromDrawContext(r3);
+			return (uint32)NativeTextureNewFromDrawContext(r3, r4, r5);
 		case kRaveDrawBitmapFromContext:    // 32
-			return (uint32)NativeBitmapNewFromDrawContext(r3);
+			return (uint32)NativeBitmapNewFromDrawContext(r3, r4, r5);
 		case kRaveDrawBusy:                // 33
 			return (uint32)NativeBusy(r3);
 		case kRaveDrawSwapBuffers:         // 34
-			return (uint32)NativeSwapBuffers(r3);
+			return (uint32)NativeSwapBuffers(r3, r4);
 
 		default:
 			// All 35 draw methods (0-34) have explicit case handlers. This default arm is unreachable dead code. Test: RAVEABITests.testStubLogLines_drawMethods_deadCode

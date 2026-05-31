@@ -183,11 +183,14 @@ struct RaveNoticeMethod {
  *
  *  Transparent triangles are buffered during draw calls (when kQATag_ZSortedHint=1)
  *  and flushed back-to-front at RenderEnd for correct transparency compositing.
- *  Uses float[3][12] instead of RaveVertex[3] because RaveVertex is defined in
- *  rave_metal_renderer.mm, not this header. Layout is identical (12 floats = 48 bytes).
+ *  Uses float arrays instead of RaveVertex[3] because RaveVertex is defined in
+ *  rave_metal_renderer.mm, not this header. Layout must match RaveVertex.
  */
+#define RAVE_VERTEX_FLOATS 20
+#define RAVE_VERTEX_BYTES  (RAVE_VERTEX_FLOATS * sizeof(float))
+
 struct ZSortTriangle {
-	float      verts[3][12];   // 3 vertices x 12 floats (pos4+color4+uv4) = 144 bytes
+	float      verts[3][RAVE_VERTEX_FLOATS];
 	float      sortKey;
 	bool       textured;
 	uint32_t   textureMacAddr;
@@ -208,7 +211,7 @@ struct RaveDrawPrivate {
 	struct RaveMetalState *metal;   // Metal resources, opaque to .cpp
 
 	// Vertex staging buffer for geometry submission
-	uint8_t       *vertexStagingBuffer;   // native heap, 64K vertices * 40 bytes = 2.5MB
+	uint8_t       *vertexStagingBuffer;   // native heap, 64K vertices
 	uint32_t       vertexStagingCount;    // current vertex count in staging buffer
 	uint32_t       vertexStagingCapacity; // max vertices (65536)
 

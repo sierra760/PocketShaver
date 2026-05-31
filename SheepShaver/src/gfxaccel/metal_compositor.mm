@@ -249,21 +249,23 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
         return 0;
     }
 
-    /* CF-22.3-06 + CF-22.3-07: when a non-QuickDraw owner takes the display,
-     * resize the compositor's framebuffer texture to match the Mac mode so
-     * CALayer's kCAGravityResizeAspect upscales the smaller drawable to fill
-     * the window. Without this, the framebuffer texture stays at the
-     * init-time window dimensions while engines only write a top-left region
-     * = the "small corner" UX symptom.
-     *
-     * Engine-blind: keys on opaque DMC ownership, never on engine identity.
+    /* CF-22.3-06 + CF-22.3-07: when DSp owns the framebuffer, resize the
+     * compositor texture to match the Mac mode so CALayer's
+     * kCAGravityResizeAspect upscales the smaller drawable to fill the
+     * window. Without this, the framebuffer texture stays at the init-time
+     * window dimensions while DSp only writes a top-left region = the "small
+     * corner" UX symptom.
      *
      * The compositor texture is forced to BGRA8Unorm (VIDEO_DEPTH_32BIT)
-     * because non-QuickDraw engines decode their source-format back buffer
-     * (e.g. DSp's R16Uint xRGB1555 at 16bpp) into BGRA8Unorm during their
-     * own render pass before the compositor sees it. The Mac-side mode depth
-     * is preserved in the snapshot; only the compositor's internal pixel
-     * format is normalised.
+     * because DSp decodes its source-format back buffer (e.g. R16Uint
+     * xRGB1555 at 16bpp) into BGRA8Unorm during its own render pass before
+     * the compositor sees it. The Mac-side mode depth is preserved in the
+     * snapshot; only the compositor's internal pixel format is normalised.
+     *
+     * RAVE/GL are overlay contributors, not compositor-framebuffer writers.
+     * They still rely on the QuickDraw host framebuffer underlay for classic
+     * 2D UI, so rebuilding compositor_texture with a NULL host buffer here
+     * hides those CPU-side UI writes.
      *
      * QuickDraw mode switches retain their existing behaviour (no auto-resize
      * here; the QD-side path manages compositor refresh through its own
@@ -271,7 +273,7 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
      * mismatch is benign for in-place returns; out-of-place handoffs are
      * tracked separately (post-DSp-release QD geometry restore).
      */
-    if (incoming->active_owner != kDMCOwnerQuickDraw) {
+    if (incoming->active_owner == (uint32_t)kDMCOwnerDSp) {
         int new_w = (int)incoming->width;
         int new_h = (int)incoming->height;
         int cur_w = compositor_pixel_width;
@@ -288,8 +290,8 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
                 bgra_size);
             if (rc != 0) {
                 COMPOSITOR_ERR("DMC on_mode_enter: MetalCompositorResize failed (rc=%d) for "
-                               "non-QuickDraw owner=%u %dx%d — drawable will appear small in window",
-                               rc, incoming->active_owner, new_w, new_h);
+                               "DSp owner %dx%d — drawable will appear small in window",
+                               rc, new_w, new_h);
                 /* Non-fatal: engine writes still land in the existing (mismatched)
                  * framebuffer texture, which appears in a corner of the window
                  * (pre-CF-22.3-06 behaviour). */
@@ -858,10 +860,9 @@ void MetalCompositorPresent(void)
 
     // If using fallback texture, upload framebuffer data via replaceRegion.
     //
-    // Skip this CPU upload when a
-    // non-QuickDraw active_owner is driving the framebuffer texture. In that
-    // case the owner has already encoded its own render pass into
-    // compositor_texture (e.g. DSp's DSpEncodePresentToFramebuffer), and:
+    // Skip this CPU upload when the active owner is driving the framebuffer
+    // texture. In that case the owner has already encoded its own render pass
+    // into compositor_texture (e.g. DSp's DSpEncodePresentToFramebuffer), and:
     //   (a) replaceRegion: here would clobber the owner's render output, and
     //   (b) Metal validation rejects replaceRegion: on a texture that is
     //       currently attached as a writeable render target by an in-flight
@@ -870,16 +871,20 @@ void MetalCompositorPresent(void)
     //       GPU may still hold compositor_texture as a render-target
     //       attachment when MetalCompositorPresent runs the next VBL tick.
     //
-    // Engine-blindness (RES-04): we gate on dmc_current_snapshot()->active_owner
-    // (an opaque DMC ownership concept), not on engine identity. Any owner
-    // other than kDMCOwnerQuickDraw is presumed to maintain compositor_texture
-    // through its own GPU encoding path. compositor_buffer is the legacy CPU
-    // framebuffer used by QuickDraw / NQD writes only.
+    // RAVE/GL are overlay owners. They submit cached overlay layers, but the
+    // base compositor_texture is still the QuickDraw/NQD CPU framebuffer.
+    // Keep uploading it so post-RAVE classic 2D UI/text remains visible under
+    // or outside the overlay.
     bool skip_cpu_upload = false;
     {
         const DMCModeSnapshot *snap = dmc_current_snapshot();
-        if (snap != NULL && snap->active_owner != (uint32_t)kDMCOwnerQuickDraw) {
-            skip_cpu_upload = true;
+        if (snap != NULL) {
+            uint32_t owner = snap->active_owner;
+            if (owner != (uint32_t)kDMCOwnerQuickDraw &&
+                owner != (uint32_t)kDMCOwnerRAVE &&
+                owner != (uint32_t)kDMCOwnerGL) {
+                skip_cpu_upload = true;
+            }
         }
     }
     if (!skip_cpu_upload && compositor_use_fallback_texture && compositor_texture && compositor_buffer) {

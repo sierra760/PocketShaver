@@ -265,7 +265,7 @@ int32 NativeDrawPrivateNew(uint32 drawContextAddr, uint32 deviceAddr,
 	// Allocate vertex staging buffer
 	ctx->vertexStagingCapacity = 65536;
 	ctx->vertexStagingCount = 0;
-	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * 48]; // 48 bytes per vertex
+	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * RAVE_VERTEX_BYTES];
 
 	// Allocate multi-texture UV staging buffer (parallel to vertexStagingBuffer)
 	// 16 bytes per vertex: uOverW2(4) + vOverW2(4) + invW2(4) + pad(4)
