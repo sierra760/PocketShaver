@@ -118,6 +118,7 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         // flip needed here — the interpolated values are already correct.
 
         float4 texPix = tex.sample(samp, uv, bias(uniforms.mipmap_bias));
+        bool sampledTransparentTexel = texPix.a <= 0.0;
 
         // TextureOp processing per RAVE spec: TextureOp is a mask, so the
         // decal/base step can be followed by diffuse modulation and highlight.
@@ -131,6 +132,12 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
             texPix.a *= color.a;
         } else {
             texPix.a *= color.a;
+        }
+
+        // Fully transparent samples must not write depth; Bugdom draws large
+        // cutout texture quads with normal Z enabled.
+        if (sampledTransparentTexel && !(uniforms.texture_op & 4)) {
+            discard_fragment();
         }
 
         if (uniforms.texture_op & 1) {  // Modulate: multiply by kd_rgb

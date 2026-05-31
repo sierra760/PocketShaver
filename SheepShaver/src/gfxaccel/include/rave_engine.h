@@ -14,6 +14,56 @@
 
 #include <stdint.h>
 
+struct RaveBGRAImageStats {
+	uint32_t nonzero;       // any BGRA channel is non-zero
+	uint32_t alpha;         // alpha channel is non-zero
+	uint32_t rgb;           // at least one RGB channel is non-zero
+	uint32_t white;         // opaque/near-opaque white RGB pixels
+	uint32_t first_nonzero; // pixelCount if absent
+	uint32_t first_alpha;   // pixelCount if absent
+	uint32_t first_rgb;     // pixelCount if absent
+};
+
+/*
+ * Bugdom's ARGB16 sprite textures often have transparent top-left borders,
+ * so diagnostics and empty checks need whole-image scans instead of leading
+ * samples.
+ */
+static inline RaveBGRAImageStats RaveBGRAImageAnalyze(const uint8_t *pixels, uint32_t pixelCount)
+{
+	RaveBGRAImageStats stats = {0, 0, 0, 0, pixelCount, pixelCount, pixelCount};
+	if (!pixels) return stats;
+	for (uint32_t i = 0; i < pixelCount; i++) {
+		const uint32_t off = i * 4;
+		const uint8_t b = pixels[off];
+		const uint8_t g = pixels[off + 1];
+		const uint8_t r = pixels[off + 2];
+		const uint8_t a = pixels[off + 3];
+		const bool hasRGB = (b != 0 || g != 0 || r != 0);
+		if (hasRGB || a != 0) {
+			if (stats.nonzero == 0) stats.first_nonzero = i;
+			stats.nonzero++;
+		}
+		if (a != 0) {
+			if (stats.alpha == 0) stats.first_alpha = i;
+			stats.alpha++;
+		}
+		if (hasRGB) {
+			if (stats.rgb == 0) stats.first_rgb = i;
+			stats.rgb++;
+		}
+		if (a >= 0xF0 && r >= 0xF0 && g >= 0xF0 && b >= 0xF0) {
+			stats.white++;
+		}
+	}
+	return stats;
+}
+
+static inline bool RaveBGRAImageHasData(const uint8_t *pixels, uint32_t pixelCount)
+{
+	return RaveBGRAImageAnalyze(pixels, pixelCount).nonzero != 0;
+}
+
 /*
  *  RAVE sub-opcode constants
  *
@@ -432,8 +482,8 @@ struct RaveResourceEntry {
 	uint32_t         row_bytes;       // original row bytes for level 0
 	uint32_t         bound_clut;      // resource handle of bound color table (0 = none)
 	uint8_t          priority;        // 4-bit priority (0-15) from bits [31:28] per RAVE 1.6 spec
-	uint32_t         pixmap_mac_addr; // deferred: Mac address of pixel data (indexed textures)
-	bool             pixels_copied;   // true once pixel data has been copied (at Detach time)
+	uint32_t         pixmap_mac_addr; // deferred direct texture Mac address
+	bool             pixels_copied;   // true once non-empty direct texture data has been observed
 
 	// CPU pixel access (AccessTexture/AccessBitmap support)
 	uint8_t         *cpu_pixel_data;       // permanent CPU copy in original Mac format
@@ -456,6 +506,14 @@ struct RaveResourceEntry {
 	uint32_t         clut_count;      // number of palette entries (256 for CL8, 16 for CL4)
 	int32_t          transparent_index; // -1 if none
 };
+
+static inline bool RaveTextureNeedsLivePixmapRefresh(const RaveResourceEntry *entry)
+{
+	return entry &&
+	       entry->metal_texture != nullptr &&
+	       entry->pixmap_mac_addr != 0 &&
+	       !entry->cpu_pixel_data_is_authoritative;
+}
 
 #define RAVE_MAX_RESOURCES 512
 

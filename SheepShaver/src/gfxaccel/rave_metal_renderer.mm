@@ -1108,7 +1108,7 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 				// from the pixmap on every draw call (no GPU upload step). QD3D's
 				// Interactive Renderer writes directly to the pixmap between frames.
 				// We must re-read and re-upload every frame to match this behavior.
-				else if (tex_entry->metal_texture && !tex_entry->pixels_copied && tex_entry->pixmap_mac_addr != 0) {
+				else if (RaveTextureNeedsLivePixmapRefresh(tex_entry)) {
 					RaveRefreshTextureFromPixmap(tex_entry);
 				}
 				if (tex_entry->metal_texture) {
@@ -1146,6 +1146,9 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 			if (tex2_entry) {
 				if (!tex2_entry->metal_texture && tex2_entry->pixmap_mac_addr != 0) {
 					RaveRealizeDeferredTexture(tex2_entry);
+				}
+				else if (RaveTextureNeedsLivePixmapRefresh(tex2_entry)) {
+					RaveRefreshTextureFromPixmap(tex2_entry);
 				}
 				if (tex2_entry->metal_texture) {
 					id<MTLTexture> mtlTex2 = (__bridge id<MTLTexture>)tex2_entry->metal_texture;
@@ -2155,6 +2158,15 @@ int32 NativeSubmitVerticesTexture(uint32 drawContextAddr, uint32 nVertices, uint
 		float minY = dst[0].pos[1], maxY = dst[0].pos[1];
 		float minZ = dst[0].pos[2], maxZ = dst[0].pos[2];
 		float minA = dst[0].color[3], maxA = dst[0].color[3];
+		float minR = dst[0].color[0], maxR = dst[0].color[0];
+		float minG = dst[0].color[1], maxG = dst[0].color[1];
+		float minB = dst[0].color[2], maxB = dst[0].color[2];
+		float minKdR = dst[0].diffuse[0], maxKdR = dst[0].diffuse[0];
+		float minKdG = dst[0].diffuse[1], maxKdG = dst[0].diffuse[1];
+		float minKdB = dst[0].diffuse[2], maxKdB = dst[0].diffuse[2];
+		float minKsR = dst[0].specular[0], maxKsR = dst[0].specular[0];
+		float minKsG = dst[0].specular[1], maxKsG = dst[0].specular[1];
+		float minKsB = dst[0].specular[2], maxKsB = dst[0].specular[2];
 		float minU = dst[0].uv[0], maxU = dst[0].uv[0];
 		float minV = dst[0].uv[1], maxV = dst[0].uv[1];
 		float minW = dst[0].uv[2], maxW = dst[0].uv[2];
@@ -2167,6 +2179,24 @@ int32 NativeSubmitVerticesTexture(uint32 drawContextAddr, uint32 nVertices, uint
 			if (dst[i].pos[2] > maxZ) maxZ = dst[i].pos[2];
 			if (dst[i].color[3] < minA) minA = dst[i].color[3];
 			if (dst[i].color[3] > maxA) maxA = dst[i].color[3];
+			if (dst[i].color[0] < minR) minR = dst[i].color[0];
+			if (dst[i].color[0] > maxR) maxR = dst[i].color[0];
+			if (dst[i].color[1] < minG) minG = dst[i].color[1];
+			if (dst[i].color[1] > maxG) maxG = dst[i].color[1];
+			if (dst[i].color[2] < minB) minB = dst[i].color[2];
+			if (dst[i].color[2] > maxB) maxB = dst[i].color[2];
+			if (dst[i].diffuse[0] < minKdR) minKdR = dst[i].diffuse[0];
+			if (dst[i].diffuse[0] > maxKdR) maxKdR = dst[i].diffuse[0];
+			if (dst[i].diffuse[1] < minKdG) minKdG = dst[i].diffuse[1];
+			if (dst[i].diffuse[1] > maxKdG) maxKdG = dst[i].diffuse[1];
+			if (dst[i].diffuse[2] < minKdB) minKdB = dst[i].diffuse[2];
+			if (dst[i].diffuse[2] > maxKdB) maxKdB = dst[i].diffuse[2];
+			if (dst[i].specular[0] < minKsR) minKsR = dst[i].specular[0];
+			if (dst[i].specular[0] > maxKsR) maxKsR = dst[i].specular[0];
+			if (dst[i].specular[1] < minKsG) minKsG = dst[i].specular[1];
+			if (dst[i].specular[1] > maxKsG) maxKsG = dst[i].specular[1];
+			if (dst[i].specular[2] < minKsB) minKsB = dst[i].specular[2];
+			if (dst[i].specular[2] > maxKsB) maxKsB = dst[i].specular[2];
 			if (dst[i].uv[0] < minU) minU = dst[i].uv[0];
 			if (dst[i].uv[0] > maxU) maxU = dst[i].uv[0];
 			if (dst[i].uv[1] < minV) minV = dst[i].uv[1];
@@ -2178,6 +2208,10 @@ int32 NativeSubmitVerticesTexture(uint32 drawContextAddr, uint32 nVertices, uint
 		         priv->frameCount, nVertices,
 		         minX, maxX, minY, maxY, minZ, maxZ, minA, maxA,
 			         (int)priv->state[12].i, perspZ ? 1 : 0);
+		fprintf(stderr, "  RGB: r=[%.2f,%.2f] g=[%.2f,%.2f] b=[%.2f,%.2f] kd=[%.2f..%.2f,%.2f..%.2f,%.2f..%.2f] ks=[%.2f..%.2f,%.2f..%.2f,%.2f..%.2f]\n",
+		         minR, maxR, minG, maxG, minB, maxB,
+		         minKdR, maxKdR, minKdG, maxKdG, minKdB, maxKdB,
+		         minKsR, maxKsR, minKsG, maxKsG, minKsB, maxKsB);
 		fprintf(stderr, "  UV: uOverW=[%.4f,%.4f] vOverW=[%.4f,%.4f] invW=[%.6f,%.6f]\n",
 		         minU, maxU, minV, maxV, minW, maxW);
 		// Dump first 3 vertices' raw UV data for inspection
@@ -2187,8 +2221,11 @@ int32 NativeSubmitVerticesTexture(uint32 drawContextAddr, uint32 nVertices, uint
 			float rawInvW = ReadMacFloat(verticesAddr + i * 64 + 12);
 			float finalU = (rawInvW != 0.0f) ? rawU / rawInvW : 0.0f;
 			float finalV = (rawInvW != 0.0f) ? rawV / rawInvW : 0.0f;
-			fprintf(stderr, "  v[%d]: uOverW=%.4f vOverW=%.4f invW=%.6f -> u=%.4f v=%.4f\n",
-			         i, rawU, rawV, rawInvW, finalU, finalV);
+			fprintf(stderr, "  v[%d]: uOverW=%.4f vOverW=%.4f invW=%.6f -> u=%.4f v=%.4f rgb=(%.2f,%.2f,%.2f) a=%.2f kd=(%.2f,%.2f,%.2f) ks=(%.2f,%.2f,%.2f)\n",
+			         i, rawU, rawV, rawInvW, finalU, finalV,
+			         dst[i].color[0], dst[i].color[1], dst[i].color[2], dst[i].color[3],
+			         dst[i].diffuse[0], dst[i].diffuse[1], dst[i].diffuse[2],
+			         dst[i].specular[0], dst[i].specular[1], dst[i].specular[2]);
 		}
 	}
 
@@ -4188,18 +4225,14 @@ void RaveReleaseTexture(void *metalTexture)
 /*
  *  RaveRefreshTextureFromPixmap - re-read pixmap and re-upload to Metal texture
  *
- *  Called every frame for deferred textures that were initially realized from
- *  all-zero data.  The original RAVE software renderer reads the pixmap live
- *  on every draw call, so QD3D's IR can write directly to the pixmap between
- *  frames.  We must mirror this by re-uploading each frame.
- *
- *  Once non-zero data is detected, marks pixels_copied=true to stop re-uploading
- *  (the texture content has stabilized).
+ *  Called every draw for deferred direct-format textures that still point at a
+ *  live pixmap. The original RAVE software renderer reads the pixmap live, so
+ *  QD3D's IR can keep writing into the same pixmap after the first non-zero
+ *  pixels appear. We must mirror this and avoid freezing partial textures.
  */
 void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 {
 	if (!entry || !entry->metal_texture || entry->pixmap_mac_addr == 0) return;
-	if (entry->pixels_copied) return;  // already has real data
 
 	uint32_t w = entry->width;
 	uint32_t h = entry->height;
@@ -4222,20 +4255,11 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
 
-	// Check if any non-black pixels exist.
-	//
-	// Also test the alpha channel
-	// (expanded[off+3]). Same rationale as the sibling check in
-	// RaveRealizeDeferredTexture — ARGB16 sprites with transparent-border
-	// top scanlines have alpha-dense but RGB-zero pixels.
-	bool hasData = false;
-	uint32_t sampleCount = (w * h < 256) ? w * h : 256;
-	for (uint32_t i = 0; i < sampleCount && !hasData; i++) {
-		uint32_t off = i * 4;
-		if (expanded[off] != 0 || expanded[off+1] != 0 || expanded[off+2] != 0 || expanded[off+3] != 0) {
-			hasData = true;
-		}
-	}
+	// Check the whole converted image. ARGB16 sprites can have transparent
+	// leading scanlines, so a top-left sample is not enough to decide whether
+	// the texture has received real data.
+	RaveBGRAImageStats sourceStats = RaveBGRAImageAnalyze(expanded, w * h);
+	bool hasData = (sourceStats.nonzero != 0);
 
 	// Replace Metal texture contents
 	id<MTLTexture> mtlTex = (__bridge id<MTLTexture>)entry->metal_texture;
@@ -4244,17 +4268,20 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 
 	delete[] expanded;
 
-	if (hasData) {
-		// Data arrived — stop re-uploading. Under R2 authoritative read
-		// path `pixmap == cpu_pixel_mac_addr`, so this copy is a no-op
+	if (hasData && !entry->pixels_copied) {
+		// First non-empty data observed. Under R2 authoritative read path
+		// `pixmap == cpu_pixel_mac_addr`, so this copy is a no-op
 		// (self-copy). Under the classic path it mirrors the pixmap data
-		// into cpu_pixel_data for AccessTexture consumers.
+		// into cpu_pixel_data for AccessTexture consumers. Refresh still
+		// continues on later draws because live pixmaps may change again.
 		if (entry->cpu_pixel_data && entry->cpu_pixel_mac_addr) {
 			Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 		}
 		entry->pixels_copied = true;
-		RAVE_LOG("TextureRefresh: pixelType=%d %dx%d pixmap=0x%08x -> data arrived, re-uploaded",
-		       pixelType, w, h, pixmap);
+		RAVE_LOG("TextureRefresh: pixelType=%d %dx%d pixmap=0x%08x -> first non-empty data observed nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+		       pixelType, w, h, pixmap,
+		       sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
+		       sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb);
 	}
 }
 

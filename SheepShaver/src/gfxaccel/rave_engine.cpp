@@ -926,16 +926,20 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 			break;
 	}
 
-	// [DIAG-T03] Log first 4 output BGRA pixel values for texture diagnostics
+	// [DIAG-T03] Log first 4 output BGRA pixel values and full-image coverage
+	// for texture diagnostics.
 	if (converted && rave_logging_enabled && width > 0 && height > 0) {
 		uint32_t px[4] = {0, 0, 0, 0};
 		uint32_t numPx = width * height;
 		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
 			memcpy(&px[i], &dst[i * 4], 4);
 		}
-		printf("RAVE DIAG: ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X\n",
+		RaveBGRAImageStats stats = RaveBGRAImageAnalyze(dst, numPx);
+		printf("RAVE DIAG: ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u\n",
 		       RavePixelFormatName(pixelType), pixelType, width, height,
-		       px[0], px[1], px[2], px[3]);
+		       px[0], px[1], px[2], px[3],
+		       stats.nonzero, stats.alpha, stats.rgb, stats.white,
+		       stats.first_nonzero, stats.first_alpha, stats.first_rgb);
 	}
 
 	return converted;
@@ -1137,25 +1141,11 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
 
-	// Check if source data was all zeros (placeholder texture from QD3D).
-	// Sample a few pixels — if all are opaque black (0xFF000000 in BGRA),
-	// the game likely hasn't written real data yet.
-	//
-	// Also test the alpha channel
-	// (expanded[off+3]). ARGB16 sprites with transparent-border top
-	// scanlines (the common PICT-loaded sprite layout) have alpha-dense
-	// but RGB-zero pixels; the previous RGB-only check missed those and
-	// incorrectly flagged the source as empty.
-	bool sourceWasEmpty = true;
-	uint32_t sampleCount = (w * h < 64) ? w * h : 64;
-	for (uint32_t i = 0; i < sampleCount; i++) {
-		uint32_t offset = i * 4;
-		// Check if any pixel has non-zero color (B, G, R, A channels)
-		if (expanded[offset] != 0 || expanded[offset+1] != 0 || expanded[offset+2] != 0 || expanded[offset+3] != 0) {
-			sourceWasEmpty = false;
-			break;
-		}
-	}
+	// Check the whole converted image. Bugdom's ARGB16 sprites commonly
+	// have transparent top-left borders, so a small leading sample can mark
+	// real texture data as empty.
+	RaveBGRAImageStats sourceStats = RaveBGRAImageAnalyze(expanded, w * h);
+	bool sourceWasEmpty = (sourceStats.nonzero == 0);
 
 	entry->metal_texture = RaveCreateMetalTexture(w, h, mipLevels, expanded, w * 4);
 
@@ -1191,13 +1181,16 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 	}
 
-	// Only mark as fully copied if source had real data.
-	// If source was empty, leave pixels_copied=false so subsequent frames
-	// will re-check the pixmap (QD3D may write real data later).
+	// Record whether any data was present at first realization. This is a
+	// diagnostic/lifecycle marker only: direct-format pixmap-backed textures
+	// remain live and are refreshed on later draws, because QD3D can continue
+	// writing into the same pixmap after first use.
 	entry->pixels_copied = !sourceWasEmpty;
 
-	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d",
-	       pixelType, w, h, mipLevels, pixmap, entry->metal_texture, sourceWasEmpty);
+	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+	         pixelType, w, h, mipLevels, pixmap, entry->metal_texture, sourceWasEmpty,
+	         sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
+	         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb);
 }
 
 
