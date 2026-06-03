@@ -40,6 +40,7 @@
 
 #if TARGET_OS_IPHONE
 #include "display_mode_controller.h"
+#include "dsp_video_status_policy.h"
 #endif
 
 #define DEBUG 0
@@ -673,6 +674,22 @@ static void get_size_of_resolution(int id, uint32 &x, uint32 &y)
 	x = y = 0;
 }
 
+#if TARGET_OS_IPHONE
+static bool get_dsp_video_status_override(uint16 &mode, uint32 &data)
+{
+	const DMCModeSnapshot *snap = dmc_current_snapshot();
+	return DSpVideoStatusForSnapshot(snap, VModes, &mode, &data);
+}
+
+static void log_dsp_video_status_override(const char *selector, uint16 mode, uint32 data)
+{
+	const int depth = (mode >= APPLE_1_BIT && mode <= APPLE_32_BIT) ?
+	    (1 << (mode - APPLE_1_BIT)) : 0;
+	printf("VideoStatus %s: DSp override mode=0x%04x depth=%d id=0x%08x\n",
+	       selector, mode, depth, data);
+}
+#endif
+
 static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 {
 	int16 code = ReadMacInt16(pb + csCode);
@@ -680,15 +697,22 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 	uint32 param = ReadMacInt32(pb + csParam);
 	switch (code) {
 
-		case cscGetMode:							// GetMode
+		case cscGetMode: {							// GetMode
 			D(bug("GetMode\n"));
+			uint16 mode = csSave->saveMode;
+			uint32 data = csSave->saveData;
+#if TARGET_OS_IPHONE
+			if (get_dsp_video_status_override(mode, data))
+				log_dsp_video_status_override("GetMode", mode, data);
+#endif
 			WriteMacInt32(param + csBaseAddr, csSave->saveBaseAddr);
-			WriteMacInt16(param + csMode, csSave->saveMode);
+			WriteMacInt16(param + csMode, mode);
 			WriteMacInt16(param + csPage, csSave->savePage);
 			D(bug("return: mode:%04x page:%04x ", ReadMacInt16(param + csMode),
 				ReadMacInt16(param + csPage)));
 			D(bug("base adress %08lx\n", ReadMacInt32(param + csBaseAddr)));
 			return noErr;
+		}
 
 		case cscGetEntries: {						// GetEntries
 			D(bug("GetEntries\n"));	
@@ -760,10 +784,16 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 			D(bug("GetDefaultMode\n"));
 			return statusErr;
 
-		case cscGetCurMode:							// GetCurMode
+		case cscGetCurMode: {						// GetCurMode
 			D(bug("GetCurMode\n"));
-			WriteMacInt16(param + csMode, csSave->saveMode);
-			WriteMacInt32(param + csData, csSave->saveData);
+			uint16 mode = csSave->saveMode;
+			uint32 data = csSave->saveData;
+#if TARGET_OS_IPHONE
+			if (get_dsp_video_status_override(mode, data))
+				log_dsp_video_status_override("GetCurMode", mode, data);
+#endif
+			WriteMacInt16(param + csMode, mode);
+			WriteMacInt32(param + csData, data);
 			WriteMacInt16(param + csPage, csSave->savePage);
 			WriteMacInt32(param + csBaseAddr, csSave->saveBaseAddr);
 			
@@ -771,6 +801,7 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 				ReadMacInt32(param + csData), ReadMacInt16(param + csPage)));
 			D(bug("base adress %08lx\n", ReadMacInt32(param + csBaseAddr)));
 			return noErr;
+		}
 
 		case cscGetConnection:						// GetConnection
 			D(bug("GetConnection\n"));
@@ -796,6 +827,17 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 			unsigned int work_id = ReadMacInt32(param + csPreviousDisplayModeID);
 			switch (work_id) {
 				case kDisplayModeIDCurrent:
+#if TARGET_OS_IPHONE
+				{
+					uint16 mode = csSave->saveMode;
+					uint32 data = csSave->saveData;
+					if (get_dsp_video_status_override(mode, data)) {
+						log_dsp_video_status_override("GetNextResolution", mode, data);
+						work_id = data;
+						break;
+					}
+				}
+#endif
 					work_id = csSave->saveData;
 					break;
 				case kDisplayModeIDFindFirstResolution:
@@ -885,15 +927,29 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 			return noErr;
 		}
 
-		case cscGetVideoParameters:					// GetVideoParameters
+		case cscGetVideoParameters: {				// GetVideoParameters
 			D(bug("GetVideoParameters ID:%08lx Depth:%04x\n",
 				ReadMacInt32(param + csDisplayModeID),
 				ReadMacInt16(param + csDepthMode)));
 
+			uint32 requested_id = ReadMacInt32(param + csDisplayModeID);
+			uint16 requested_mode = ReadMacInt16(param + csDepthMode);
+#if TARGET_OS_IPHONE
+			if (requested_id == kDisplayModeIDCurrent) {
+				uint16 mode = csSave->saveMode;
+				uint32 data = csSave->saveData;
+				if (get_dsp_video_status_override(mode, data)) {
+					log_dsp_video_status_override("GetVideoParameters", mode, data);
+					requested_id = data;
+					requested_mode = mode;
+				}
+			}
+#endif
+
 			// find right video mode						
 			for (int i=0; VModes[i].viType!=DIS_INVALID; i++) {
-				if ((ReadMacInt16(param + csDepthMode) == VModes[i].viAppleMode) &&
-					(ReadMacInt32(param + csDisplayModeID) == VModes[i].viAppleID)) {
+				if ((requested_mode == VModes[i].viAppleMode) &&
+					(requested_id == VModes[i].viAppleID)) {
 					uint32 vpb = ReadMacInt32(param + csVPBlockPtr);
 					WriteMacInt32(vpb + vpBaseOffset, 0);
 					WriteMacInt16(vpb + vpRowBytes, VModes[i].viRowBytes);
@@ -956,6 +1012,7 @@ static int16 VideoStatus(uint32 pb, VidLocals *csSave)
 				}
 			}
 			return paramErr;
+		}
 
 		case cscGetModeTiming:
 			D(bug("GetModeTiming mode %08lx\n", ReadMacInt32(param + csTimingMode)));

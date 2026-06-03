@@ -56,6 +56,8 @@ extern uint32 NativeHookAccessTexture(uint32 engine, uint32 texture, uint32 mipm
 extern uint32 NativeHookAccessTextureEnd(uint32 engine, uint32 texture, uint32 dirtyRect);
 extern uint32 NativeHookAccessBitmap(uint32 engine, uint32 bitmap, uint32 flags, uint32 buffer);
 extern uint32 NativeHookAccessBitmapEnd(uint32 engine, uint32 bitmap, uint32 dirtyRect);
+extern uint32 NativeHookEngineEnable(uint32 vendorID, uint32 engineID);
+extern uint32 NativeHookEngineDisable(uint32 vendorID, uint32 engineID);
 
 // Engine method dispatch functions (implemented in rave_engine.cpp)
 extern int32_t NativeEngineTextureNew(uint32_t flags, uint32_t pixelType, uint32_t imagesAddr, uint32_t newTexturePtr);
@@ -422,6 +424,14 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 			// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount
 			NativeHookQ3PixmapSetImage(r3, r4, r5);
 			return kQANoErr;
+
+		case kRaveHookEngineEnable:
+			// QAEngineEnable(vendorID, engineID)
+			return NativeHookEngineEnable(r3, r4);
+
+		case kRaveHookEngineDisable:
+			// QAEngineDisable(vendorID, engineID)
+			return NativeHookEngineDisable(r3, r4);
 
 		default:
 			RAVE_LOG("RAVE: unknown hook sub-opcode %d", method_id);

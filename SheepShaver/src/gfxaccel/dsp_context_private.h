@@ -39,6 +39,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "dsp_front_staging_present_policy.h"
+
 #include "dsp_engine.h"       /* DSpContextAttributes + DSpContextState enum */
 #include "dsp_event_record.h" /* DSpEventRecord struct */
 
@@ -96,6 +98,13 @@ struct DSpContextPrivate {
 	 * First GetBackBuffer call allocates via SheepMem::Reserve
 	 * and caches the Mac address here; subsequent calls return the same. */
 	uint32_t              cgrafptr_mac_addr;
+	uint32_t              front_cgrafptr_mac_addr;
+	uint32_t              front_pixmap_mac_addr;
+	uint32_t              front_pixmap_handle_mac_addr;
+	uint32_t              front_staging_mac_addr;
+	uint32_t              front_staging_size;
+	bool                  front_staging_owned_sysheap;
+	DSpFrontStagingPresentState front_staging_present_state;
 
 	/* Dirty-region accumulator — populated with the real
 	 * InvalBackBufferRect-driven union. */
@@ -104,21 +113,24 @@ struct DSpContextPrivate {
 	bool                  dirty_cold_start;
 
 	/* Staging-region fallback. When Host2MacAddr cannot map the
-	 * MTLBuffer contents pointer back to a guest-Mac uint32 (e.g., the
-	 * bump allocator lives outside the vm_alloc region on arm64
-	 * iOS), DSpGetBackBufferCGrafPtr reserves a guest-RAM region via
-	 * SheepMem::Reserve(buffer_size) and stores the Mac address here. At
+	 * MTLBuffer contents pointer back to a usable guest-RAM address (e.g.,
+	 * the bump allocator lives outside the vm_alloc region on arm64 iOS),
+	 * DSpGetBackBufferCGrafPtr reserves a guest-RAM region via
+	 * Mac_sysalloc(buffer_size) and stores the Mac address here. At
 	 * SwapBuffers time the handler memcpys staging → back_buffer.contents
-	 * before the GPU blit. Zero means Host2MacAddr succeeded and no
-	 * staging indirection is needed.
+	 * before the GPU blit. Zero means Host2MacAddr produced a guest-RAM
+	 * address and no staging indirection is needed.
 	 *
 	 * Preserving guest-writable CGrafPtr semantics via a host memcpy is
 	 * strictly better than a raw (uint32)(uintptr_t) cast of the contents
 	 * pointer — the latter is undefined behaviour on arm64 iOS (64-bit
 	 * host VA truncated to 32-bit Mac address). Graceful degradation: if
-	 * SheepMem cannot vend enough, GetBackBufferHandler returns
+	 * Mac_sysalloc cannot vend enough, GetBackBufferHandler returns
 	 * kDSpInternalErr; no OOB write is ever attempted. */
 	uint32_t              staging_mac_addr;
+	/* True only for staging_mac_addr allocations that must be returned with
+	 * Mac_sysfree. Test scratch and direct Host2MacAddr paths leave this false. */
+	bool                  staging_owned_sysheap;
 
 	/* MainDevice PixMap restoration state.
 	 * Single-writer emul-thread per DSpContextPrivate convention. Captured on
@@ -129,6 +141,10 @@ struct DSpContextPrivate {
 	uint32_t  saved_pixmap_baseAddr;
 	uint16_t  saved_pixmap_rowBytes;
 	int16_t   saved_pixmap_bounds[4];   /* top, left, bottom, right (matches QD Rect layout) */
+	uint16_t  saved_pixmap_pixelType;
+	uint16_t  saved_pixmap_pixelSize;
+	uint16_t  saved_pixmap_cmpCount;
+	uint16_t  saved_pixmap_cmpSize;
 	uint8_t   saved_pixmap_valid;       /* 0 = no redirect installed; 1 = redirect installed */
 	uint8_t   saved_pixmap_reserved[3]; /* alignment padding (preserves uint16 alignment of any trailing fields) */
 

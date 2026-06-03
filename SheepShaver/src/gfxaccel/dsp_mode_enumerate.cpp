@@ -744,7 +744,6 @@ extern "C" int32_t DSpFindBestContextHandler(uint32_t attrAddr,
 	 * inspects backBufferWidth/Height sees consistent values. */
 	req.backBufferWidth       = req.displayWidth;
 	req.backBufferHeight      = req.displayHeight;
-
 	const DSpContextAttributes *best = DSpFindBestContext_Core(&req);
 	if (best == nullptr) {
 		/* No mode satisfies the attribute mask. */

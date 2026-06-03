@@ -20,6 +20,9 @@
 #include "cpu_emulation.h"
 #include "nqd_accel.h"
 #include "accel_logging.h"
+#include "dsp_pixmap_offsets.h"
+#include "nqd_main_device_policy.h"
+#include "nqd_packed_fill_policy.h"
 #include "metal_device_shared.h"
 #include "gfxaccel_resources_heap.h"
 
@@ -445,6 +448,81 @@ static inline uint32_t nqd_walk_read32(uint32_t mac_addr)
     }
 #endif
     return ReadMacInt32(mac_addr);
+}
+
+static inline bool nqd_lowmem_or_ram_inrange(uint32_t mac_addr)
+{
+    const uint32_t ram_lo = (uint32_t)RAMBase;
+    const uint32_t ram_hi = (uint32_t)(RAMBase + RAMSize);
+    return (mac_addr < 0x3000u) || (mac_addr >= ram_lo && mac_addr < ram_hi);
+}
+
+static inline NQDMainDevicePixMapSnapshot nqd_read_main_device_pixmap_snapshot()
+{
+    NQDMainDevicePixMapSnapshot snap = { false, 0, 0, 0 };
+    uint32_t mainDeviceH = ReadMacInt32(LMADDR_MAIN_DEVICE);
+    if (mainDeviceH == 0 || !nqd_lowmem_or_ram_inrange(mainDeviceH)) return snap;
+
+    uint32_t gdevicePtr = nqd_walk_read32(mainDeviceH);
+    if (gdevicePtr == 0 || !nqd_lowmem_or_ram_inrange(gdevicePtr)) return snap;
+    if (!nqd_lowmem_or_ram_inrange(gdevicePtr + GDEVICE_OFF_PMAP)) return snap;
+
+    uint32_t pixMapH = nqd_walk_read32(gdevicePtr + GDEVICE_OFF_PMAP);
+    if (pixMapH == 0 || !nqd_lowmem_or_ram_inrange(pixMapH)) return snap;
+
+    uint32_t pixMapPtr = nqd_walk_read32(pixMapH);
+    if (pixMapPtr == 0 || !nqd_lowmem_or_ram_inrange(pixMapPtr)) return snap;
+    if (!nqd_lowmem_or_ram_inrange(
+            pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE + 2)) return snap;
+
+    snap.valid = true;
+    snap.baseAddr = nqd_walk_read32(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR);
+    snap.rowBytes = (uint32_t)(nqd_walk_read16(
+        pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES) & 0x7FFFu);
+    snap.pixelSize = nqd_walk_read16(
+        pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE);
+    return snap;
+}
+
+static inline bool nqd_should_drop_stale_main_device_params(NQDMainDevicePixMapSnapshot snap,
+                                                             uint32_t dest_base,
+                                                             int32_t dest_row_bytes,
+                                                             uint32_t pixel_size)
+{
+    return NQDShouldDropStaleMainDeviceParams(snap, dest_base, dest_row_bytes,
+                                              pixel_size);
+}
+
+static inline bool nqd_should_use_cpu_packed_main_device_path(NQDMainDevicePixMapSnapshot snap,
+                                                               uint32_t dest_base,
+                                                               int32_t dest_row_bytes,
+                                                               uint32_t pixel_size)
+{
+    return NQDShouldUseCPUPackedMainDevicePath(snap, dest_base, dest_row_bytes,
+                                               pixel_size);
+}
+
+static inline bool nqd_should_use_cpu_mixed_depth_main_device_bitblt(NQDMainDevicePixMapSnapshot snap,
+                                                                      uint32_t dest_base,
+                                                                      int32_t dest_row_bytes,
+                                                                      uint32_t src_pixel_size,
+                                                                      uint32_t dest_pixel_size,
+                                                                      uint32_t transfer_mode)
+{
+    return NQDShouldUseCPUMixedDepthMainDeviceBitBlt(snap, dest_base,
+                                                     dest_row_bytes,
+                                                     src_pixel_size,
+                                                     dest_pixel_size,
+                                                     transfer_mode);
+}
+
+static inline uint32_t nqd_effective_main_device_pixel_size(NQDMainDevicePixMapSnapshot snap,
+                                                             uint32_t dest_base,
+                                                             int32_t dest_row_bytes,
+                                                             uint32_t pixel_size)
+{
+    return NQDEffectiveMainDevicePixelSize(snap, dest_base, dest_row_bytes,
+                                           pixel_size);
 }
 
 static inline uint32_t nqd_read_blend_weight()
@@ -892,6 +970,262 @@ static uint32_t nqd_pack_hilite_color(int bpp)
     }
 }
 
+static bool nqd_cpu_fillrect_packed_boolean(uint32 dest_base,
+                                            int32 dest_row_bytes,
+                                            int16 dest_X,
+                                            int16 dest_Y,
+                                            int16 width,
+                                            int16 height,
+                                            uint32 pixel_size,
+                                            uint32 transfer_mode,
+                                            uint32 fill_color)
+{
+    if (pixel_size == 0 || pixel_size >= 8) return false;
+    if (transfer_mode < 8 || transfer_mode > 15) return false;
+
+    NQDMetalFlush();
+
+    uint8 *dst_ptr = Mac2HostAddr(dest_base)
+                   + (dest_Y * dest_row_bytes)
+                   + nqd_packed_byte_offset(dest_X, pixel_size);
+    const uint32 width_bytes = nqd_packed_width_bytes(width, pixel_size);
+    const uint8_t fill = (uint8_t)(fill_color & 0xFFu);
+
+    if (pixel_size == 1) {
+        const uint32_t fill_index = NQDPacked1BppIndexFromNativeColor(fill_color);
+        uint8 *dst_row = Mac2HostAddr(dest_base) + (dest_Y * dest_row_bytes);
+        for (int row = 0; row < height; row++) {
+            for (int col = 0; col < width; col++) {
+                const uint32_t x = (uint32_t)dest_X + (uint32_t)col;
+                uint8_t *byte = dst_row + (x >> 3);
+                const uint32_t d = NQDPackedGet1BppPixel(*byte, x);
+                uint32_t out = 0;
+                switch (transfer_mode) {
+                    case 8:  out = fill_index;              break;
+                    case 9:  out = fill_index | d;          break;
+                    case 10: out = fill_index ^ d;          break;
+                    case 11: out = (~fill_index) & d;       break;
+                    case 12: out = ~fill_index;             break;
+                    case 13: out = (~fill_index) | d;       break;
+                    case 14: out = (~fill_index) ^ d;       break;
+                    case 15: out = fill_index & d;          break;
+                }
+                *byte = NQDPackedSet1BppPixel(*byte, x, out);
+            }
+            dst_row += dest_row_bytes;
+        }
+        return true;
+    }
+
+    for (int row = 0; row < height; row++) {
+        for (uint32 b = 0; b < width_bytes; b++) {
+            uint8_t d = dst_ptr[b];
+            switch (transfer_mode) {
+                case 8:  dst_ptr[b] = fill;             break;
+                case 9:  dst_ptr[b] = fill | d;         break;
+                case 10: dst_ptr[b] = fill ^ d;         break;
+                case 11: dst_ptr[b] = (uint8_t)(~fill) & d; break;
+                case 12: dst_ptr[b] = (uint8_t)(~fill); break;
+                case 13: dst_ptr[b] = (uint8_t)(~fill) | d; break;
+                case 14: dst_ptr[b] = (uint8_t)(~fill) ^ d; break;
+                case 15: dst_ptr[b] = fill & d;         break;
+            }
+        }
+        dst_ptr += dest_row_bytes;
+    }
+
+    return true;
+}
+
+static bool nqd_cpu_bitblt_packed_boolean(uint32 src_base,
+                                          int32 src_row_bytes,
+                                          uint32 dest_base,
+                                          int32 dest_row_bytes,
+                                          int16 src_X,
+                                          int16 src_Y,
+                                          int16 dest_X,
+                                          int16 dest_Y,
+                                          int16 width,
+                                          int16 height,
+                                          uint32 pixel_size,
+                                          uint32 transfer_mode,
+                                          uint32 fore_pen,
+                                          uint32 back_pen)
+{
+    if (pixel_size == 0 || pixel_size >= 8) return false;
+    if (transfer_mode > 7) return false;
+
+    NQDMetalFlush();
+
+    uint8 *src_ptr = Mac2HostAddr(src_base)
+                   + (src_Y * src_row_bytes)
+                   + nqd_packed_byte_offset(src_X, pixel_size);
+    uint8 *dst_ptr = Mac2HostAddr(dest_base)
+                   + (dest_Y * dest_row_bytes)
+                   + nqd_packed_byte_offset(dest_X, pixel_size);
+    const uint32 width_bytes = nqd_packed_width_bytes(width, pixel_size);
+
+    if (pixel_size == 1) {
+        const uint32 fore_bit = NQDPacked1BppIndexFromNativeColor(ntohl(fore_pen));
+        const uint32 back_bit = NQDPacked1BppIndexFromNativeColor(ntohl(back_pen));
+        uint8 *src_row = Mac2HostAddr(src_base) + (src_Y * src_row_bytes);
+        uint8 *dst_row = Mac2HostAddr(dest_base) + (dest_Y * dest_row_bytes);
+        for (int row = 0; row < height; row++) {
+            for (int col = 0; col < width; col++) {
+                const uint32_t sx = (uint32_t)src_X + (uint32_t)col;
+                const uint32_t dx = (uint32_t)dest_X + (uint32_t)col;
+                uint8_t *src_byte = src_row + (sx >> 3);
+                uint8_t *dst_byte = dst_row + (dx >> 3);
+                const uint32_t s_index =
+                    NQDPackedGet1BppPixel(*src_byte, sx) ? fore_bit : back_bit;
+                const uint32_t d = NQDPackedGet1BppPixel(*dst_byte, dx);
+                uint32_t out = 0;
+                switch (transfer_mode) {
+                    case 0:  out = s_index;                break;
+                    case 1:  out = s_index | d;            break;
+                    case 2:  out = s_index ^ d;            break;
+                    case 3:  out = (~s_index) & d;         break;
+                    case 4:  out = ~s_index;               break;
+                    case 5:  out = (~s_index) | d;         break;
+                    case 6:  out = (~s_index) ^ d;         break;
+                    case 7:  out = s_index & d;            break;
+                }
+                *dst_byte = NQDPackedSet1BppPixel(*dst_byte, dx, out);
+            }
+            src_row += src_row_bytes;
+            dst_row += dest_row_bytes;
+        }
+        return true;
+    }
+
+    for (int row = 0; row < height; row++) {
+        for (uint32 b = 0; b < width_bytes; b++) {
+            uint8_t src = src_ptr[b];
+            uint8_t dst = dst_ptr[b];
+
+            switch (transfer_mode) {
+                case 0:  dst_ptr[b] = src;              break;
+                case 1:  dst_ptr[b] = src | dst;        break;
+                case 2:  dst_ptr[b] = src ^ dst;        break;
+                case 3:  dst_ptr[b] = (uint8_t)(~src) & dst; break;
+                case 4:  dst_ptr[b] = (uint8_t)(~src);  break;
+                case 5:  dst_ptr[b] = (uint8_t)(~src) | dst; break;
+                case 6:  dst_ptr[b] = (uint8_t)(~src) ^ dst; break;
+                case 7:  dst_ptr[b] = src & dst;        break;
+            }
+        }
+        src_ptr += src_row_bytes;
+        dst_ptr += dest_row_bytes;
+    }
+
+    return true;
+}
+
+static inline uint32_t nqd_direct_pixel_from_native_color(uint32_t native_color,
+                                                          uint32_t pixel_size)
+{
+    const uint32_t rgb = native_color & 0x00ffffffu;
+    const uint32_t r = (rgb >> 16) & 0xffu;
+    const uint32_t g = (rgb >> 8) & 0xffu;
+    const uint32_t b = rgb & 0xffu;
+
+    if (pixel_size == 16) {
+        return 0x8000u | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    }
+    if (pixel_size == 32) {
+        return 0xff000000u | (r << 16) | (g << 8) | b;
+    }
+    return native_color;
+}
+
+static inline uint32_t nqd_apply_boolean_pixel(uint32_t src,
+                                               uint32_t dst,
+                                               uint32_t transfer_mode,
+                                               uint32_t mask)
+{
+    uint32_t out = 0;
+    switch (transfer_mode) {
+        case 0:  out = src;          break;
+        case 1:  out = src | dst;    break;
+        case 2:  out = src ^ dst;    break;
+        case 3:  out = (~src) & dst; break;
+        case 4:  out = ~src;         break;
+        case 5:  out = (~src) | dst; break;
+        case 6:  out = (~src) ^ dst; break;
+        case 7:  out = src & dst;    break;
+        default: out = dst;          break;
+    }
+    return out & mask;
+}
+
+static bool nqd_cpu_bitblt_1bpp_to_direct_boolean(uint32 src_base,
+                                                  int32 src_row_bytes,
+                                                  uint32 dest_base,
+                                                  int32 dest_row_bytes,
+                                                  int16 src_X,
+                                                  int16 src_Y,
+                                                  int16 dest_X,
+                                                  int16 dest_Y,
+                                                  int16 width,
+                                                  int16 height,
+                                                  uint32 dest_pixel_size,
+                                                  uint32 transfer_mode,
+                                                  uint32 fore_pen_native,
+                                                  uint32 back_pen_native)
+{
+    if (dest_pixel_size != 16 && dest_pixel_size != 32) return false;
+    if (transfer_mode > 7) return false;
+
+    NQDMetalFlush();
+
+    const uint32_t dest_bpp = dest_pixel_size / 8u;
+    const uint32_t mask = (dest_pixel_size == 16) ? 0xffffu : 0xffffffffu;
+    const uint32_t fore_pixel =
+        nqd_direct_pixel_from_native_color(fore_pen_native, dest_pixel_size);
+    const uint32_t back_pixel =
+        nqd_direct_pixel_from_native_color(back_pen_native, dest_pixel_size);
+
+    uint8 *src_row = Mac2HostAddr(src_base) + (src_Y * src_row_bytes);
+    uint8 *dst_row = Mac2HostAddr(dest_base) + (dest_Y * dest_row_bytes);
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            const uint32_t sx = (uint32_t)src_X + (uint32_t)col;
+            const uint32_t dx = (uint32_t)dest_X + (uint32_t)col;
+            const uint8_t *src_byte = src_row + (sx >> 3);
+            uint8_t *dst = dst_row + (dx * dest_bpp);
+            const uint32_t src_pixel =
+                NQDPackedGet1BppPixel(*src_byte, sx) ? fore_pixel : back_pixel;
+            uint32_t dst_pixel = 0;
+
+            if (dest_pixel_size == 16) {
+                dst_pixel = ((uint32_t)dst[0] << 8) | (uint32_t)dst[1];
+            } else {
+                dst_pixel = ((uint32_t)dst[0] << 24) |
+                            ((uint32_t)dst[1] << 16) |
+                            ((uint32_t)dst[2] << 8) |
+                            (uint32_t)dst[3];
+            }
+
+            const uint32_t out =
+                nqd_apply_boolean_pixel(src_pixel, dst_pixel, transfer_mode, mask);
+            if (dest_pixel_size == 16) {
+                dst[0] = (uint8_t)((out >> 8) & 0xffu);
+                dst[1] = (uint8_t)(out & 0xffu);
+            } else {
+                dst[0] = (uint8_t)((out >> 24) & 0xffu);
+                dst[1] = (uint8_t)((out >> 16) & 0xffu);
+                dst[2] = (uint8_t)((out >> 8) & 0xffu);
+                dst[3] = (uint8_t)(out & 0xffu);
+            }
+        }
+        src_row += src_row_bytes;
+        dst_row += dest_row_bytes;
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Mask buffer management (file-static)
 // ---------------------------------------------------------------------------
@@ -957,7 +1291,6 @@ static bool nqd_decode_region(uint32 rgn_addr, int dest_width, int dest_height,
     }
 
     int rgn_width  = bbox_right - bbox_left;
-    int rgn_height = bbox_bottom - bbox_top;
 
     NQD_LOG("nqd_decode_region: rgnSize=%u bbox=(%d,%d,%d,%d) dest=%dx%d",
             rgnSize, bbox_top, bbox_left, bbox_bottom, bbox_right,
@@ -1359,6 +1692,7 @@ void NQDMetalBitblt(uint32 p)
     if (width <= 0 || height <= 0) return;
 
     uint32 src_pixel_size  = ReadMacInt32(p + NQD_acclSrcPixelSize);
+    uint32 dest_pixel_size = ReadMacInt32(p + NQD_acclDestPixelSize);
     int bpp = nqd_bytes_per_pixel(src_pixel_size);
     if (src_pixel_size < 8) bpp = 1;  // packed depths: byte-level ops
     uint32 width_bytes = nqd_packed_width_bytes(width, src_pixel_size);
@@ -1372,8 +1706,91 @@ void NQDMetalBitblt(uint32 p)
     // Read transfer mode and pen colors from accl_params
     uint32_t transfer_mode = ReadMacInt32(p + NQD_acclTransferMode);
 
-    NQD_LOG("NQDMetalBitblt: src=(%d,%d) dst=(%d,%d) %dx%d bpp=%d bits_per_pixel=%u mode=%d src_rb=%d dst_rb=%d",
-            src_X, src_Y, dest_X, dest_Y, width, height, bpp, src_pixel_size, transfer_mode, src_row_bytes, dest_row_bytes);
+    NQD_LOG("NQDMetalBitblt: src=(%d,%d) dst=(%d,%d) %dx%d bpp=%d bits_per_pixel=%u dest_bits=%u mode=%d src_base=0x%08x dest_base=0x%08x src_rb=%d dst_rb=%d",
+            src_X, src_Y, dest_X, dest_Y, width, height, bpp, src_pixel_size,
+            dest_pixel_size, transfer_mode, src_base, dest_base,
+            src_row_bytes, dest_row_bytes);
+
+    NQDMainDevicePixMapSnapshot main_device = nqd_read_main_device_pixmap_snapshot();
+    if (nqd_should_drop_stale_main_device_params(main_device, dest_base,
+                                                 dest_row_bytes,
+                                                 dest_pixel_size)) {
+        NQD_LOG("NQDMetalBitblt: dropped stale MainDevice params "
+                "(base=0x%08x bits_per_pixel=%u dst_rb=%d)",
+                dest_base, dest_pixel_size, dest_row_bytes);
+        return;
+    }
+    uint32_t packet_src_pixel_size = src_pixel_size;
+    uint32_t packet_dest_pixel_size = dest_pixel_size;
+    src_pixel_size = nqd_effective_main_device_pixel_size(main_device,
+                                                          src_base,
+                                                          src_row_bytes,
+                                                          src_pixel_size);
+    dest_pixel_size = nqd_effective_main_device_pixel_size(main_device,
+                                                           dest_base,
+                                                           dest_row_bytes,
+                                                           dest_pixel_size);
+    if (src_pixel_size != packet_src_pixel_size) {
+        bpp = nqd_bytes_per_pixel(src_pixel_size);
+        if (src_pixel_size < 8) bpp = 1;
+        width_bytes = nqd_packed_width_bytes(width, src_pixel_size);
+        NQD_LOG("NQDMetalBitblt: coerced redirected MainDevice source depth "
+                "packet=%u live=%u src_rb=%d",
+                packet_src_pixel_size, src_pixel_size, src_row_bytes);
+    }
+    if (dest_pixel_size != packet_dest_pixel_size) {
+        NQD_LOG("NQDMetalBitblt: coerced redirected MainDevice dest depth "
+                "packet=%u live=%u dst_rb=%d",
+                packet_dest_pixel_size, dest_pixel_size, dest_row_bytes);
+    }
+    if (nqd_should_use_cpu_mixed_depth_main_device_bitblt(main_device,
+                                                          dest_base,
+                                                          dest_row_bytes,
+                                                          src_pixel_size,
+                                                          dest_pixel_size,
+                                                          transfer_mode)) {
+        uint32_t fore_pen = ReadMacInt32(p + NQD_acclForePen);
+        uint32_t back_pen = ReadMacInt32(p + NQD_acclBackPen);
+        if (src_pixel_size == 1 &&
+            nqd_cpu_bitblt_1bpp_to_direct_boolean(src_base, src_row_bytes,
+                                                  dest_base, dest_row_bytes,
+                                                  src_X, src_Y, dest_X, dest_Y,
+                                                  width, height,
+                                                  dest_pixel_size,
+                                                  transfer_mode,
+                                                  fore_pen, back_pen)) {
+            NQD_LOG("NQDMetalBitblt: used CPU mixed-depth MainDevice path "
+                    "(base=0x%08x src_bits=%u dst_bits=%u dst_rb=%d mode=%u "
+                    "fore=0x%08x back=0x%08x)",
+                    dest_base, src_pixel_size, dest_pixel_size,
+                    dest_row_bytes, transfer_mode, fore_pen, back_pen);
+            return;
+        }
+    }
+    if (src_pixel_size != dest_pixel_size &&
+        main_device.valid && dest_base == main_device.baseAddr &&
+        dest_row_bytes == (int32_t)main_device.rowBytes) {
+        NQD_LOG("NQDMetalBitblt: dropped unsupported mixed-depth MainDevice blit "
+                "(src_bits=%u dst_bits=%u mode=%u)",
+                src_pixel_size, dest_pixel_size, transfer_mode);
+        return;
+    }
+    if (nqd_should_use_cpu_packed_main_device_path(main_device, dest_base, dest_row_bytes, src_pixel_size)) {
+        uint32_t fore_pen = htonl(ReadMacInt32(p + NQD_acclForePen));
+        uint32_t back_pen = htonl(ReadMacInt32(p + NQD_acclBackPen));
+        if (nqd_cpu_bitblt_packed_boolean(src_base, src_row_bytes,
+                                          dest_base, dest_row_bytes,
+                                          src_X, src_Y, dest_X, dest_Y,
+                                          width, height, src_pixel_size,
+                                          transfer_mode, fore_pen, back_pen)) {
+            NQD_LOG("NQDMetalBitblt: used CPU packed MainDevice path "
+                    "(base=0x%08x bits_per_pixel=%u dst_rb=%d mode=%u "
+                    "fore=0x%08x back=0x%08x)",
+                    dest_base, src_pixel_size, dest_row_bytes,
+                    transfer_mode, fore_pen, back_pen);
+            return;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // CPU fast path for small operations and simple modes
@@ -2001,8 +2418,45 @@ void NQDMetalFillRect(uint32 p)
     uint32_t transfer_mode = ReadMacInt32(p + NQD_acclTransferMode);
     uint32_t pen_mode = ReadMacInt32(p + NQD_acclPenMode);
 
-    NQD_LOG("NQDMetalFillRect: dst=(%d,%d) %dx%d bpp=%d bits_per_pixel=%u transfer_mode=%d mode=%d rb=%d",
-            dest_X, dest_Y, width, height, bpp, pixel_size, transfer_mode, pen_mode, dest_row_bytes);
+    NQD_LOG("NQDMetalFillRect: dst=(%d,%d) %dx%d bpp=%d bits_per_pixel=%u transfer_mode=%d mode=%d base=0x%08x rb=%d",
+            dest_X, dest_Y, width, height, bpp, pixel_size, transfer_mode,
+            pen_mode, dest_base, dest_row_bytes);
+
+    NQDMainDevicePixMapSnapshot main_device = nqd_read_main_device_pixmap_snapshot();
+    if (nqd_should_drop_stale_main_device_params(main_device, dest_base, dest_row_bytes, pixel_size)) {
+        NQD_LOG("NQDMetalFillRect: dropped stale MainDevice params "
+                "(base=0x%08x bits_per_pixel=%u rb=%d)",
+                dest_base, pixel_size, dest_row_bytes);
+        return;
+    }
+    uint32_t packet_pixel_size = pixel_size;
+    pixel_size = nqd_effective_main_device_pixel_size(main_device, dest_base,
+                                                      dest_row_bytes, pixel_size);
+    if (pixel_size != packet_pixel_size) {
+        bpp = nqd_bytes_per_pixel(pixel_size);
+        if (pixel_size < 8) bpp = 1;
+        NQD_LOG("NQDMetalFillRect: coerced redirected MainDevice depth "
+                "packet=%u live=%u rb=%d",
+                packet_pixel_size, pixel_size, dest_row_bytes);
+    }
+    if (nqd_should_use_cpu_packed_main_device_path(main_device, dest_base, dest_row_bytes, pixel_size)) {
+        uint32_t fill_color = NQDPackedFillNativeColor(
+            ReadMacInt32(p + NQD_acclForePen),
+            ReadMacInt32(p + NQD_acclBackPen),
+            pen_mode);
+        uint32_t fill_raster_op = NQDPackedFillRasterOp(transfer_mode, pen_mode);
+        if (nqd_cpu_fillrect_packed_boolean(dest_base, dest_row_bytes,
+                                            dest_X, dest_Y, width, height,
+                                            pixel_size, fill_raster_op,
+                                            fill_color)) {
+            NQD_LOG("NQDMetalFillRect: used CPU packed MainDevice path "
+                    "(base=0x%08x bits_per_pixel=%u rb=%d mode=%u "
+                    "pen_mode=%u raster_op=%u fill=0x%08x)",
+                    dest_base, pixel_size, dest_row_bytes, transfer_mode,
+                    pen_mode, fill_raster_op, fill_color);
+            return;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // CPU fast path for small Boolean fills on standard depths

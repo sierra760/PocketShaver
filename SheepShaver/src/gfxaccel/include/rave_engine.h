@@ -203,8 +203,10 @@ enum {
 	// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount. Tests invoke
 	// NativeHookQ3PixmapSetImage directly (no dispatch round-trip).
 	kRaveHookQ3PixmapSetImage = 220,  // Q3Pixmap_Set_Image intercept (deferred activation)
+	kRaveHookEngineEnable     = 221,  // QAEngineEnable hook
+	kRaveHookEngineDisable    = 222,  // QAEngineDisable hook
 
-	kRaveHookCount            = 21
+	kRaveHookCount            = 23
 };
 
 // ATI RaveExtFuncs sub-opcodes (300-303)
@@ -385,6 +387,8 @@ extern uint32_t rave_orig_access_texture;
 extern uint32_t rave_orig_access_texture_end;
 extern uint32_t rave_orig_access_bitmap;
 extern uint32_t rave_orig_access_bitmap_end;
+extern uint32_t rave_orig_engine_enable;
+extern uint32_t rave_orig_engine_disable;
 
 // Per-hook patch info for unpatch-call-repatch chaining.
 // Stores the original 4 instructions and addresses needed to safely chain
@@ -397,7 +401,7 @@ struct RaveHookPatchInfo {
 	bool     active;            // Whether this hook is installed
 };
 
-#define RAVE_NUM_HOOKED_APIS 20
+#define RAVE_NUM_HOOKED_APIS 22
 extern RaveHookPatchInfo rave_hook_patches[RAVE_NUM_HOOKED_APIS];
 
 // Hook indices into rave_hook_patches[] — matches apis[] order in RaveInstallHooks
@@ -421,7 +425,9 @@ enum {
 	kRaveHookIdx_AccessTexture    = 16,
 	kRaveHookIdx_AccessTextureEnd = 17,
 	kRaveHookIdx_AccessBitmap     = 18,
-	kRaveHookIdx_AccessBitmapEnd  = 19
+	kRaveHookIdx_AccessBitmapEnd  = 19,
+	kRaveHookIdx_EngineEnable     = 20,
+	kRaveHookIdx_EngineDisable    = 21
 };
 
 // Safe chaining: temporarily restores original code, calls via CallMacOS, re-patches.

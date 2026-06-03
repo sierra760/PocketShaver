@@ -30,6 +30,8 @@
 #include "metal_device_shared.h"
 #include "metal_compositor.h"
 #include "display_mode_controller.h"
+#include "rave_compositor_rect.h"
+#include "rave_overlay_clear_policy.h"
 #include "gfxaccel_resources.h"
 #include "gfxaccel_resources_heap.h"
 
@@ -373,6 +375,24 @@ static void rave_release_overlay_texture(void)
 	s_rave_overlay_h = 0;
 }
 
+static void RaveSetCompositorDestinationRect(
+    int32_t left,
+    int32_t top,
+    int32_t width,
+    int32_t height)
+{
+	const struct DMCModeSnapshot *snap = dmc_current_snapshot();
+	const uint32_t mode_width = snap ? snap->width : 0;
+	const uint32_t mode_height = snap ? snap->height : 0;
+	const struct RaveCompositorRect dst = RaveCompositorRectFromDrawRect(
+	    left, top, width, height, mode_width, mode_height);
+
+	s_rave_dst_left   = dst.left;
+	s_rave_dst_top    = dst.top;
+	s_rave_dst_width  = dst.width;
+	s_rave_dst_height = dst.height;
+}
+
 /*
  *  rave_has_active_overlay - true iff RAVE currently holds a vended overlay.
  *  Used by the gfxaccel_resources fan-out attach/detach handlers (in
@@ -414,15 +434,13 @@ void RaveCreateMetalOverlay(int32_t left, int32_t top, int32_t width, int32_t he
 		RAVE_LOG("RaveCreateMetalOverlay: vend(%dx%d) FAILED", width, height);
 		return;
 	}
-	s_rave_dst_left   = left;
-	s_rave_dst_top    = top;
-	s_rave_dst_width  = width;
-	s_rave_dst_height = height;
+	RaveSetCompositorDestinationRect(left, top, width, height);
 	/* Declare RAVE as the active owner so DMC subscribers / snapshot
 	 * readers know which engine drives mode semantics. The idempotent
 	 * early-return makes this a fast no-op when owner already matches. */
 	(void)dmc_set_active_owner(kDMCOwnerRAVE);
-	RAVE_LOG("RaveCreateMetalOverlay: vended overlay %dx%d at (%d,%d)", width, height, left, top);
+	RAVE_LOG("RaveCreateMetalOverlay: vended overlay %dx%d draw=(%d,%d) dst=(%d,%d)",
+	         width, height, left, top, s_rave_dst_left, s_rave_dst_top);
 }
 
 
@@ -3267,10 +3285,8 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	}
 	ms->overlayTexture = overlay;
 	/* Track the destination rect for SubmitFrame emission in NativeRenderEnd. */
-	s_rave_dst_left   = priv->left;
-	s_rave_dst_top    = priv->top;
-	s_rave_dst_width  = priv->width;
-	s_rave_dst_height = priv->height;
+	RaveSetCompositorDestinationRect(
+	    priv->left, priv->top, priv->width, priv->height);
 
 	// Check if MSAA is requested
 	// kQAAntialias_Fast (1) = default, no MSAA
@@ -3287,14 +3303,20 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	// Build render pass descriptor
 	MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
 
-	// Color attachment: clear to background color with alpha=1.0 (opaque).
-	// The compositor uses MTLViewport set to the RAVE render rect to position
-	// the overlay correctly, so 2D content outside the 3D viewport is visible.
+	// Color attachment: honor the guest clear alpha. RAVE overlays composite
+	// over the 2D framebuffer, so an opaque forced clear tints untouched 2D.
+	const struct DMCModeSnapshot *clearSnap = dmc_current_snapshot();
+	const uint32_t clearModeWidth = clearSnap ? clearSnap->width : 0;
+	const uint32_t clearModeHeight = clearSnap ? clearSnap->height : 0;
+	const float clearAlpha = RaveOverlayEffectiveClearAlpha(
+	    priv->state[2].f, priv->state[3].f, priv->state[4].f, priv->state[1].f,
+	    (uint32_t)priv->width, (uint32_t)priv->height,
+	    clearModeWidth, clearModeHeight);
 	rpd.colorAttachments[0].clearColor = MTLClearColorMake(
-		priv->state[2].f,  // red
-		priv->state[3].f,  // green
-		priv->state[4].f,  // blue
-		1.0                // opaque — viewport positioning handles 2D visibility
+		RaveOverlayPremultipliedClearComponent(priv->state[2].f, clearAlpha),
+		RaveOverlayPremultipliedClearComponent(priv->state[3].f, clearAlpha),
+		RaveOverlayPremultipliedClearComponent(priv->state[4].f, clearAlpha),
+		clearAlpha
 	);
 	rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
 
@@ -3404,16 +3426,14 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	// each SubmitFrame's CompositeLayer (encoded in NativeRenderEnd from
 	// s_rave_dst_*). Update local cached dst rect in case the viewport
 	// changed after context creation.
-	s_rave_dst_left   = priv->left;
-	s_rave_dst_top    = priv->top;
-	s_rave_dst_width  = priv->width;
-	s_rave_dst_height = priv->height;
+	RaveSetCompositorDestinationRect(
+	    priv->left, priv->top, priv->width, priv->height);
 
-	RAVE_LOG("RenderStart: ctx=0x%08x dirty=0x%08x initial=0x%08x clear=(%.2f,%.2f,%.2f,%.2f) size=%dx%d",
+	RAVE_LOG("RenderStart: ctx=0x%08x dirty=0x%08x initial=0x%08x clear=(%.2f,%.2f,%.2f,%.2f) effectiveClearAlpha=%.2f size=%dx%d",
 	         drawContextAddr,
 	         dirtyRectAddr, initialContextAddr,
 	         priv->state[2].f, priv->state[3].f, priv->state[4].f, priv->state[1].f,
-	         priv->width, priv->height);
+	         clearAlpha, priv->width, priv->height);
 
 	return kQANoErr;
 }

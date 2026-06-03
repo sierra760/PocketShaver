@@ -47,8 +47,12 @@
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "thunks.h"              /* SheepMem::Reserve */
+#include "dsp_back_buffer_range.h"
+#include "dsp_display_mode_policy.h"
 #include "dsp_engine.h"
 #include "dsp_draw_context.h"
+#include "dsp_front_staging_color_policy.h"
+#include "dsp_guest_address.h"
 #include "dsp_metal_renderer.h"
 #include "dsp_context_private.h"
 #include "gfxaccel_resources.h"       /* per-buffer owner tag */
@@ -56,6 +60,9 @@
 #include "metal_compositor.h"
 #include "metal_device_shared.h"     /* SharedMetalDevice() for unpack-PSO lazy init */
 #include "display_mode_controller.h" /* dmc_current_snapshot() for fade_active in the unpack twin */
+
+extern uint32 Mac_sysalloc(uint32 size);
+extern void Mac_sysfree(uint32 addr);
 
 /* Forward decl of the lowmem PixMap restore
  * helper defined in dsp_draw_context.mm. Called at the START of
@@ -79,6 +86,27 @@ static inline uint32_t DSpReserveGuestScratch(uint32_t size)
 #else
 	return SheepMem::Reserve(size);
 #endif
+}
+
+static inline uint32_t DSpReserveGuestPixelStaging(uint32_t size)
+{
+#ifdef TESTING_BUILD
+	return dsp_testing_alloc_guest_scratch(size);
+#else
+	return Mac_sysalloc(size);
+#endif
+}
+
+extern "C" void DSpReleaseBackBufferStaging(DSpContextPrivate *ctx)
+{
+	if (ctx == nullptr || ctx->staging_mac_addr == 0) return;
+#ifndef TESTING_BUILD
+	if (ctx->staging_owned_sysheap) {
+		Mac_sysfree(ctx->staging_mac_addr);
+	}
+#endif
+	ctx->staging_mac_addr = 0;
+	ctx->staging_owned_sysheap = false;
 }
 
 /*
@@ -135,13 +163,7 @@ static inline MTLPixelFormat DSpPixelFormatForDepthBits(uint32_t depth_bits)
  */
 static inline uint32_t DSpAlignedRowBytes(uint32_t w, uint32_t bpp)
 {
-	uint32_t row_bytes = (w * bpp + 7) / 8;
-	return (row_bytes + 255) & ~255u;
-}
-
-static inline uint32_t DSpBackBufferSize(uint32_t w, uint32_t h, uint32_t bpp)
-{
-	return DSpAlignedRowBytes(w, bpp) * h;
+	return DSpBackBufferAlignedRowBytes(w, bpp);
 }
 
 /* ---------------------------------------------------------------------- *
@@ -276,6 +298,8 @@ extern "C" void DSpReleaseBackBufferNow(DSpContextPrivate *ctx)
 	 * callback). All must clear the owner tag before nil'ing the buffer. */
 	ctx->back_texture = nil;
 	ctx->back_buffer  = nil;
+	DSpReleaseBackBufferStaging(ctx);
+	ctx->cgrafptr_mac_addr = 0;
 }
 
 /* ---------------------------------------------------------------------- *
@@ -426,32 +450,78 @@ extern "C" uint32_t DSpGetBackBufferCGrafPtr(DSpContextPrivate *ctx)
 	 * .contents is a host VA pointer; Host2MacAddr (from
 	 * include/cpu_emulation.h) wraps vm_do_get_virtual_address on real-
 	 * addressing platforms and an identity cast on direct-addressing.
-	 *
-	 * On arm64 iOS the bump allocator lives in its own heap —
-	 * NOT mapped into the emulated RAM region — so Host2MacAddr returns
-	 * 0 for the MTLBuffer contents pointer. Fallback: reserve a
-	 * guest-RAM staging region the same size as the back-buffer and
-	 * memcpy staging → back_buffer.contents in SwapBuffers before
-	 * encoding the GPU blit. This preserves guest-writable CGrafPtr
-	 * semantics.
+		 *
+		 * On arm64 iOS the bump allocator lives in its own heap —
+		 * NOT mapped into the emulated RAM region — so Host2MacAddr may
+		 * return 0 or a nonzero address outside guest RAM for the MTLBuffer
+		 * contents pointer. Fallback: reserve a Mac system-heap staging region
+		 * the same size as the back-buffer and
+		 * memcpy staging → back_buffer.contents in SwapBuffers before
+		 * encoding the GPU blit. This preserves guest-writable CGrafPtr
+		 * semantics.
 	 *
 	 * Raw (uint32)(uintptr_t) cast of the contents pointer is FORBIDDEN
 	 * — it's undefined behaviour on arm64 iOS (64-bit host VA truncated
 	 * to 32-bit Mac address). */
-	uint32_t baseAddr_mac = Host2MacAddr((uint8 *)ctx->back_buffer.contents);
+	uint32_t buffer_size = alignedRB * h;
+	uint8_t *back_contents = (uint8_t *)ctx->back_buffer.contents;
+	uint32_t mapped_addr = Host2MacAddr(back_contents);
+	uint8_t *round_trip_host = mapped_addr != 0 ? Mac2HostAddr(mapped_addr) : NULL;
+	uint32_t baseAddr_mac = DSpUsableDirectGuestBaseOrZero(
+		mapped_addr,
+		buffer_size,
+		(uint32_t)RAMBase,
+		(uint32_t)RAMSize,
+		(uintptr_t)round_trip_host,
+		(uintptr_t)back_contents);
 	if (baseAddr_mac == 0) {
-		uint32_t buffer_size = alignedRB * h;
-		baseAddr_mac = DSpReserveGuestScratch(buffer_size);
-		if (baseAddr_mac == 0) {
-			DSP_LOG("DSpGetBackBufferCGrafPtr: neither Host2MacAddr nor "
-			        "guest-scratch reserve(%u) could vend a guest-RAM baseAddr",
-			        buffer_size);
-			return 0;
+		DSP_LOG("DSpGetBackBufferCGrafPtr: direct base rejected "
+		        "(mapped=0x%08x roundTrip=%p contents=%p size=%u)",
+		        mapped_addr, round_trip_host, back_contents, buffer_size);
+		if (ctx->staging_mac_addr != 0) {
+			baseAddr_mac = DSpUsableGuestBaseOrZero(
+				ctx->staging_mac_addr,
+				buffer_size,
+				(uint32_t)RAMBase,
+				(uint32_t)RAMSize);
+			if (baseAddr_mac == 0) {
+				DSP_LOG("DSpGetBackBufferCGrafPtr: discarding unusable cached "
+				        "staging baseAddr=0x%08x (size=%u)",
+				        ctx->staging_mac_addr, buffer_size);
+				DSpReleaseBackBufferStaging(ctx);
+			}
 		}
-		ctx->staging_mac_addr = baseAddr_mac;
-		DSP_LOG("DSpGetBackBufferCGrafPtr: using guest-scratch staging at 0x%08x "
-		        "(size=%u); SwapBuffers will memcpy staging→back_buffer",
-		        baseAddr_mac, buffer_size);
+		if (baseAddr_mac == 0) {
+			uint32_t staging_mac = DSpReserveGuestPixelStaging(buffer_size);
+			baseAddr_mac = DSpUsableGuestBaseOrZero(
+				staging_mac,
+				buffer_size,
+				(uint32_t)RAMBase,
+				(uint32_t)RAMSize);
+			if (baseAddr_mac == 0) {
+				#ifndef TESTING_BUILD
+				if (staging_mac != 0) Mac_sysfree(staging_mac);
+				#endif
+				DSP_LOG("DSpGetBackBufferCGrafPtr: neither Host2MacAddr nor "
+				        "Mac_sysalloc(%u) could vend a usable guest-RAM baseAddr "
+				        "(last=0x%08x)",
+				        buffer_size, staging_mac);
+				return 0;
+			}
+			ctx->staging_mac_addr = baseAddr_mac;
+			#ifndef TESTING_BUILD
+			ctx->staging_owned_sysheap = true;
+			#endif
+			if (back_contents != NULL) {
+				Host2Mac_memcpy(baseAddr_mac, back_contents, buffer_size);
+			} else {
+				Mac_memset(baseAddr_mac, 0, buffer_size);
+			}
+			DSP_LOG("DSpGetBackBufferCGrafPtr: using guest-RAM staging at 0x%08x "
+			        "(size=%u); initialized from back_buffer; SwapBuffers will "
+			        "memcpy staging→back_buffer",
+			        baseAddr_mac, buffer_size);
+		}
 	}
 
 	int16_t bounds_top    = 0;
@@ -556,6 +626,79 @@ static const char *kDSpUnpackShaderSource =
     "    return out;\n"
     "}\n"
     "\n"
+    "/* R8Uint indexed -> BGRA8Unorm. Mirrors compositor_fragment_indexed\n"
+    " * while reading DSp's per-context planar RGB CLUT directly. */\n"
+    "fragment float4 dsp_unpack_fragment_indexed(\n"
+    "    DSpUnpackVertexOut in [[stage_in]],\n"
+    "    texture2d<uint, access::read> tex [[texture(0)]],\n"
+    "    constant uchar *gamma_lut [[buffer(0)]],\n"
+    "    constant uint &fade_active [[buffer(1)]],\n"
+    "    constant uchar *clut_rgb [[buffer(2)]],\n"
+    "    constant uint &bits_per_pixel [[buffer(3)]],\n"
+    "    constant uint &pixel_width [[buffer(4)]])\n"
+    "{\n"
+    "    uint px = uint(in.texCoord.x * float(pixel_width));\n"
+    "    uint py = uint(in.texCoord.y * float(tex.get_height()));\n"
+    "    px = min(px, pixel_width - 1);\n"
+    "    py = min(py, tex.get_height() - 1);\n"
+    "\n"
+    "    uint index = 0;\n"
+    "    if (bits_per_pixel == 8u) {\n"
+    "        index = tex.read(uint2(px, py)).r;\n"
+    "    } else if (bits_per_pixel == 4u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 2u, py)).r;\n"
+    "        index = ((px & 1u) == 0u) ? (byte_val >> 4u) : (byte_val & 0xFu);\n"
+    "    } else if (bits_per_pixel == 2u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 4u, py)).r;\n"
+    "        uint shift = (3u - (px & 3u)) * 2u;\n"
+    "        index = (byte_val >> shift) & 0x3u;\n"
+    "    } else if (bits_per_pixel == 1u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 8u, py)).r;\n"
+    "        index = (byte_val >> (7u - (px & 7u))) & 0x1u;\n"
+    "    }\n"
+    "\n"
+    "    uint clut_offset = index * 3u;\n"
+    "    float r = float(gamma_lut[clut_rgb[clut_offset + 0u]])        / 255.0;\n"
+    "    float g = float(gamma_lut[256u + clut_rgb[clut_offset + 1u]]) / 255.0;\n"
+    "    float b = float(gamma_lut[512u + clut_rgb[clut_offset + 2u]]) / 255.0;\n"
+    "    if (fade_active == 0u) {\n"
+    "        r = pow(r, 1.8 / 2.2);\n"
+    "        g = pow(g, 1.8 / 2.2);\n"
+    "        b = pow(b, 1.8 / 2.2);\n"
+    "    }\n"
+    "    return float4(r, g, b, 1.0);\n"
+    "}\n"
+    "\n"
+    "static inline float4 dsp_unpack_rgb555_to_rgba(\n"
+    "    uint packed,\n"
+    "    constant uchar *gamma_lut,\n"
+    "    uint fade_active)\n"
+    "{\n"
+    "    uint R = (packed >> 10) & 0x1F;\n"
+    "    uint G = (packed >>  5) & 0x1F;\n"
+    "    uint B =  packed        & 0x1F;\n"
+    "    uint idx_r = (R * 255u) / 31u;\n"
+    "    uint idx_g = (G * 255u) / 31u;\n"
+    "    uint idx_b = (B * 255u) / 31u;\n"
+    "    float r = float(gamma_lut[idx_r])        / 255.0;\n"
+    "    float g = float(gamma_lut[256u + idx_g]) / 255.0;\n"
+    "    float b = float(gamma_lut[512u + idx_b]) / 255.0;\n"
+    "    if (fade_active == 0u) {\n"
+    "        r = pow(r, 1.8 / 2.2);\n"
+    "        g = pow(g, 1.8 / 2.2);\n"
+    "        b = pow(b, 1.8 / 2.2);\n"
+    "    }\n"
+    "    return float4(r, g, b, 1.0);\n"
+    "}\n"
+    "\n"
+    "static inline float4 dsp_store_for_compositor_32bpp(float4 rgba)\n"
+    "{\n"
+    "    /* MetalCompositorPresent's 32-bit shader treats the compositor\n"
+    "     * texture as classic big-endian ARGB memory and reconstructs RGB\n"
+    "     * as (s.g, s.r, s.a). Store front-staging pixels in that layout. */\n"
+    "    return float4(rgba.g, rgba.r, 1.0, rgba.b);\n"
+    "}\n"
+    "\n"
     "/* R16Uint xRGB1555 -> BGRA8Unorm. Mirrors compositor_fragment_16bpp\n"
     " * (compositor_shaders.metal:143). The Mac stores 16-bit pixels as\n"
     " * big-endian xRGB1555, but ARM64 reads them as little-endian. */\n"
@@ -580,36 +723,100 @@ static const char *kDSpUnpackShaderSource =
     "    /* Byte-swap big-endian -> little-endian (matches compositor\n"
     "     * shader; Mac authored xRGB1555 big-endian). */\n"
     "    packed = ((packed & 0xFF) << 8) | ((packed >> 8) & 0xFF);\n"
-    "    uint R = (packed >> 10) & 0x1F;\n"
-    "    uint G = (packed >>  5) & 0x1F;\n"
-    "    uint B =  packed        & 0x1F;\n"
-    "    /* Scale 5-bit channel (0..31) to 8-bit LUT index (0..255)\n"
-    "     * and apply the planar gamma LUT (matches compositor_fragment_16bpp). */\n"
-    "    uint idx_r = (R * 255u) / 31u;\n"
-    "    uint idx_g = (G * 255u) / 31u;\n"
-    "    uint idx_b = (B * 255u) / 31u;\n"
-    "    float r = float(gamma_lut[idx_r])        / 255.0;\n"
-    "    float g = float(gamma_lut[256u + idx_g]) / 255.0;\n"
-    "    float b = float(gamma_lut[512u + idx_b]) / 255.0;\n"
-    "    /* Static 1.8 -> 2.2 correction when NOT fading; bypass during\n"
-    "     * a fade so the LUT marches linearly (DSp-1.7). Matches the four-shader\n"
-    "     * rule (compositor_fragment_indexed/_32bpp/_16bpp). */\n"
-    "    if (fade_active == 0u) {\n"
-    "        r = pow(r, 1.8 / 2.2);\n"
-    "        g = pow(g, 1.8 / 2.2);\n"
-    "        b = pow(b, 1.8 / 2.2);\n"
-    "    }\n"
-    "    return float4(r, g, b, 1.0);\n"
+    "    return dsp_unpack_rgb555_to_rgba(packed, gamma_lut, fade_active);\n"
+    "}\n"
+    "\n"
+    "/* R16Uint xRGB1555 -> BGRA8Unorm for native-order staging inputs.\n"
+    " * Most Mac-authored 16-bit DSp pixels use dsp_unpack_fragment_16bpp,\n"
+    " * which swaps big-endian xRGB1555 before decoding. */\n"
+    "fragment float4 dsp_unpack_fragment_16bpp_native(\n"
+    "    DSpUnpackVertexOut in [[stage_in]],\n"
+    "    texture2d<uint, access::read> tex [[texture(0)]],\n"
+    "    constant uchar *gamma_lut [[buffer(0)]],\n"
+    "    constant uint &fade_active [[buffer(1)]])\n"
+    "{\n"
+    "    uint w = tex.get_width();\n"
+    "    uint h = tex.get_height();\n"
+    "    uint px = uint(in.texCoord.x * float(w));\n"
+    "    uint py = uint(in.texCoord.y * float(h));\n"
+    "    px = min(px, w - 1);\n"
+    "    py = min(py, h - 1);\n"
+    "    uint packed = tex.read(uint2(px, py)).r;\n"
+    "    return dsp_unpack_rgb555_to_rgba(packed, gamma_lut, fade_active);\n"
+    "}\n"
+    "\n"
+    "fragment float4 dsp_unpack_fragment_16bpp_compositor32(\n"
+    "    DSpUnpackVertexOut in [[stage_in]],\n"
+    "    texture2d<uint, access::read> tex [[texture(0)]],\n"
+    "    constant uchar *gamma_lut [[buffer(0)]],\n"
+    "    constant uint &fade_active [[buffer(1)]])\n"
+    "{\n"
+    "    uint w = tex.get_width();\n"
+    "    uint h = tex.get_height();\n"
+    "    uint px = uint(in.texCoord.x * float(w));\n"
+    "    uint py = uint(in.texCoord.y * float(h));\n"
+    "    px = min(px, w - 1);\n"
+    "    py = min(py, h - 1);\n"
+    "    uint packed = tex.read(uint2(px, py)).r;\n"
+    "    packed = ((packed & 0xFF) << 8) | ((packed >> 8) & 0xFF);\n"
+    "    return dsp_store_for_compositor_32bpp(\n"
+    "        dsp_unpack_rgb555_to_rgba(packed, gamma_lut, fade_active));\n"
+    "}\n"
+    "\n"
+    "fragment float4 dsp_unpack_fragment_16bpp_native_compositor32(\n"
+    "    DSpUnpackVertexOut in [[stage_in]],\n"
+    "    texture2d<uint, access::read> tex [[texture(0)]],\n"
+    "    constant uchar *gamma_lut [[buffer(0)]],\n"
+    "    constant uint &fade_active [[buffer(1)]])\n"
+    "{\n"
+    "    uint w = tex.get_width();\n"
+    "    uint h = tex.get_height();\n"
+    "    uint px = uint(in.texCoord.x * float(w));\n"
+    "    uint py = uint(in.texCoord.y * float(h));\n"
+    "    px = min(px, w - 1);\n"
+    "    py = min(py, h - 1);\n"
+    "    uint packed = tex.read(uint2(px, py)).r;\n"
+    "    return dsp_store_for_compositor_32bpp(\n"
+    "        dsp_unpack_rgb555_to_rgba(packed, gamma_lut, fade_active));\n"
     "}\n";
 
-/* Lazy-initialised PSO for the 16 bpp unpack pass. Built once per
+/* Lazy-initialised PSOs for the indexed and 16 bpp unpack passes. Built once per
  * process; reused across every VBL present. The destination format is
  * pinned to BGRA8Unorm to match the compositor framebuffer texture
  * (metal_compositor.h:69). dispatch_once gives us thread-safe lazy init
  * without introducing a new mutex / atomic. */
+static id<MTLRenderPipelineState> s_dsp_unpack_pso_indexed = nil;
 static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp = nil;
+static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp_native = nil;
+static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp_compositor32 = nil;
+static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp_native_compositor32 = nil;
 static dispatch_once_t            s_dsp_unpack_pso_once = 0;
 static bool                       s_dsp_unpack_pso_build_failed = false;
+
+static id<MTLRenderPipelineState> DSpBuildUnpackPSO(id<MTLDevice> device,
+                                                     id<MTLFunction> vfn,
+                                                     id<MTLFunction> ffn,
+                                                     const char *name)
+{
+	if (vfn == nil || ffn == nil) {
+		DSP_LOG("DSpBuildUnpackPSOs: missing function for %s", name);
+		return nil;
+	}
+
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction   = vfn;
+	desc.fragmentFunction = ffn;
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+	NSError *psoErr = nil;
+	id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:desc
+	                                                                        error:&psoErr];
+	if (pso == nil) {
+		DSP_LOG("DSpBuildUnpackPSOs: %s PSO creation failed: %s",
+		        name, psoErr ? [[psoErr localizedDescription] UTF8String] : "(no error)");
+	}
+	return pso;
+}
 
 static void DSpBuildUnpackPSOs(void)
 {
@@ -633,65 +840,93 @@ static void DSpBuildUnpackPSOs(void)
 	}
 
 	id<MTLFunction> vfn = [lib newFunctionWithName:@"dsp_unpack_vertex"];
-	id<MTLFunction> ffn = [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp"];
-	if (vfn == nil || ffn == nil) {
+	id<MTLFunction> indexed_ffn = [lib newFunctionWithName:@"dsp_unpack_fragment_indexed"];
+	id<MTLFunction> ffn_16bpp = [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp"];
+	id<MTLFunction> ffn_16bpp_native = [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp_native"];
+	id<MTLFunction> ffn_16bpp_compositor32 =
+	    [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp_compositor32"];
+	id<MTLFunction> ffn_16bpp_native_compositor32 =
+	    [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp_native_compositor32"];
+	if (vfn == nil) {
 		s_dsp_unpack_pso_build_failed = true;
-		DSP_LOG("DSpBuildUnpackPSOs: missing dsp_unpack_vertex or "
-		        "dsp_unpack_fragment_16bpp");
+		DSP_LOG("DSpBuildUnpackPSOs: missing dsp_unpack_vertex");
 		return;
 	}
 
-	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
-	desc.vertexFunction   = vfn;
-	desc.fragmentFunction = ffn;
-	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	s_dsp_unpack_pso_indexed = DSpBuildUnpackPSO(device, vfn, indexed_ffn, "indexed");
+	s_dsp_unpack_pso_16bpp   = DSpBuildUnpackPSO(device, vfn, ffn_16bpp, "16bpp");
+	s_dsp_unpack_pso_16bpp_native =
+	    DSpBuildUnpackPSO(device, vfn, ffn_16bpp_native, "16bpp-native");
+	s_dsp_unpack_pso_16bpp_compositor32 =
+	    DSpBuildUnpackPSO(device, vfn, ffn_16bpp_compositor32,
+	                      "16bpp-compositor32");
+	s_dsp_unpack_pso_16bpp_native_compositor32 =
+	    DSpBuildUnpackPSO(device, vfn, ffn_16bpp_native_compositor32,
+	                      "16bpp-native-compositor32");
 
-	NSError *psoErr = nil;
-	s_dsp_unpack_pso_16bpp = [device newRenderPipelineStateWithDescriptor:desc
-	                                                                error:&psoErr];
-	if (s_dsp_unpack_pso_16bpp == nil) {
-		s_dsp_unpack_pso_build_failed = true;
-		DSP_LOG("DSpBuildUnpackPSOs: 16bpp PSO creation failed: %s",
-		        psoErr ? [[psoErr localizedDescription] UTF8String] : "(no error)");
-		return;
-	}
-
-	DSP_LOG("DSpBuildUnpackPSOs: 16bpp R16Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_indexed != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: indexed R8Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_16bpp != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: 16bpp R16Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_16bpp_native != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: 16bpp native R16Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_16bpp_compositor32 != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: 16bpp compositor32 R16Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_16bpp_native_compositor32 != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: 16bpp native compositor32 R16Uint->BGRA8Unorm PSO ready");
 }
 
 /*
  *  DSpEncodeUnpackRenderPass — full-screen render pass that samples
- *  ctx->back_texture (R16Uint or future R8Uint) and writes BGRA8Unorm to
+ *  ctx->back_texture (R8Uint or R16Uint) and writes BGRA8Unorm to
  *  framebuffer_texture. Called only when pixel formats differ; same-
  *  format presents take the blit fast path in DSpEncodePresentToFramebuffer.
  *
  *  Returns true on success, false if the PSO is unavailable or the
- *  format isn't currently supported. On failure the caller may fall
- *  back to the bare blit (which Metal validation will reject loudly —
- *  this is intentional so unsupported depths surface during UAT).
+ *  format isn't currently supported.
  */
-static bool DSpEncodeUnpackRenderPass(DSpContextPrivate *ctx,
-                                       id<MTLCommandBuffer> cb,
-                                       id<MTLTexture> framebuffer_texture)
+static bool DSpEncodeUnpackTextureRenderPass(DSpContextPrivate *ctx,
+                                             id<MTLTexture> source_texture,
+                                             uint32_t source_bpp,
+                                             uint32_t source_pixel_width,
+                                             const char *source_label,
+                                             bool native_r16_order,
+                                             bool use_display_gamma,
+                                             bool write_compositor32_layout,
+                                             id<MTLCommandBuffer> cb,
+                                             id<MTLTexture> framebuffer_texture)
 {
 	if (ctx == nullptr || cb == nil || framebuffer_texture == nil) return false;
-	if (ctx->back_texture == nil) return false;
+	if (source_texture == nil) return false;
 
 	dispatch_once(&s_dsp_unpack_pso_once, ^{ DSpBuildUnpackPSOs(); });
 	if (s_dsp_unpack_pso_build_failed) return false;
 
-	MTLPixelFormat src_fmt = ctx->back_texture.pixelFormat;
+	MTLPixelFormat src_fmt = source_texture.pixelFormat;
 	MTLPixelFormat dst_fmt = framebuffer_texture.pixelFormat;
+	const uint32_t bpp = source_bpp;
+	const bool indexed =
+	    (src_fmt == MTLPixelFormatR8Uint && dst_fmt == MTLPixelFormatBGRA8Unorm &&
+	     (bpp == 1 || bpp == 2 || bpp == 4 || bpp == 8));
 
 	id<MTLRenderPipelineState> pso = nil;
-	if (src_fmt == MTLPixelFormatR16Uint && dst_fmt == MTLPixelFormatBGRA8Unorm) {
-		pso = s_dsp_unpack_pso_16bpp;
+	if (indexed) {
+		pso = s_dsp_unpack_pso_indexed;
+	} else if (src_fmt == MTLPixelFormatR16Uint && dst_fmt == MTLPixelFormatBGRA8Unorm) {
+		if (write_compositor32_layout) {
+			pso = native_r16_order ? s_dsp_unpack_pso_16bpp_native_compositor32
+			                       : s_dsp_unpack_pso_16bpp_compositor32;
+		} else {
+			pso = native_r16_order ? s_dsp_unpack_pso_16bpp_native
+			                       : s_dsp_unpack_pso_16bpp;
+		}
 	}
 	if (pso == nil) {
 		DSP_LOG("DSpEncodeUnpackRenderPass: unsupported format pair "
-		        "(src=%lu dst=%lu) — indexed-depth unpack is follow-up work; "
-		        "falling back to blit (Metal validation will reject)",
-		        (unsigned long)src_fmt, (unsigned long)dst_fmt);
+		        "(%s src=%lu dst=%lu bpp=%u) — present skipped to avoid "
+		        "Metal-incompatible blit",
+		        source_label ? source_label : "source",
+		        (unsigned long)src_fmt, (unsigned long)dst_fmt, bpp);
 		return false;
 	}
 
@@ -714,8 +949,9 @@ static bool DSpEncodeUnpackRenderPass(DSpContextPrivate *ctx,
 	 * dimensions (matches DSpEncodeBackBufferBlit's clamp logic — a
 	 * lagging compositor framebuffer during a mode-switch in flight must
 	 * not be over-rasterised). */
-	NSUInteger back_w = ctx->back_texture.width;
-	NSUInteger back_h = ctx->back_texture.height;
+	NSUInteger back_w = indexed ? (NSUInteger)source_pixel_width
+	                            : source_texture.width;
+	NSUInteger back_h = source_texture.height;
 	NSUInteger fb_w   = framebuffer_texture.width;
 	NSUInteger fb_h   = framebuffer_texture.height;
 	NSUInteger vp_w   = (back_w < fb_w) ? back_w : fb_w;
@@ -729,50 +965,91 @@ static bool DSpEncodeUnpackRenderPass(DSpContextPrivate *ctx,
 	[re setViewport:vp];
 
 	[re setRenderPipelineState:pso];
-	[re setFragmentTexture:ctx->back_texture atIndex:0];
+	[re setFragmentTexture:source_texture atIndex:0];
 
-	/* Bind the same planar gamma LUT (buffer 0) + fade_active (buffer 1)
-	 * the compositor present shaders use, so this non-visible twin stays
-	 * consistent with the four-shader rule. gamma_lut comes from the
-	 * compositor (single shared 768-byte buffer); fade_active rides the DMC
-	 * snapshot (no new primitive).
+	/* Bind gamma LUT (buffer 0) + fade_active (buffer 1). Normal DSp
+	 * back-buffer presents use the same display gamma as the compositor.
+	 * RAVE/DSp front-staging overlays use identity gamma so their 2D pixels
+	 * are color-matched with the already-BGRA RAVE layer in the same frame.
 	 *
 	 * dsp_unpack_fragment_16bpp reads gamma_lut[idx] UNCONDITIONALLY, so
-	 * buffer index 0 MUST always be bound. Prefer the live gamma_lut_buffer;
-	 * fall back to the compositor's permanently-allocated identity buffer if the
-	 * live buffer is nil (compositor mid-init). If BOTH are nil the compositor is
-	 * fully uninitialized — abort the pass (caller falls back to the bare blit)
-	 * rather than encode a present that dereferences an unbound argument (UB). */
-	id<MTLBuffer> gamma_buf =
-	    (__bridge id<MTLBuffer>)MetalCompositorGetGammaLUTBuffer();
+	 * buffer index 0 MUST always be bound. */
+	id<MTLBuffer> gamma_buf = nil;
+	if (use_display_gamma) {
+		gamma_buf = (__bridge id<MTLBuffer>)MetalCompositorGetGammaLUTBuffer();
+	}
 	if (gamma_buf == nil) {
 		gamma_buf = (__bridge id<MTLBuffer>)MetalCompositorGetGammaIdentityBuffer();
 	}
 	if (gamma_buf == nil) {
 		DSP_LOG("DSpEncodeUnpackRenderPass: no gamma LUT buffer (compositor "
 		        "uninitialized) — aborting unpack pass to avoid unbound-buffer "
-		        "read; caller falls back to blit");
+		        "read; caller skips present");
 		[re endEncoding];
 		return false;
 	}
 	[re setFragmentBuffer:gamma_buf offset:0 atIndex:0];
 	uint32_t fade_active = 0u;
-	{
+	if (use_display_gamma) {
 		const DMCModeSnapshot *snap = dmc_current_snapshot();
 		fade_active = (snap && snap->fade_active) ? 1u : 0u;
 	}
+	fade_active = DSpUnpackShaderFadeActiveForGammaPolicy(
+	    use_display_gamma,
+	    fade_active != 0u);
 	[re setFragmentBytes:&fade_active length:sizeof(fade_active) atIndex:1];
+	if (indexed) {
+		[re setFragmentBytes:ctx->clut_bytes length:768 atIndex:2];
+		[re setFragmentBytes:&bpp length:sizeof(bpp) atIndex:3];
+		uint32_t pixel_width = source_pixel_width;
+		[re setFragmentBytes:&pixel_width length:sizeof(pixel_width) atIndex:4];
+	}
 
 	[re drawPrimitives:MTLPrimitiveTypeTriangle
 	       vertexStart:0
 	       vertexCount:3];
 	[re endEncoding];
 
-	DSP_LOG("DSpEncodeUnpackRenderPass: %lux%lu R16Uint -> BGRA8Unorm "
-	        "(cold_start=%d empty=%d)",
-	        (unsigned long)vp_w, (unsigned long)vp_h,
-	        ctx->dirty_cold_start, ctx->dirty_empty);
+	if (indexed) {
+		DSP_LOG("DSpEncodeUnpackRenderPass: %s %lux%lu R8Uint indexed -> "
+		        "BGRA8Unorm (bpp=%u gamma=%s shaderFade=%u "
+		        "cold_start=%d empty=%d "
+		        "clut0=%u,%u,%u clut1=%u,%u,%u)",
+		        source_label ? source_label : "source",
+		        (unsigned long)vp_w, (unsigned long)vp_h,
+		        bpp, use_display_gamma ? "display" : "identity",
+		        fade_active, ctx->dirty_cold_start, ctx->dirty_empty,
+		        ctx->clut_bytes[0], ctx->clut_bytes[1], ctx->clut_bytes[2],
+		        ctx->clut_bytes[3], ctx->clut_bytes[4], ctx->clut_bytes[5]);
+	} else {
+		DSP_LOG("DSpEncodeUnpackRenderPass: %s %lux%lu R16Uint -> BGRA8Unorm "
+		        "(bpp=%u order=%s output=%s gamma=%s shaderFade=%u "
+		        "cold_start=%d empty=%d)",
+		        source_label ? source_label : "source",
+		        (unsigned long)vp_w, (unsigned long)vp_h,
+		        bpp, native_r16_order ? "native" : "mac-be",
+		        write_compositor32_layout ? "compositor32" : "normalized",
+		        use_display_gamma ? "display" : "identity", fade_active,
+		        ctx->dirty_cold_start, ctx->dirty_empty);
+	}
 	return true;
+}
+
+static bool DSpEncodeUnpackRenderPass(DSpContextPrivate *ctx,
+                                       id<MTLCommandBuffer> cb,
+                                       id<MTLTexture> framebuffer_texture)
+{
+	if (ctx == nullptr) return false;
+	return DSpEncodeUnpackTextureRenderPass(ctx,
+	                                        ctx->back_texture,
+	                                        ctx->attr.backBufferBestDepth,
+	                                        ctx->attr.displayWidth,
+	                                        "backBuffer",
+	                                        false,
+	                                        DSpBackBufferPresentUsesDisplayGamma(),
+	                                        false,
+	                                        cb,
+	                                        framebuffer_texture);
 }
 
 extern "C" void DSpEncodePresentToFramebuffer(DSpContextPrivate *ctx,
@@ -810,16 +1087,10 @@ extern "C" void DSpEncodePresentToFramebuffer(DSpContextPrivate *ctx,
 	 * texture. */
 	bool ok = DSpEncodeUnpackRenderPass(ctx, cb, framebuffer_texture);
 	if (!ok) {
-		/* Last-resort fallback so the failure surfaces rather than
-		 * silently producing wrong output. Metal validation will reject
-		 * this on debug builds — that's intentional: the regression
-		 * shows up loudly during UAT instead of black-screening for
-		 * weeks. */
-		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-		if (blit == nil) return;
-		DSpEncodeBackBufferBlit(ctx, (__bridge void *)blit,
-		                         (__bridge void *)framebuffer_texture);
-		[blit endEncoding];
+		DSP_LOG("DSpEncodePresentToFramebuffer: no compatible present path "
+		        "(src=%lu dst=%lu bpp=%u)",
+		        (unsigned long)src_fmt, (unsigned long)dst_fmt,
+		        ctx->attr.backBufferBestDepth);
 		return;
 	}
 
@@ -829,4 +1100,135 @@ extern "C" void DSpEncodePresentToFramebuffer(DSpContextPrivate *ctx,
 	ctx->dirty_empty       = true;
 	ctx->dirty_cold_start  = false;
 	ctx->dirty_left = ctx->dirty_top = ctx->dirty_right = ctx->dirty_bottom = 0;
+}
+
+extern "C" bool DSpEncodeFrontBufferStagingToFramebuffer(DSpContextPrivate *ctx,
+                                                          void *command_buffer_raw,
+                                                          void *framebuffer_texture_raw)
+{
+	id<MTLCommandBuffer> cb =
+	    (__bridge id<MTLCommandBuffer>)command_buffer_raw;
+	id<MTLTexture> framebuffer_texture =
+	    (__bridge id<MTLTexture>)framebuffer_texture_raw;
+	if (ctx == nullptr || cb == nil || framebuffer_texture == nil) return false;
+	if (ctx->front_staging_mac_addr == 0 || ctx->front_staging_size == 0) return false;
+
+	const uint32_t front_depth =
+	    DSpDisplayModeDepth(ctx->attr.backBufferBestDepth,
+	                        ctx->attr.displayBestDepth);
+	MTLPixelFormat fmt = DSpPixelFormatForDepthBits(front_depth);
+	if (fmt == MTLPixelFormatInvalid) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: unsupported "
+		        "front depth %u", front_depth);
+		return false;
+	}
+
+	const uint32_t w = ctx->attr.displayWidth;
+	const uint32_t h = ctx->attr.displayHeight;
+	const uint32_t row_bytes =
+	    DSpDisplayModeRowBytes(w, front_depth);
+	const uint32_t buffer_size = row_bytes * h;
+	uint32_t baseAddr_mac = DSpUsableGuestBaseOrZero(
+		ctx->front_staging_mac_addr,
+		buffer_size,
+		(uint32_t)RAMBase,
+		(uint32_t)RAMSize);
+	if (baseAddr_mac == 0 || buffer_size > ctx->front_staging_size) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: unusable front "
+		        "staging addr=0x%08x size=%u need=%u depth=%u",
+		        ctx->front_staging_mac_addr, ctx->front_staging_size,
+		        buffer_size, front_depth);
+		return false;
+	}
+
+	uint8_t *front_host = Mac2HostAddr(baseAddr_mac);
+	if (front_host == NULL) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: Mac2HostAddr "
+		        "failed for 0x%08x", baseAddr_mac);
+		return false;
+	}
+
+	const uint32_t current_hash =
+	    DSpFrontStagingHashBytes(front_host, buffer_size);
+	const DMCModeSnapshot *snap = dmc_current_snapshot();
+	const uint32_t gamma_gen = snap ? snap->gamma_gen : 0u;
+	const uint32_t fade_active = (snap && snap->fade_active) ? 1u : 0u;
+	if (!DSpFrontStagingShouldEncodeHashForGamma(
+	        &ctx->front_staging_present_state,
+	        current_hash,
+	        buffer_size,
+	        gamma_gen,
+	        fade_active)) {
+		const uint32_t skips =
+		    ctx->front_staging_present_state.unchanged_skips;
+		if (skips <= 3 || (skips % 120u) == 0) {
+			DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: skipped "
+			        "unchanged front staging addr=0x%08x rowBytes=%u "
+			        "%ux%u@%u hash=0x%08x gammaGen=%u fade=%u skips=%u",
+			        baseAddr_mac, row_bytes, w, h, front_depth,
+			        current_hash, gamma_gen, fade_active, skips);
+		}
+		return true;
+	}
+
+	id<MTLDevice> device = (__bridge id<MTLDevice>)SharedMetalDevice();
+	if (device == nil) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: shared Metal "
+		        "device is nil");
+		return false;
+	}
+
+	id<MTLBuffer> staging_copy =
+	    [device newBufferWithBytes:front_host
+	                        length:buffer_size
+	                       options:MTLResourceStorageModeShared];
+	if (staging_copy == nil) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: newBufferWithBytes "
+		        "failed (size=%u depth=%u)", buffer_size, front_depth);
+		return false;
+	}
+
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	td.usage       = MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModeShared;
+
+	id<MTLTexture> front_texture =
+	    [staging_copy newTextureWithDescriptor:td
+	                                    offset:0
+	                               bytesPerRow:row_bytes];
+	if (front_texture == nil) {
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: front texture "
+		        "creation failed (rowBytes=%u depth=%u)",
+		        row_bytes, front_depth);
+		return false;
+	}
+
+	bool ok = DSpEncodeUnpackTextureRenderPass(ctx,
+	                                           front_texture,
+	                                           front_depth,
+	                                           w,
+	                                           "frontStaging",
+	                                           DSpFrontStagingUsesNativeR16OrderInMetal(),
+	                                           DSpFrontStagingUsesDisplayGamma(),
+	                                           DSpFrontStagingWritesCompositor32Layout(),
+	                                           cb,
+	                                           framebuffer_texture);
+	if (ok) {
+		DSpFrontStagingRememberHashForGamma(
+		    &ctx->front_staging_present_state,
+		    current_hash,
+		    buffer_size,
+		    gamma_gen,
+		    fade_active);
+		DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: presented "
+		        "front staging addr=0x%08x rowBytes=%u %ux%u@%u "
+		        "hash=0x%08x gammaGen=%u fade=%u",
+		        baseAddr_mac, row_bytes, w, h, front_depth, current_hash,
+		        gamma_gen, fade_active);
+	}
+	return ok;
 }

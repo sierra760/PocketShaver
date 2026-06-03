@@ -267,11 +267,12 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
      * 2D UI, so rebuilding compositor_texture with a NULL host buffer here
      * hides those CPU-side UI writes.
      *
-     * QuickDraw mode switches retain their existing behaviour (no auto-resize
-     * here; the QD-side path manages compositor refresh through its own
-     * mechanism). When QD reclaims the display from a non-QD owner the
-     * mismatch is benign for in-place returns; out-of-place handoffs are
-     * tracked separately (post-DSp-release QD geometry restore).
+     * QuickDraw mode switches normally retain their existing behaviour (no
+     * auto-resize here; the QD-side path manages compositor refresh through
+     * its own mechanism). DSp release is the exception: it publishes a
+     * QuickDraw snapshot with screen_base_host set to the restored MainDevice
+     * framebuffer, so the compositor can rebuild away from the DSp-owned
+     * BGRA render target and present the real desktop surface again.
      */
     if (incoming->active_owner == (uint32_t)kDMCOwnerDSp) {
         int new_w = (int)incoming->width;
@@ -295,6 +296,38 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
                 /* Non-fatal: engine writes still land in the existing (mismatched)
                  * framebuffer texture, which appears in a corner of the window
                  * (pre-CF-22.3-06 behaviour). */
+            }
+        }
+    } else if (incoming->active_owner == (uint32_t)kDMCOwnerQuickDraw &&
+               incoming->screen_base_host != NULL) {
+        int new_w = (int)incoming->width;
+        int new_h = (int)incoming->height;
+        int new_depth = (int)incoming->depth;
+        int new_row_bytes = (int)incoming->row_bytes;
+        int new_pitch = (int)incoming->pitch;
+        int cur_w = compositor_pixel_width;
+        int cur_h = (int)compositor_layer.drawableSize.height;
+        if (new_w != cur_w ||
+            new_h != cur_h ||
+            compositor_depth != new_depth ||
+            compositor_row_bytes != new_row_bytes ||
+            compositor_pitch != new_pitch) {
+            uint64_t buffer_size64 = (uint64_t)incoming->pitch *
+                                     (uint64_t)incoming->height;
+            uint32_t buffer_size =
+                buffer_size64 > UINT32_MAX ? UINT32_MAX : (uint32_t)buffer_size64;
+            int rc = MetalCompositorResize(
+                new_w, new_h,
+                new_depth,
+                new_row_bytes,
+                new_pitch,
+                incoming->screen_base_host,
+                buffer_size);
+            if (rc != 0) {
+                COMPOSITOR_ERR("DMC on_mode_enter: MetalCompositorResize failed "
+                               "(rc=%d) for QuickDraw restore %dx%d@%d rb=%d host=%p",
+                               rc, new_w, new_h, new_depth, new_row_bytes,
+                               incoming->screen_base_host);
             }
         }
     }

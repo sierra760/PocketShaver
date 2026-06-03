@@ -52,6 +52,7 @@ extern bool DSpAllocateBackBuffer(struct DSpContextPrivate *ctx,
  *  DSpQueueReleaseAtVBL in dsp_draw_context.mm.
  */
 extern void DSpReleaseBackBufferNow(struct DSpContextPrivate *ctx);
+extern void DSpReleaseBackBufferStaging(struct DSpContextPrivate *ctx);
 
 /*
  *  Encode the SwapBuffers blit. Honors ctx->dirty_* state:
@@ -90,7 +91,8 @@ extern void DSpEncodeBackBufferBlit(struct DSpContextPrivate *ctx,
  *      command encoder on `command_buffer` and delegates to
  *      DSpEncodeBackBufferBlit. This is the 32 bpp Sims fast path.
  *
- *    - Different format (e.g. back_texture R16Uint at 16 bpp into the
+ *    - Different format (e.g. back_texture R8Uint at indexed depths or
+ *      R16Uint at 16 bpp into the
  *      compositor's BGRA8Unorm framebuffer): runs a DSp-owned full-screen
  *      render pass that samples back_texture in its native pixel format
  *      and writes BGRA8Unorm to framebuffer_texture. The fragment shader
@@ -109,18 +111,20 @@ extern void DSpEncodeBackBufferBlit(struct DSpContextPrivate *ctx,
  *  (ctx->dirty_empty = true, ctx->dirty_cold_start = false, dirty bounds
  *  zeroed) on every successful encode.
  *
- *  Currently supports 16 bpp (R16Uint xRGB1555 -> BGRA8Unorm) and 32 bpp
- *  (BGRA8Unorm matched-format blit). 1/2/4/8 bpp indexed depths require
- *  palette + gamma uniforms (compositor_fragment_indexed precedent); a
- *  follow-up task adds those. For now the
- *  helper logs and falls back to the bare blit (which the Metal debug
- *  layer will reject) when an unsupported format pair is encountered, so
- *  the regression surfaces loudly rather than silently producing wrong
- *  output.
+ *  Currently supports indexed 1/2/4/8 bpp
+ *  (R8Uint + per-context CLUT -> BGRA8Unorm), 16 bpp
+ *  (R16Uint xRGB1555 -> BGRA8Unorm), and 32 bpp
+ *  (BGRA8Unorm matched-format blit). Unsupported mismatched format pairs
+ *  are logged and skipped rather than routed through a Metal-incompatible
+ *  blit.
  */
 extern void DSpEncodePresentToFramebuffer(struct DSpContextPrivate *ctx,
                                             void *command_buffer,
                                             void *framebuffer_texture);
+
+extern bool DSpEncodeFrontBufferStagingToFramebuffer(struct DSpContextPrivate *ctx,
+                                                      void *command_buffer,
+                                                      void *framebuffer_texture);
 
 /*
  *  Emit a CGrafPort-shaped struct into emulated Mac RAM for
@@ -132,10 +136,11 @@ extern void DSpEncodePresentToFramebuffer(struct DSpContextPrivate *ctx,
  *
  *  baseAddr uses Host2MacAddr((uint8 *)ctx->back_buffer.contents) when
  *  the contents pointer falls inside the vm_alloc emulated-RAM region;
- *  otherwise (the heap lives outside that region on arm64 iOS) the
- *  function reserves a separate SheepMem staging region the same size
- *  as the back-buffer and SwapBuffers memcpys staging → back_buffer
- *  before encoding the GPU blit. The fallback path preserves
+	 *  otherwise (the heap lives outside that region on arm64 iOS) the
+	 *  function reserves a separate Mac system-heap staging region the same
+	 *  size as the back-buffer, validates the full guest-RAM span, and
+	 *  SwapBuffers memcpys staging → back_buffer before encoding the GPU
+	 *  blit. The fallback path preserves
  *  guest-writable CGrafPtr semantics.
  *
  *  Returns the CGrafPort's Mac address, or 0 on failure (caller returns

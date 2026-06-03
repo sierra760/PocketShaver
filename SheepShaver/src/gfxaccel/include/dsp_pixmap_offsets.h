@@ -9,15 +9,15 @@
  *  (at your option) any later version.
  *
  *  Field offsets and Mac OS lowmem globals used by the
- *  DSpRedirectMainDevicePixMap / DSpRestoreMainDevicePixMap helpers. The
- *  DSP_PIXMAP_OFF_* values match the Mac OS 9.0.4 PixMap layout exercised by
- *  the GetBackBuffer CGrafPtr write path, and the canonical layout in Inside
- *  Macintosh: Imaging With QuickDraw ch.4.
+ *  DSpRedirectMainDevicePixMap / DSpRestoreMainDevicePixMap helpers.
+ *  DSP_PIXMAP_OFF_* values are the compact PixMap subset used by DSp's
+ *  synthetic CGrafPort shims. DSP_MAINDEVICE_PIXMAP_OFF_* values are the
+ *  real QuickDraw PixMap offsets used by the emulated MainDevice.
  */
 #ifndef DSP_PIXMAP_OFFSETS_H
 #define DSP_PIXMAP_OFFSETS_H
 
-/* PixMap struct field offsets (bytes from PixMap struct base). */
+/* Compact synthetic PixMap field offsets (bytes from shim PixMap base). */
 #define DSP_PIXMAP_OFF_BASEADDR     0    /* 4 bytes  — baseAddr      */
 #define DSP_PIXMAP_OFF_ROWBYTES     4    /* 2 bytes  — rowBytes      */
 #define DSP_PIXMAP_OFF_BOUNDS_TOP   6    /* 2 bytes  — bounds.top    */
@@ -28,6 +28,27 @@
 #define DSP_PIXMAP_OFF_PIXELSIZE   16    /* 2 bytes  — pixelSize     */
 #define DSP_PIXMAP_OFF_CMPCOUNT    18    /* 2 bytes  — cmpCount      */
 #define DSP_PIXMAP_OFF_CMPSIZE     20    /* 2 bytes  — cmpSize       */
+
+/* Real QuickDraw PixMap offsets for MainDevice.gdPMap. */
+#define DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR     0
+#define DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES     4
+#define DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP   6
+#define DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT  8
+#define DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT  10
+#define DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT 12
+#define DSP_MAINDEVICE_PIXMAP_OFF_PMVERSION   14
+#define DSP_MAINDEVICE_PIXMAP_OFF_PACKTYPE    16
+#define DSP_MAINDEVICE_PIXMAP_OFF_PACKSIZE    18
+#define DSP_MAINDEVICE_PIXMAP_OFF_HRES        22
+#define DSP_MAINDEVICE_PIXMAP_OFF_VRES        26
+#define DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE   30
+#define DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE   32
+#define DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT    34
+#define DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE     36
+#define DSP_MAINDEVICE_PIXMAP_OFF_PLANEBYTES  38
+#define DSP_MAINDEVICE_PIXMAP_OFF_PMTABLE     42
+#define DSP_MAINDEVICE_PIXMAP_OFF_PMRESERVED  46
+#define DSP_MAINDEVICE_PIXMAP_SIZE            50
 
 /* Mac OS lowmem globals (Inside Macintosh: Imaging With QuickDraw ch.4).
  * LMADDR_MAIN_DEVICE holds a GDeviceHandle; double-dereference + add

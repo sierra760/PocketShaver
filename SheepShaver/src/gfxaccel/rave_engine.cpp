@@ -22,7 +22,11 @@
 #include "macos_util.h"
 #include "thunks.h"
 #include "rave_engine.h"
+#include "rave_device_summary.h"
+#include "rave_engine_enable_policy.h"
+#include "rave_engine_identity.h"
 #include "rave_metal_renderer.h"
+#include "dsp_pixmap_offsets.h"
 #include "gfxaccel_resources.h"
 #include "metal_compositor.h"  // MetalCompositorSubmitFrame_ClearCachedOverlay
 
@@ -168,11 +172,73 @@ enum {
 	kQAGestalt_NumSelectors
 };
 
-// TQADevice type discriminator
-enum {
-	kQADeviceMemory = 0,
-	kQADeviceGDevice = 1
-};
+static void RaveLogDeviceSummary(const char *label, uint32 device)
+{
+	if (device == 0) {
+		RAVE_LOG("%s: device=NULL", label);
+		return;
+	}
+
+	uint32 deviceType = ReadMacInt32(device + kRaveDeviceOff_Type);
+	if (deviceType == kRaveDeviceTypeMemory) {
+		uint32 rowBytes  = ReadMacInt32(device + kRaveDeviceOff_MemoryRowBytes);
+		uint32 pixelType = ReadMacInt32(device + kRaveDeviceOff_MemoryPixelType);
+		uint32 width     = ReadMacInt32(device + kRaveDeviceOff_MemoryWidth);
+		uint32 height    = ReadMacInt32(device + kRaveDeviceOff_MemoryHeight);
+		uint32 baseAddr  = ReadMacInt32(device + kRaveDeviceOff_MemoryBaseAddr);
+		RAVE_LOG("%s: device=0x%08x type=%s rowBytes=%u pixelType=%u "
+		         "size=%ux%u baseAddr=0x%08x",
+		         label, device, RaveDeviceTypeName(deviceType),
+		         rowBytes, pixelType, width, height, baseAddr);
+	} else if (deviceType == kRaveDeviceTypeGDevice) {
+		uint32 gdevice = ReadMacInt32(device + kRaveDeviceOff_GDeviceHandle);
+		RAVE_LOG("%s: device=0x%08x type=%s gDevice=0x%08x",
+		         label, device, RaveDeviceTypeName(deviceType), gdevice);
+		if (gdevice != 0) {
+			uint32 gdevicePtr = ReadMacInt32(gdevice);
+			uint32 pixMapH = gdevicePtr != 0
+				? ReadMacInt32(gdevicePtr + GDEVICE_OFF_PMAP)
+				: 0;
+			uint32 pixMapPtr = pixMapH != 0 ? ReadMacInt32(pixMapH) : 0;
+			if (pixMapPtr != 0) {
+				uint32 baseAddr = ReadMacInt32(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR);
+				uint16 rbRaw = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES);
+				int16 top = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP);
+				int16 left = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT);
+				int16 bottom = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT);
+				int16 right = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT);
+				uint16 pixelType = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE);
+				uint16 pixelSize = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE);
+				uint16 cmpCount = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT);
+				uint16 cmpSize = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE);
+				RAVE_LOG("%s: GDevice ptr=0x%08x pixMapH=0x%08x "
+				         "pixMap=0x%08x baseAddr=0x%08x rbRaw=0x%04x "
+				         "rb=%u bounds=%d,%d,%d,%d pixelType=0x%04x "
+				         "pixelSize=%u cmpCount=%u cmpSize=%u",
+				         label, gdevicePtr, pixMapH, pixMapPtr, baseAddr,
+				         rbRaw, (unsigned)(rbRaw & 0x3FFFu),
+				         (int)top, (int)left, (int)bottom, (int)right,
+				         pixelType, pixelSize, cmpCount, cmpSize);
+			} else {
+				RAVE_LOG("%s: GDevice ptr=0x%08x pixMapH=0x%08x "
+				         "pixMap=NULL", label, gdevicePtr, pixMapH);
+			}
+		}
+	} else {
+		RAVE_LOG("%s: device=0x%08x type=%s(%u)",
+		         label, device, RaveDeviceTypeName(deviceType), deviceType);
+	}
+}
 
 // kQAOptional_* feature flags (RAVE 1.6)
 // Bit assignments MUST match DDK RAVE.h exactly.
@@ -1960,18 +2026,21 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_VendorID:
-		WriteMacInt32(responsePtr, 1);  // kQAVendor_ATI
-		RAVE_LOG("EngineGestalt: %s -> 1 (kQAVendor_ATI)", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedVendorID);
+		RAVE_LOG("EngineGestalt: %s -> %u (kQAVendor_ATI)", gestalt_selector_names[selector],
+		         kRaveAdvertisedVendorID);
 		break;
 
 	case kQAGestalt_EngineID:
-		WriteMacInt32(responsePtr, 0x50534852);  // 'PSHR' (PocketSHaveR)
-		RAVE_LOG("EngineGestalt: %s -> 0x50534852 ('PSHR')", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedEngineID);
+		RAVE_LOG("EngineGestalt: %s -> 0x%08x ('PSHR')", gestalt_selector_names[selector],
+		         kRaveAdvertisedEngineID);
 		break;
 
 	case kQAGestalt_Revision:
-		WriteMacInt32(responsePtr, 0x00010000);  // 1.0
-		RAVE_LOG("EngineGestalt: %s -> 0x00010000 (1.0)", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedRevision);
+		RAVE_LOG("EngineGestalt: %s -> 0x%08x (1.0)", gestalt_selector_names[selector],
+		         kRaveAdvertisedRevision);
 		break;
 
 	case kQAGestalt_ASCIINameLength:
@@ -1988,7 +2057,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 
 	case kQAGestalt_TextureMemory:
 	case kQAGestalt_FastTextureMemory:
-		WriteMacInt32(responsePtr, 64 * 1024 * 1024);  // 64MB
+		WriteMacInt32(responsePtr, kRaveAdvertisedTextureMemoryBytes);
 		RAVE_LOG("EngineGestalt: %s -> 64MB", gestalt_selector_names[selector]);
 		break;
 
@@ -2085,13 +2154,9 @@ int32 NativeEngineCheckDevice(uint32 devicePtr)
 	// Read device type from TQADevice struct (first field)
 	uint32 deviceType = ReadMacInt32(devicePtr);
 
-	if (deviceType == kQADeviceMemory) {
-		RAVE_LOG("EngineCheckDevice: kQADeviceMemory -> kQANoErr");
-	} else if (deviceType == kQADeviceGDevice) {
-		RAVE_LOG("EngineCheckDevice: kQADeviceGDevice -> kQANoErr");
-	} else {
-		RAVE_LOG("EngineCheckDevice: unknown device type %d -> kQANoErr", deviceType);
-	}
+	RaveLogDeviceSummary("EngineCheckDevice", devicePtr);
+	RAVE_LOG("EngineCheckDevice: %s(%u) -> kQANoErr",
+	         RaveDeviceTypeName(deviceType), deviceType);
 
 	// Accept all device types for maximum compatibility
 	return kQANoErr;
@@ -2108,6 +2173,7 @@ int32 NativeEngineCheckDevice(uint32 devicePtr)
  */
 uint32 NativeHookGetFirstEngine(uint32 device)
 {
+	RaveLogDeviceSummary("HOOK: QADeviceGetFirstEngine", device);
 	RAVE_LOG("HOOK: QADeviceGetFirstEngine(device=0x%08x) -> sentinel 0x%08x",
 		   device, rave_sentinel_engine);
 	return rave_sentinel_engine;
@@ -2185,6 +2251,48 @@ uint32 NativeHookEngineCheckDevice(uint32 engine, uint32 device)
 		const uint32 args[] = { engine, device };
 		return RaveChainToOriginal(kRaveHookIdx_EngineCheckDevice, 2, args);
 	}
+}
+
+/*
+ *  Hook handler: QAEngineEnable(vendorID, engineID) -> TQAError
+ *
+ *  Some games use this manager API as an engine-selection gate before
+ *  creating a draw context. The RAVE manager's internal engine list does not
+ *  reliably contain our injected sentinel, so handle BestChoice/ATI locally
+ *  and log the exact IDs requested.
+ */
+uint32 NativeHookEngineEnable(uint32 vendorID, uint32 engineID)
+{
+	RAVE_LOG("HOOK: QAEngineEnable(vendor=0x%08x engine=0x%08x)", vendorID, engineID);
+	if (RaveEngineEnableHandledByNative(vendorID, engineID)) {
+		RAVE_LOG("HOOK: QAEngineEnable -> kQANoErr (native accepted)");
+		return kQANoErr;
+	}
+
+	if (rave_orig_engine_enable == 0) return (uint32)(int32)kQANotSupported;
+	const uint32 args[] = { vendorID, engineID };
+	const uint32 result = RaveChainToOriginal(kRaveHookIdx_EngineEnable, 2, args);
+	RAVE_LOG("HOOK: QAEngineEnable -> chained result %d", (int32)result);
+	return result;
+}
+
+
+/*
+ *  Hook handler: QAEngineDisable(vendorID, engineID) -> TQAError
+ */
+uint32 NativeHookEngineDisable(uint32 vendorID, uint32 engineID)
+{
+	RAVE_LOG("HOOK: QAEngineDisable(vendor=0x%08x engine=0x%08x)", vendorID, engineID);
+	if (RaveEngineEnableHandledByNative(vendorID, engineID)) {
+		RAVE_LOG("HOOK: QAEngineDisable -> kQANoErr (native accepted)");
+		return kQANoErr;
+	}
+
+	if (rave_orig_engine_disable == 0) return (uint32)(int32)kQANotSupported;
+	const uint32 args[] = { vendorID, engineID };
+	const uint32 result = RaveChainToOriginal(kRaveHookIdx_EngineDisable, 2, args);
+	RAVE_LOG("HOOK: QAEngineDisable -> chained result %d", (int32)result);
+	return result;
 }
 
 
@@ -2978,7 +3086,7 @@ void RaveInstallHooks(void)
 		NULL
 	};
 
-	// Look up all 8 APIs. We need them all from the same library.
+	// Look up all APIs. We need them all from the same library.
 	// The first 5 are enumeration/creation hooks, the last 3 are resource
 	// creation hooks needed because our sentinel engine is not in the RAVE
 	// manager's internal list (QARegisterEngine succeeds but ZgLoadingSharedLibrary
@@ -3009,8 +3117,10 @@ void RaveInstallHooks(void)
 		{ "\022QAAccessTextureEnd",     &rave_orig_access_texture_end,       kRaveHookAccessTextureEnd,      "QAAccessTextureEnd" },
 		{ "\016QAAccessBitmap",         &rave_orig_access_bitmap,            kRaveHookAccessBitmap,          "QAAccessBitmap" },
 		{ "\021QAAccessBitmapEnd",      &rave_orig_access_bitmap_end,        kRaveHookAccessBitmapEnd,       "QAAccessBitmapEnd" },
+		{ "\016QAEngineEnable",         &rave_orig_engine_enable,            kRaveHookEngineEnable,          "QAEngineEnable" },
+		{ "\017QAEngineDisable",        &rave_orig_engine_disable,           kRaveHookEngineDisable,         "QAEngineDisable" },
 	};
-	const int num_apis = 20;
+	const int num_apis = 22;
 
 	// Try each library name
 	bool all_found = false;

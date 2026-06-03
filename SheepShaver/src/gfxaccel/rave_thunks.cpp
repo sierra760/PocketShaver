@@ -43,6 +43,8 @@ uint32_t rave_orig_access_texture = 0;
 uint32_t rave_orig_access_texture_end = 0;
 uint32_t rave_orig_access_bitmap = 0;
 uint32_t rave_orig_access_bitmap_end = 0;
+uint32_t rave_orig_engine_enable = 0;
+uint32_t rave_orig_engine_disable = 0;
 
 /*
  *  Allocate a single RAVE TVECT thunk in SheepMem
