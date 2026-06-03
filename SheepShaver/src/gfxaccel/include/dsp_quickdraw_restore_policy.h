@@ -30,6 +30,9 @@ static inline bool DSpSavedQuickDrawModeIsUsable(uint8_t saved_valid,
                                                  uint32_t ram_base,
                                                  uint32_t ram_size)
 {
+	(void)ram_base;
+	(void)ram_size;
+
 	if (saved_valid == 0 || base_addr == 0) {
 		return false;
 	}
@@ -48,11 +51,9 @@ static inline bool DSpSavedQuickDrawModeIsUsable(uint8_t saved_valid,
 		return false;
 	}
 
-	const uint64_t start = (uint64_t)base_addr;
-	const uint64_t end = start + (uint64_t)row_bytes * (uint64_t)height;
-	const uint64_t ram_start = (uint64_t)ram_base;
-	const uint64_t ram_end = ram_start + (uint64_t)ram_size;
-	return start >= ram_start && end <= ram_end && end >= start;
+	const uint64_t end =
+	    (uint64_t)base_addr + (uint64_t)row_bytes * (uint64_t)height;
+	return end >= (uint64_t)base_addr && end <= 0x100000000ULL;
 }
 
 static inline bool DSpQuickDrawModeRestoreDiffers(uint32_t saved_width,

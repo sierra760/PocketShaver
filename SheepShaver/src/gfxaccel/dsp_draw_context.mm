@@ -99,19 +99,13 @@ static bool DSpBuildSavedQuickDrawModeDesc(const DSpContextPrivate *ctx,
 	out_mode->vbl_usec = 0;
 	out_mode->screen_base_mac = ctx->saved_pixmap_baseAddr;
 	out_mode->screen_base_host = Mac2HostAddr(ctx->saved_pixmap_baseAddr);
-	return out_mode->screen_base_host != nullptr;
+	return true;
 }
 
 static void DSpDetachFrontBufferCGrafPtr(DSpContextPrivate *ctx,
                                          const char *caller)
 {
 	if (ctx == nullptr || ctx->front_pixmap_mac_addr == 0) return;
-	if (!DSpGuestRAMContains(ctx->front_pixmap_mac_addr,
-	                         DSpFrontBufferPixMapRecordSize(),
-	                         (uint32_t)RAMBase,
-	                         (uint32_t)RAMSize)) {
-		return;
-	}
 
 	WriteMacInt32(ctx->front_pixmap_mac_addr +
 	              DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR,
@@ -119,9 +113,18 @@ static void DSpDetachFrontBufferCGrafPtr(DSpContextPrivate *ctx,
 	WriteMacInt16(ctx->front_pixmap_mac_addr +
 	              DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES,
 	              ctx->saved_pixmap_rowBytes);
-	Host2Mac_memcpy(ctx->front_pixmap_mac_addr +
-	                DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP,
-	                &ctx->saved_pixmap_bounds, 8);
+	WriteMacInt16(ctx->front_pixmap_mac_addr +
+	              DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP,
+	              ctx->saved_pixmap_bounds[0]);
+	WriteMacInt16(ctx->front_pixmap_mac_addr +
+	              DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT,
+	              ctx->saved_pixmap_bounds[1]);
+	WriteMacInt16(ctx->front_pixmap_mac_addr +
+	              DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT,
+	              ctx->saved_pixmap_bounds[2]);
+	WriteMacInt16(ctx->front_pixmap_mac_addr +
+	              DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT,
+	              ctx->saved_pixmap_bounds[3]);
 	WriteMacInt16(ctx->front_pixmap_mac_addr +
 	              DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE,
 	              ctx->saved_pixmap_pixelType);
@@ -4078,8 +4081,10 @@ extern "C" void DSpRedirectMainDevicePixMap(DSpContextPrivate *ctx)
 		ctx->saved_pixmap_addr     = pixMapPtr;
 		ctx->saved_pixmap_baseAddr = ReadMacInt32(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR);
 		ctx->saved_pixmap_rowBytes = (uint16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES);
-		Mac2Host_memcpy(&ctx->saved_pixmap_bounds,
-		                pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP, 8);
+		ctx->saved_pixmap_bounds[0] = (int16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP);
+		ctx->saved_pixmap_bounds[1] = (int16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT);
+		ctx->saved_pixmap_bounds[2] = (int16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT);
+		ctx->saved_pixmap_bounds[3] = (int16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT);
 		ctx->saved_pixmap_pixelType = (uint16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE);
 		ctx->saved_pixmap_pixelSize = (uint16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE);
 		ctx->saved_pixmap_cmpCount  = (uint16_t)ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT);
@@ -4227,22 +4232,144 @@ extern "C" void DSpRedirectMainDevicePixMap(DSpContextPrivate *ctx)
 	#undef DSP_REDIR_INRANGE
 }
 
+static inline bool DSpLowMemOrGuestRAMContains(uint32_t mac_addr,
+                                               uint32_t byte_count)
+{
+	if (mac_addr == 0 || byte_count == 0) return false;
+	uint64_t start = (uint64_t)mac_addr;
+	uint64_t end = start + (uint64_t)byte_count;
+	if (end < start) return false;
+	if (end <= 0x3000u) return true;
+
+	uint64_t ram_lo = (uint64_t)(uint32_t)RAMBase;
+	uint64_t ram_hi = (uint64_t)(uint32_t)(RAMBase + RAMSize);
+	return start >= ram_lo && end <= ram_hi;
+}
+
+static inline bool DSpLowMemOrGuestRAMContainsAtOffset(uint32_t mac_addr,
+                                                       uint32_t offset,
+                                                       uint32_t byte_count)
+{
+	if (mac_addr == 0) return false;
+	if (mac_addr > UINT32_MAX - offset) return false;
+	return DSpLowMemOrGuestRAMContains(mac_addr + offset, byte_count);
+}
+
+static uint32_t DSpResolveLiveMainDevicePixMapPtr(void)
+{
+	uint32_t mainDeviceH = ReadMacInt32(LMADDR_MAIN_DEVICE);
+	if (!DSpLowMemOrGuestRAMContains(mainDeviceH, 4)) return 0;
+
+	uint32_t gdevicePtr = ReadMacInt32(mainDeviceH);
+	if (!DSpLowMemOrGuestRAMContainsAtOffset(gdevicePtr, GDEVICE_OFF_PMAP, 4)) {
+		return 0;
+	}
+
+	uint32_t pixMapH = ReadMacInt32(gdevicePtr + GDEVICE_OFF_PMAP);
+	if (!DSpLowMemOrGuestRAMContains(pixMapH, 4)) return 0;
+
+	uint32_t pixMapPtr = ReadMacInt32(pixMapH);
+	if (!DSpLowMemOrGuestRAMContainsAtOffset(
+	        pixMapPtr, DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE, 2)) {
+		return 0;
+	}
+	return pixMapPtr;
+}
+
+static void DSpWriteSavedMainDevicePixMap(DSpContextPrivate *ctx,
+                                          uint32_t pixMapPtr)
+{
+	WriteMacInt32(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR,
+	              ctx->saved_pixmap_baseAddr);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES,
+	              ctx->saved_pixmap_rowBytes);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP,
+	              ctx->saved_pixmap_bounds[0]);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT,
+	              ctx->saved_pixmap_bounds[1]);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT,
+	              ctx->saved_pixmap_bounds[2]);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT,
+	              ctx->saved_pixmap_bounds[3]);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE,
+	              ctx->saved_pixmap_pixelType);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE,
+	              ctx->saved_pixmap_pixelSize);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT,
+	              ctx->saved_pixmap_cmpCount);
+	WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE,
+	              ctx->saved_pixmap_cmpSize);
+}
+
+static bool DSpPixMapLooksLikeContextRedirect(DSpContextPrivate *ctx,
+                                              uint32_t pixMapPtr)
+{
+	if (ctx == nullptr || pixMapPtr == 0) return false;
+
+	uint32_t baseAddr = ReadMacInt32(pixMapPtr +
+	                                 DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR);
+	uint32_t rowBytes = (uint32_t)(
+	    ReadMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES) & 0x7FFFu);
+	uint32_t pixelSize = (uint32_t)ReadMacInt16(
+	    pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE);
+
+	const uint32_t display_depth =
+	    DSpDisplayModeDepth(ctx->attr.backBufferBestDepth,
+	                        ctx->attr.displayBestDepth);
+	const uint32_t redirect_depth =
+	    DSpMainDevicePixMapDepth(ctx->attr.backBufferBestDepth,
+	                             display_depth);
+	const uint32_t front_row_bytes =
+	    DSpMainDevicePixMapRowBytes(ctx->attr.displayWidth,
+	                                ctx->attr.backBufferBestDepth,
+	                                display_depth);
+	if (ctx->front_staging_mac_addr != 0 &&
+	    baseAddr == ctx->front_staging_mac_addr) {
+		return rowBytes == front_row_bytes && pixelSize == redirect_depth;
+	}
+
+	const uint32_t back_row_bytes =
+	    DSpAlignedRowBytes(ctx->attr.displayWidth,
+	                       ctx->attr.backBufferBestDepth);
+	if (ctx->staging_mac_addr != 0 &&
+	    baseAddr == ctx->staging_mac_addr) {
+		return rowBytes == back_row_bytes &&
+		       pixelSize == ctx->attr.backBufferBestDepth;
+	}
+
+	if (ctx->back_buffer != nil) {
+		uint8_t *back_contents = (uint8_t *)[ctx->back_buffer contents];
+		uint32_t mappedBaseAddr = Host2MacAddr(back_contents);
+		if (mappedBaseAddr != 0 && baseAddr == mappedBaseAddr) {
+			return rowBytes == back_row_bytes &&
+			       pixelSize == ctx->attr.backBufferBestDepth;
+		}
+	}
+
+	return false;
+}
+
 extern "C" void DSpRestoreMainDevicePixMap(DSpContextPrivate *ctx)
 {
 	if (ctx == nullptr || ctx->saved_pixmap_valid == 0) return;
-	uint32_t pixMapPtr = ctx->saved_pixmap_addr;
-	if (pixMapPtr != 0) {
-		WriteMacInt32(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR, ctx->saved_pixmap_baseAddr);
-		WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES, ctx->saved_pixmap_rowBytes);
-		Host2Mac_memcpy(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP,
-		                &ctx->saved_pixmap_bounds, 8);
-		WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE, ctx->saved_pixmap_pixelType);
-		WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE, ctx->saved_pixmap_pixelSize);
-		WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT, ctx->saved_pixmap_cmpCount);
-		WriteMacInt16(pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE, ctx->saved_pixmap_cmpSize);
+	uint32_t savedPixMapPtr = ctx->saved_pixmap_addr;
+	uint32_t livePixMapPtr = DSpResolveLiveMainDevicePixMapPtr();
+	if (savedPixMapPtr != 0) {
+		DSpWriteSavedMainDevicePixMap(ctx, savedPixMapPtr);
 		DSP_LOG("DSpRestoreMainDevicePixMap: restored pixMapPtr=0x%08x "
 		        "baseAddr=0x%08x rowBytes=0x%04x pixelSize=%u",
-		        pixMapPtr,
+		        savedPixMapPtr,
+		        ctx->saved_pixmap_baseAddr,
+		        ctx->saved_pixmap_rowBytes,
+		        ctx->saved_pixmap_pixelSize);
+	}
+	if (livePixMapPtr != 0 &&
+	    livePixMapPtr != savedPixMapPtr &&
+	    DSpPixMapLooksLikeContextRedirect(ctx, livePixMapPtr)) {
+		DSpWriteSavedMainDevicePixMap(ctx, livePixMapPtr);
+		DSP_LOG("DSpRestoreMainDevicePixMap: restored live pixMapPtr=0x%08x "
+		        "baseAddr=0x%08x rowBytes=0x%04x pixelSize=%u",
+		        livePixMapPtr,
 		        ctx->saved_pixmap_baseAddr,
 		        ctx->saved_pixmap_rowBytes,
 		        ctx->saved_pixmap_pixelSize);

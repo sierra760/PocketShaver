@@ -302,7 +302,8 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
                incoming->screen_base_host != NULL) {
         int new_w = (int)incoming->width;
         int new_h = (int)incoming->height;
-        int new_depth = (int)incoming->depth;
+        int new_pixel_depth = (int)incoming->depth;
+        int new_depth = DepthModeForPixelDepth(new_pixel_depth);
         int new_row_bytes = (int)incoming->row_bytes;
         int new_pitch = (int)incoming->pitch;
         int cur_w = compositor_pixel_width;
@@ -326,7 +327,7 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
             if (rc != 0) {
                 COMPOSITOR_ERR("DMC on_mode_enter: MetalCompositorResize failed "
                                "(rc=%d) for QuickDraw restore %dx%d@%d rb=%d host=%p",
-                               rc, new_w, new_h, new_depth, new_row_bytes,
+                               rc, new_w, new_h, new_pixel_depth, new_row_bytes,
                                incoming->screen_base_host);
             }
         }

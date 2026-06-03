@@ -37,7 +37,9 @@ static inline bool DSpShouldCacheMainDevicePixMapOriginal(bool saved_valid,
                                                           uint32_t saved_pixmap_addr,
                                                           uint32_t current_pixmap_addr)
 {
-	return !saved_valid || saved_pixmap_addr != current_pixmap_addr;
+	(void)saved_pixmap_addr;
+	(void)current_pixmap_addr;
+	return !saved_valid;
 }
 
 #endif /* DSP_MAIN_DEVICE_REDIRECT_POLICY_H */
