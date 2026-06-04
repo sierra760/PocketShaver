@@ -1207,16 +1207,50 @@ extern "C" bool DSpEncodeFrontBufferStagingToFramebuffer(DSpContextPrivate *ctx,
 		return false;
 	}
 
-	bool ok = DSpEncodeUnpackTextureRenderPass(ctx,
-	                                           front_texture,
-	                                           front_depth,
-	                                           w,
-	                                           "frontStaging",
-	                                           DSpFrontStagingUsesNativeR16OrderInMetal(),
-	                                           DSpFrontStagingUsesDisplayGamma(),
-	                                           DSpFrontStagingWritesCompositor32Layout(),
-	                                           cb,
-	                                           framebuffer_texture);
+	bool ok = false;
+	if (front_texture.pixelFormat == framebuffer_texture.pixelFormat) {
+		NSUInteger copy_w = (NSUInteger)w;
+		NSUInteger copy_h = (NSUInteger)h;
+		if (copy_w > front_texture.width) copy_w = front_texture.width;
+		if (copy_h > front_texture.height) copy_h = front_texture.height;
+		if (copy_w > framebuffer_texture.width) copy_w = framebuffer_texture.width;
+		if (copy_h > framebuffer_texture.height) copy_h = framebuffer_texture.height;
+
+		if (copy_w > 0 && copy_h > 0) {
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			if (blit != nil) {
+				[blit copyFromTexture:front_texture
+				           sourceSlice:0
+				           sourceLevel:0
+				          sourceOrigin:MTLOriginMake(0, 0, 0)
+				            sourceSize:MTLSizeMake(copy_w, copy_h, 1)
+				             toTexture:framebuffer_texture
+				      destinationSlice:0
+				      destinationLevel:0
+				     destinationOrigin:MTLOriginMake(0, 0, 0)];
+				[blit endEncoding];
+				ok = true;
+				DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: direct "
+				        "front staging blit %lux%lu",
+				        (unsigned long)copy_w, (unsigned long)copy_h);
+			} else {
+				DSP_LOG("DSpEncodeFrontBufferStagingToFramebuffer: "
+				        "blitCommandEncoder returned nil for direct front "
+				        "staging path");
+			}
+		}
+	} else {
+		ok = DSpEncodeUnpackTextureRenderPass(ctx,
+		                                      front_texture,
+		                                      front_depth,
+		                                      w,
+		                                      "frontStaging",
+		                                      DSpFrontStagingUsesNativeR16OrderInMetal(),
+		                                      DSpFrontStagingUsesDisplayGamma(),
+		                                      DSpFrontStagingWritesCompositor32Layout(),
+		                                      cb,
+		                                      framebuffer_texture);
+	}
 	if (ok) {
 		DSpFrontStagingRememberHashForGamma(
 		    &ctx->front_staging_present_state,

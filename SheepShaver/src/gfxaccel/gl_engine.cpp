@@ -26,6 +26,8 @@
 #include "metal_compositor.h"
 #include "gfxaccel_resources.h"
 #include "display_mode_controller.h"
+#include "gl_drawable_owner_policy.h"
+#include "gl_offscreen_policy.h"
 #include "accel_logging.h"
 
 #include <cstring>
@@ -229,7 +231,14 @@ struct AGLContextState {
 	int32_t  agl_swap_rect[4];
 	bool     agl_rasterization_enabled;
 	uint32_t agl_drawable;           // Mac address stored at SetDrawable time
+	bool     agl_offscreen;
+	uint32_t agl_offscreen_width;
+	uint32_t agl_offscreen_height;
+	uint32_t agl_offscreen_rowbytes;
+	uint32_t agl_offscreen_baseaddr;
 	int32_t  agl_virtual_screen;
+	uint32_t agl_owner_before_drawable;
+	bool     agl_owner_before_drawable_valid;
 };
 static AGLContextState agl_ctx_state[GL_MAX_CONTEXTS];
 
@@ -410,6 +419,69 @@ static int gl_pixel_format_count = 0;
 #else
 #define GL_LOG(fmt, ...) do {} while(0)
 #endif
+
+static const char *GLDMCOwnerName(uint32_t owner)
+{
+	switch (owner) {
+	case kDMCOwnerQuickDraw: return "QuickDraw";
+	case kDMCOwnerRAVE:      return "RAVE";
+	case kDMCOwnerGL:        return "GL";
+	case kDMCOwnerDSp:       return "DSp";
+	case kDMCOwnerBlanking:  return "Blanking";
+	case kDMCOwnerQuiescent: return "Quiescent";
+	default:                 return "unknown";
+	}
+}
+
+static bool GLOtherDrawableBound(int except_idx)
+{
+	for (int i = 0; i < GL_MAX_CONTEXTS; ++i) {
+		if (i != except_idx &&
+		    gl_contexts[i] != nullptr &&
+		    agl_ctx_state[i].agl_drawable != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void GLCaptureOwnerBeforeDrawableBind(int idx)
+{
+	if (!GLShouldSnapshotDrawableOwner(agl_ctx_state[idx].agl_drawable != 0,
+	                                   agl_ctx_state[idx].agl_owner_before_drawable_valid)) {
+		return;
+	}
+
+	const DMCModeSnapshot *snap = dmc_current_snapshot();
+	uint32_t owner = snap ? snap->active_owner : kDMCOwnerQuickDraw;
+	agl_ctx_state[idx].agl_owner_before_drawable = owner;
+	agl_ctx_state[idx].agl_owner_before_drawable_valid = true;
+	GL_LOG("aglSetDrawable: captured display owner %s before binding context %d",
+	       GLDMCOwnerName(owner), idx + 1);
+}
+
+static void GLFinishDrawableUnbind(int idx)
+{
+	uint32_t captured_owner = agl_ctx_state[idx].agl_owner_before_drawable_valid
+	                            ? agl_ctx_state[idx].agl_owner_before_drawable
+	                            : kDMCOwnerQuickDraw;
+	uint32_t restore_owner = GLRestorableDrawableOwner(captured_owner);
+	bool other_drawable = GLOtherDrawableBound(idx);
+
+	agl_ctx_state[idx].agl_drawable = 0;
+	agl_ctx_state[idx].agl_owner_before_drawable = kDMCOwnerQuickDraw;
+	agl_ctx_state[idx].agl_owner_before_drawable_valid = false;
+
+	if (other_drawable) {
+		GL_LOG("aglSetDrawable: deferred owner restore after context %d unbind; another GL drawable remains",
+		       idx + 1);
+		return;
+	}
+
+	(void)dmc_set_active_owner(restore_owner);
+	GL_LOG("aglSetDrawable: restored display owner %s after context %d unbind (captured %s)",
+	       GLDMCOwnerName(restore_owner), idx + 1, GLDMCOwnerName(captured_owner));
+}
 
 
 /*
@@ -901,6 +973,7 @@ uint32_t NativeAGLCreateContext(uint32_t pixelFormat, uint32_t shareContext)
 	// Initialize per-context AGL state
 	memset(&agl_ctx_state[slot], 0, sizeof(AGLContextState));
 	agl_ctx_state[slot].agl_rasterization_enabled = true;  // default: rasterization on
+	agl_ctx_state[slot].agl_owner_before_drawable = kDMCOwnerQuickDraw;
 
 	GL_LOG("aglCreateContext: created context %d (handle=0x%08x)", slot + 1, mac_handle);
 
@@ -985,9 +1058,12 @@ uint32_t NativeAGLSetDrawable(uint32_t ctx, uint32_t drawable)
 		// compositing occurs. gl_overlay_unbind releases via
 		// gfxaccel_resources_release_overlay_texture(kGfxEngineGL, ...).
 		gl_overlay_unbind();
-		// Return ownership to QuickDraw on GL drawable unbind.
-		dmc_set_active_owner(kDMCOwnerQuickDraw);
-		agl_ctx_state[idx].agl_drawable = 0;
+		GLFinishDrawableUnbind(idx);
+		agl_ctx_state[idx].agl_offscreen = false;
+		agl_ctx_state[idx].agl_offscreen_width = 0;
+		agl_ctx_state[idx].agl_offscreen_height = 0;
+		agl_ctx_state[idx].agl_offscreen_rowbytes = 0;
+		agl_ctx_state[idx].agl_offscreen_baseaddr = 0;
 		GL_LOG("aglSetDrawable: unbinding drawable from context %d", idx + 1);
 		gl_agl_last_error = AGL_NO_ERROR;
 		return GL_TRUE;
@@ -1012,6 +1088,8 @@ uint32_t NativeAGLSetDrawable(uint32_t ctx, uint32_t drawable)
 	GL_LOG("aglSetDrawable: port rect=(%d,%d,%d,%d) -> %dx%d",
 	       port_top, port_left, port_bottom, port_right, width, height);
 
+	GLCaptureOwnerBeforeDrawableBind(idx);
+
 	// Vend a per-engine overlay texture via
 	// gfxaccel_resources_vend_overlay_texture(kGfxEngineGL, ...).
 	// gl_overlay_bind caches the destination rect for SubmitFrame emission
@@ -1034,6 +1112,11 @@ uint32_t NativeAGLSetDrawable(uint32_t ctx, uint32_t drawable)
 
 	// Store drawable Mac address for GetDrawable
 	agl_ctx_state[idx].agl_drawable = drawable;
+	agl_ctx_state[idx].agl_offscreen = false;
+	agl_ctx_state[idx].agl_offscreen_width = 0;
+	agl_ctx_state[idx].agl_offscreen_height = 0;
+	agl_ctx_state[idx].agl_offscreen_rowbytes = 0;
+	agl_ctx_state[idx].agl_offscreen_baseaddr = 0;
 
 	gl_agl_last_error = AGL_NO_ERROR;
 	return GL_TRUE;
@@ -1128,6 +1211,9 @@ uint32_t NativeAGLDestroyContext(uint32_t ctx)
 	}
 	if (!any_remaining) {
 		gl_overlay_unbind();
+	}
+	if (agl_ctx_state[idx].agl_drawable != 0) {
+		GLFinishDrawableUnbind(idx);
 	}
 
 	// Free accumulation buffer (raw malloc'd, not managed by ARC or C++ dtors)
@@ -1480,21 +1566,60 @@ uint32_t NativeAGLUpdateContext(uint32_t ctx)
 
 /*
  *  NativeAGLSetOffScreen / NativeAGLSetFullScreen / NativeAGLUseFont -
- *  honest-failure for the AGL trio. Our renderer is always windowed via the
- *  Metal overlay; offscreen/fullscreen drawables and Mac font-glyph
- *  rasterization are out-of-scope for the single-context iOS Metal emulator.
- *  These functions previously returned GL_TRUE while discarding every argument
- *  (a silent stub producing wrong output). They now fail honestly:
- *  aglSetOffScreen -> AGL_BAD_OFFSCREEN + GL_FALSE; aglSetFullScreen ->
- *  AGL_BAD_FULLSCREEN + GL_FALSE; aglUseFont -> GL_FALSE (no AGL_BAD_FONT in
- *  the AGL 1.2 spec — none invented). This is a deliberate known limitation.
+ *  AGL utility entry points.
+ *
+ *  Some GL games probe AGL by binding a guest offscreen buffer before any
+ *  onscreen drawable exists. Accept valid offscreen buffers so that path can
+ *  proceed, while preserving honest errors for malformed buffers and for the
+ *  still-unsupported fullscreen/font calls.
  */
 uint32_t NativeAGLSetOffScreen(uint32_t ctx, uint32_t width, uint32_t height,
                                 uint32_t rowbytes, uint32_t baseaddr)
 {
-	GL_LOG("aglSetOffScreen: ctx=0x%08x %dx%d (known limitation: windowed only)", ctx, width, height);
-	gl_agl_last_error = AGL_BAD_OFFSCREEN;
-	return GL_FALSE;
+	GL_LOG("aglSetOffScreen: ctx=0x%08x %dx%d rowbytes=%u base=0x%08x",
+	       ctx, width, height, rowbytes, baseaddr);
+
+	int idx;
+	GLContext *context = GLContextFromHandle(ctx, &idx);
+	if (!context) {
+		GL_LOG("aglSetOffScreen: invalid context handle");
+		gl_agl_last_error = AGL_BAD_CONTEXT;
+		return GL_FALSE;
+	}
+
+	if (!GLShouldAcceptOffscreenDrawable(width, height, rowbytes, baseaddr)) {
+		GL_LOG("aglSetOffScreen: rejected invalid offscreen drawable");
+		gl_agl_last_error = AGL_BAD_OFFSCREEN;
+		return GL_FALSE;
+	}
+
+	if (agl_ctx_state[idx].agl_drawable != 0) {
+		gl_overlay_unbind();
+		GLFinishDrawableUnbind(idx);
+	}
+
+	if (!context->metal) {
+		GLMetalInit(context);
+	}
+
+	context->viewport[0] = 0;
+	context->viewport[1] = 0;
+	context->viewport[2] = width;
+	context->viewport[3] = height;
+	context->scissor_box[0] = 0;
+	context->scissor_box[1] = 0;
+	context->scissor_box[2] = width;
+	context->scissor_box[3] = height;
+
+	agl_ctx_state[idx].agl_offscreen = true;
+	agl_ctx_state[idx].agl_offscreen_width = width;
+	agl_ctx_state[idx].agl_offscreen_height = height;
+	agl_ctx_state[idx].agl_offscreen_rowbytes = rowbytes;
+	agl_ctx_state[idx].agl_offscreen_baseaddr = baseaddr;
+
+	GL_LOG("aglSetOffScreen: accepted offscreen drawable for context %d", idx + 1);
+	gl_agl_last_error = AGL_NO_ERROR;
+	return GL_TRUE;
 }
 
 uint32_t NativeAGLSetFullScreen(uint32_t ctx, uint32_t width, uint32_t height,

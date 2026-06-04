@@ -1102,13 +1102,19 @@ extern "C" void DSpVBLCompositorPublishCallback(void *cb_ctx,
 		return;
 	}
 
+	const bool has_back_buffer_staging = (active->staging_mac_addr != 0);
+	if (DSpShouldFlushNQDBeforeStagingDrain(has_back_buffer_staging,
+	                                       present_front_staging)) {
+		NQDMetalFlush();
+	}
+
 	/* Staging-drain (Landmine-1 — mirrors SwapBuffers lines 2123-2136).
 	 * When DSpRedirectMainDevicePixMap fell back to the
 	 * guest-RAM staging path because Host2MacAddr could not map
 	 * back_buffer.contents, the emulated app has been writing through
 	 * staging_mac_addr. Drain into back_buffer.contents BEFORE the GPU
 	 * blit so the texture view sees the latest pixels. */
-	if (active->staging_mac_addr != 0) {
+	if (has_back_buffer_staging) {
 		const uint32_t w         = active->attr.displayWidth;
 		const uint32_t h         = active->attr.displayHeight;
 		const uint32_t bpp       = active->attr.backBufferBestDepth;
@@ -1146,10 +1152,6 @@ extern "C" void DSpVBLCompositorPublishCallback(void *cb_ctx,
 	    (__bridge id<MTLCommandQueue>)SharedMetalCommandQueue();
 	if (queue == nil) {
 		return;
-	}
-
-	if (present_front_staging) {
-		NQDMetalFlush();
 	}
 
 	@autoreleasepool {
@@ -2585,6 +2587,20 @@ extern "C" int32_t DSpContext_SwapBuffersHandler(uint32_t ctxRef,
 			return kDSpInternalErr;
 		}
 
+		bool present_front_staging =
+		    DSpShouldPresentFrontBufferStagingForState(
+		        ctx->attr.backBufferBestDepth,
+		        ctx->attr.displayBestDepth,
+		        ctx->front_staging_mac_addr,
+		        ctx->front_staging_size,
+		        ctx->state,
+		        (uint32_t)kDSpContextState_Active);
+		const bool has_back_buffer_staging = (ctx->staging_mac_addr != 0);
+		if (DSpShouldFlushNQDBeforeStagingDrain(has_back_buffer_staging,
+		                                       present_front_staging)) {
+			NQDMetalFlush();
+		}
+
 		/* Stage 1 (W1 staging path): if GetBackBuffer was forced to
 		 * vend a guest-RAM staging region because Host2MacAddr could not
 		 * map the MTLBuffer contents pointer, the emulated app has been
@@ -2592,7 +2608,7 @@ extern "C" int32_t DSpContext_SwapBuffersHandler(uint32_t ctxRef,
 		 * back_buffer.contents BEFORE encoding the GPU blit so the
 		 * texture view sees the latest pixels. This preserves guest-
 		 * writable CGrafPtr semantics. */
-		if (ctx->staging_mac_addr != 0) {
+		if (has_back_buffer_staging) {
 			uint32_t w         = ctx->attr.displayWidth;
 			uint32_t h         = ctx->attr.displayHeight;
 			uint32_t bpp       = ctx->attr.backBufferBestDepth;
@@ -2605,18 +2621,6 @@ extern "C" int32_t DSpContext_SwapBuffersHandler(uint32_t ctxRef,
 			if (staging_host != NULL && back_contents != NULL) {
 				memcpy(back_contents, staging_host, buffer_size);
 			}
-		}
-
-		bool present_front_staging =
-		    DSpShouldPresentFrontBufferStagingForState(
-		        ctx->attr.backBufferBestDepth,
-		        ctx->attr.displayBestDepth,
-		        ctx->front_staging_mac_addr,
-		        ctx->front_staging_size,
-		        ctx->state,
-		        (uint32_t)kDSpContextState_Active);
-		if (present_front_staging) {
-			NQDMetalFlush();
 		}
 
 		/* Stage 2: encode the back_texture → framebuffer_texture blit
@@ -4106,12 +4110,19 @@ extern "C" void DSpRedirectMainDevicePixMap(DSpContextPrivate *ctx)
 		display_depth);
 	uint32_t buffer_size = alignedRB * ctx->attr.displayHeight;
 	uint32_t newBaseAddr_mac = 0;
+	const bool has_presentable_front_staging =
+	    DSpShouldPresentFrontBufferStaging(ctx->attr.backBufferBestDepth,
+	                                       ctx->attr.displayBestDepth,
+	                                       ctx->front_staging_mac_addr,
+	                                       ctx->front_staging_size);
 
-	/* DSP-RDR-S6: same-depth DSp contexts keep the classic back-buffer
-	 * redirect. Mixed-depth contexts expose the display-depth front surface
-	 * to MainDevice so monitor-depth probes and RAVE/QD3D device discovery
-	 * see the active display mode, not the low-depth back buffer. */
-	if (redirect_depth == ctx->attr.backBufferBestDepth) {
+	/* DSP-RDR-S6: before DSpContext_GetFrontBuffer, same-depth contexts keep
+	 * the classic back-buffer redirect. After a front CGrafPort exists,
+	 * MainDevice must expose that front staging surface even when the display
+	 * and back-buffer depths match; QuickTime/Color QuickDraw front-buffer
+	 * paths rely on the fuller front CGrafPort and its PixMap backing store. */
+	if (!has_presentable_front_staging &&
+	    redirect_depth == ctx->attr.backBufferBestDepth) {
 		buffer_size = DSpBackBufferSize(
 			ctx->attr.displayWidth,
 			ctx->attr.displayHeight,
@@ -4183,9 +4194,10 @@ extern "C" void DSpRedirectMainDevicePixMap(DSpContextPrivate *ctx)
 			redirect_depth,
 			"DSpRedirectMainDevicePixMap");
 		DSP_LOG("DSpRedirectMainDevicePixMap: DSP-RDR-S6 using display-depth "
-		        "front staging (backBuffer@%u display@%u redirect@%u) -> 0x%08x",
+		        "front staging (backBuffer@%u display@%u redirect@%u presentable=%u) "
+		        "-> 0x%08x",
 		        ctx->attr.backBufferBestDepth, display_depth, redirect_depth,
-		        newBaseAddr_mac);
+		        has_presentable_front_staging ? 1u : 0u, newBaseAddr_mac);
 	}
 
 	/* Security gate (ASVS L1): refuse to write an
@@ -5032,10 +5044,9 @@ static uint32_t DSpGetFrontBufferCGrafPtr(DSpContextPrivate *ctx)
 {
 	if (ctx == nullptr || ctx->back_buffer == nil) return 0;
 
-	const uint32_t front_depth =
-	    DSpFrontBufferDepth(ctx->attr.backBufferBestDepth,
-	                        ctx->attr.displayBestDepth);
-	if (front_depth == ctx->attr.backBufferBestDepth) {
+	if (DSpShouldReuseBackBufferCGrafPtrForFrontBuffer(
+	        ctx->attr.backBufferBestDepth,
+	        ctx->attr.displayBestDepth)) {
 		return DSpGetBackBufferCGrafPtr(ctx);
 	}
 
@@ -5043,19 +5054,22 @@ static uint32_t DSpGetFrontBufferCGrafPtr(DSpContextPrivate *ctx)
 		return ctx->front_cgrafptr_mac_addr;
 	}
 
+	const uint32_t front_depth =
+	    DSpFrontBufferDepth(ctx->attr.backBufferBestDepth,
+	                        ctx->attr.displayBestDepth);
 	const uint32_t w = ctx->attr.displayWidth;
 	const uint32_t h = ctx->attr.displayHeight;
 	const uint32_t row_bytes =
-	    DSpFrontBufferRowBytes(w, ctx->attr.backBufferBestDepth,
+	    DSpFrontBufferRowBytes(w,
+	                           ctx->attr.backBufferBestDepth,
 	                           ctx->attr.displayBestDepth);
 	const uint32_t buffer_size = row_bytes * h;
 
-	uint32_t baseAddr_mac = DSpEnsureFrontBufferStaging(
-		ctx,
-		row_bytes,
-		h,
-		front_depth,
-		"DSpGetFrontBufferCGrafPtr");
+	uint32_t baseAddr_mac = DSpEnsureFrontBufferStaging(ctx,
+	                                                    row_bytes,
+	                                                    h,
+	                                                    front_depth,
+	                                                    "DSpGetFrontBufferCGrafPtr");
 	if (baseAddr_mac == 0) {
 		DSP_LOG("DSpGetFrontBufferCGrafPtr: staging allocation unusable "
 		        "(size=%u, frontDepth=%u)",

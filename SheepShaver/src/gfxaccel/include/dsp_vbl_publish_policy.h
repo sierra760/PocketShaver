@@ -18,4 +18,10 @@ static inline bool DSpShouldPublishActiveContextOnVBL(uint32_t active_owner,
 	return has_presentable_front_staging;
 }
 
+static inline bool DSpShouldFlushNQDBeforeStagingDrain(bool has_back_buffer_staging,
+                                                       bool has_presentable_front_staging)
+{
+	return has_back_buffer_staging || has_presentable_front_staging;
+}
+
 #endif /* DSP_VBL_PUBLISH_POLICY_H */

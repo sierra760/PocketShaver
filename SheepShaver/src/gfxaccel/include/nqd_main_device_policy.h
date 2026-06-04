@@ -20,6 +20,21 @@ static inline bool NQDIsSupportedPixMapDepth(uint32_t pixel_size)
 	       pixel_size == 8 || pixel_size == 16 || pixel_size == 32;
 }
 
+static inline bool NQDIsPackedMainDeviceAlias(
+    NQDMainDevicePixMapSnapshot snap,
+    uint32_t dest_base,
+    int32_t dest_row_bytes,
+    uint32_t packet_pixel_size)
+{
+	if (!snap.valid || dest_base != snap.baseAddr) return false;
+	if (dest_row_bytes <= 0) return false;
+	if (dest_row_bytes == (int32_t)snap.rowBytes) return false;
+	if (!NQDIsSupportedPixMapDepth(packet_pixel_size)) return false;
+	if (!NQDIsSupportedPixMapDepth(snap.pixelSize)) return false;
+	if (packet_pixel_size >= 8) return false;
+	return snap.pixelSize == 16 || snap.pixelSize == 32;
+}
+
 static inline bool NQDShouldDropStaleMainDeviceParams(
     NQDMainDevicePixMapSnapshot snap,
     uint32_t dest_base,
@@ -28,6 +43,10 @@ static inline bool NQDShouldDropStaleMainDeviceParams(
 {
 	if (!snap.valid || dest_base != snap.baseAddr) return false;
 	if (!NQDIsSupportedPixMapDepth(snap.pixelSize)) return false;
+	if (NQDIsPackedMainDeviceAlias(snap, dest_base, dest_row_bytes,
+	                               pixel_size)) {
+		return false;
+	}
 	return dest_row_bytes != (int32_t)snap.rowBytes;
 }
 
@@ -39,7 +58,11 @@ static inline uint32_t NQDEffectiveMainDevicePixelSize(
 {
 	if (!snap.valid || dest_base != snap.baseAddr) return packet_pixel_size;
 	if (!NQDIsSupportedPixMapDepth(snap.pixelSize)) return packet_pixel_size;
-	if (dest_row_bytes != (int32_t)snap.rowBytes) return packet_pixel_size;
+	if (dest_row_bytes != (int32_t)snap.rowBytes &&
+	    !NQDIsPackedMainDeviceAlias(snap, dest_base, dest_row_bytes,
+	                                packet_pixel_size)) {
+		return packet_pixel_size;
+	}
 	return snap.pixelSize;
 }
 

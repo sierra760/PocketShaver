@@ -304,11 +304,13 @@ int32_t DSpStartupHandler(void)
 	 *    engine via this module (not via DMC-direct subscription).
 	 */
 	if (dsp_startup_refcount == 0) {
+		if (!dsp_registered) {
+			DSpInit();
+		}
 		DSpRegisterResourceHandlers();
-		/* Mirror dsp_registered so a test that called dsp_testing_reset()
-		 * (refcount-0 clean slate) sees DSpIsRegistered() == true after
-		 * a bare Startup. Matches the DSp 1.7 contract that Startup is
-		 * the authoritative init entry point. */
+		/* Mirror dsp_registered for the already-initialized path. A
+		 * post-Shutdown restart takes the DSpInit path above, which also
+		 * rebuilds the mode cache cleared by final Shutdown. */
 		dsp_registered = true;
 		DSP_LOG("DSpStartupHandler: first-call init complete");
 	}

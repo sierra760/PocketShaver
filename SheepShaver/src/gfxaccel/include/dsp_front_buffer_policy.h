@@ -16,6 +16,15 @@ static inline uint32_t DSpFrontBufferDepth(uint32_t back_buffer_depth,
 	return DSpDisplayModeDepth(back_buffer_depth, display_depth);
 }
 
+static inline bool DSpShouldReuseBackBufferCGrafPtrForFrontBuffer(
+	uint32_t back_buffer_depth,
+	uint32_t display_depth)
+{
+	(void)back_buffer_depth;
+	(void)display_depth;
+	return false;
+}
+
 static inline uint32_t DSpFrontBufferRowBytes(uint32_t width,
                                               uint32_t back_buffer_depth,
                                               uint32_t display_depth)
@@ -30,10 +39,10 @@ static inline bool DSpShouldPresentFrontBufferStaging(uint32_t back_buffer_depth
                                                       uint32_t front_staging_mac_addr,
                                                       uint32_t front_staging_size)
 {
+	(void)back_buffer_depth;
+	(void)display_depth;
 	return front_staging_mac_addr != 0 &&
-	       front_staging_size != 0 &&
-	       DSpFrontBufferDepth(back_buffer_depth, display_depth) !=
-	           back_buffer_depth;
+	       front_staging_size != 0;
 }
 
 static inline bool DSpShouldPresentFrontBufferStagingForState(

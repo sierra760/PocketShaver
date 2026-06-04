@@ -493,6 +493,15 @@ static inline bool nqd_should_drop_stale_main_device_params(NQDMainDevicePixMapS
                                               pixel_size);
 }
 
+static inline bool nqd_is_packed_main_device_alias(NQDMainDevicePixMapSnapshot snap,
+                                                    uint32_t dest_base,
+                                                    int32_t dest_row_bytes,
+                                                    uint32_t pixel_size)
+{
+    return NQDIsPackedMainDeviceAlias(snap, dest_base, dest_row_bytes,
+                                      pixel_size);
+}
+
 static inline bool nqd_should_use_cpu_packed_main_device_path(NQDMainDevicePixMapSnapshot snap,
                                                                uint32_t dest_base,
                                                                int32_t dest_row_bytes,
@@ -1712,16 +1721,28 @@ void NQDMetalBitblt(uint32 p)
             src_row_bytes, dest_row_bytes);
 
     NQDMainDevicePixMapSnapshot main_device = nqd_read_main_device_pixmap_snapshot();
-    if (nqd_should_drop_stale_main_device_params(main_device, dest_base,
-                                                 dest_row_bytes,
-                                                 dest_pixel_size)) {
-        NQD_LOG("NQDMetalBitblt: dropped stale MainDevice params "
-                "(base=0x%08x bits_per_pixel=%u dst_rb=%d)",
-                dest_base, dest_pixel_size, dest_row_bytes);
-        return;
-    }
     uint32_t packet_src_pixel_size = src_pixel_size;
     uint32_t packet_dest_pixel_size = dest_pixel_size;
+    int32 packet_dest_row_bytes = dest_row_bytes;
+    bool dest_packed_main_device_alias =
+        nqd_is_packed_main_device_alias(main_device, dest_base,
+                                        dest_row_bytes,
+                                        packet_dest_pixel_size);
+    if (nqd_should_drop_stale_main_device_params(main_device, dest_base,
+                                                 dest_row_bytes,
+                                                 packet_dest_pixel_size)) {
+        NQD_LOG("NQDMetalBitblt: dropped stale MainDevice params "
+                "(base=0x%08x bits_per_pixel=%u dst_rb=%d)",
+                dest_base, packet_dest_pixel_size, dest_row_bytes);
+        return;
+    }
+    if (dest_packed_main_device_alias) {
+        dest_row_bytes = (int32)main_device.rowBytes;
+        NQD_LOG("NQDMetalBitblt: redirected packed MainDevice dest alias "
+                "(packet_bits=%u live_bits=%u packet_rb=%d live_rb=%d)",
+                packet_dest_pixel_size, main_device.pixelSize,
+                packet_dest_row_bytes, dest_row_bytes);
+    }
     src_pixel_size = nqd_effective_main_device_pixel_size(main_device,
                                                           src_base,
                                                           src_row_bytes,
@@ -2423,13 +2444,25 @@ void NQDMetalFillRect(uint32 p)
             pen_mode, dest_base, dest_row_bytes);
 
     NQDMainDevicePixMapSnapshot main_device = nqd_read_main_device_pixmap_snapshot();
-    if (nqd_should_drop_stale_main_device_params(main_device, dest_base, dest_row_bytes, pixel_size)) {
+    uint32_t packet_pixel_size = pixel_size;
+    int32 packet_dest_row_bytes = dest_row_bytes;
+    bool dest_packed_main_device_alias =
+        nqd_is_packed_main_device_alias(main_device, dest_base,
+                                        dest_row_bytes,
+                                        packet_pixel_size);
+    if (nqd_should_drop_stale_main_device_params(main_device, dest_base, dest_row_bytes, packet_pixel_size)) {
         NQD_LOG("NQDMetalFillRect: dropped stale MainDevice params "
                 "(base=0x%08x bits_per_pixel=%u rb=%d)",
-                dest_base, pixel_size, dest_row_bytes);
+                dest_base, packet_pixel_size, dest_row_bytes);
         return;
     }
-    uint32_t packet_pixel_size = pixel_size;
+    if (dest_packed_main_device_alias) {
+        dest_row_bytes = (int32)main_device.rowBytes;
+        NQD_LOG("NQDMetalFillRect: redirected packed MainDevice dest alias "
+                "(packet_bits=%u live_bits=%u packet_rb=%d live_rb=%d)",
+                packet_pixel_size, main_device.pixelSize,
+                packet_dest_row_bytes, dest_row_bytes);
+    }
     pixel_size = nqd_effective_main_device_pixel_size(main_device, dest_base,
                                                       dest_row_bytes, pixel_size);
     if (pixel_size != packet_pixel_size) {
