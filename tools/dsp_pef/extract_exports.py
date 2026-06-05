@@ -18,14 +18,13 @@
 #  along with this program; if not, write to the Free Software
 #  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
-#  Phase 22.5.1 Plan 22.5.1-01 (D-01/D-02/D-03). Host-side, OFFLINE, no ROM,
-#  no device. Parses the classic PEF/CFM container loader section export hash
-#  table of resources/DrawSprocketLib and emits the machine-readable export
-#  manifest (dsp_export_set.json shape) that gates the install-table drift
-#  detector. Reproducible in research + CI: stdlib-only (struct, hashlib,
-#  json), no external packages (threat T-22.5.1-SC trivially satisfied).
+#  Host-side, OFFLINE, no ROM, no device. Parses the classic PEF/CFM container
+#  loader section export hash table of resources/DrawSprocketLib and emits the
+#  machine-readable export manifest (dsp_export_set.json shape) that gates the
+#  install-table drift detector. Reproducible in research + CI: stdlib-only
+#  (struct, hashlib, json), no external packages.
 #
-#  Recipe (22.5.1-RESEARCH §"Decompile Tooling Recipe / Step 1"):
+#  Recipe:
 #    1. PEF Container Header @0 (40 bytes): tag1 "Joy!", tag2 "peff",
 #       architecture "pwpc", sectionCount u16 @ +32.
 #    2. Section Headers @40, stride 28: find sectionKind == 4 (Loader);
@@ -176,7 +175,7 @@ def main(argv):
 		"exported_symbol_count": count,
 		"exports": exports,
 		"generated_by": GENERATED_BY,
-		"notes": "Ground truth for the dsp_install_symbols[] drift gate (D-03). "
+		"notes": "Ground truth for the dsp_install_symbols[] drift gate. "
 		         "Regenerate offline with: python3 %s %s"
 		         % (GENERATED_BY, SOURCE_BINARY),
 	}

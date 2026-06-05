@@ -9,7 +9,7 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
  *
- *  Display-link abstraction that phase-locks frame presentation to the
+ *  Display-link abstraction that synchronizes frame presentation to the
  *  device's native refresh rate.  Wraps CAMetalDisplayLink on iOS 17+
  *  (delivers drawable + target presentation timestamp) and falls back to
  *  CADisplayLink on iOS 13.4-16 (delivers timing only; caller must use

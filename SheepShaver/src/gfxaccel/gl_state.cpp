@@ -25,7 +25,16 @@
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "macos_util.h"
+#include "video.h"
+#include "dsp_draw_context.h"
+#include "gl_clip_plane_policy.h"
+#include "gl_color_index_policy.h"
 #include "gl_engine.h"
+#include "gl_metal_draw_state.h"
+#include "gl_offscreen_policy.h"
+#include "gl_pixel_unpack_policy.h"
+
+extern bool RaveGetLastCL8ColorTableRGBSnapshot(uint8_t outRGB[768]);
 
 // =========================================================================
 //  GL enum constants (from gl.h / glext.h)
@@ -409,18 +418,38 @@
 // Pixel format enums
 #define GL_RGBA                           0x1908
 #define GL_RGB                            0x1907
+#define GL_RED                            0x1903
+#define GL_GREEN                          0x1904
+#define GL_BLUE                           0x1905
 #define GL_LUMINANCE                      0x1909
 #define GL_LUMINANCE_ALPHA                0x190A
 #define GL_ALPHA_FORMAT                   0x1906
+#define GL_COLOR_INDEX                    0x1900
+#define GL_ABGR_EXT                       0x8000
+#define GL_BGR_EXT                        0x80E0
 #define GL_BGRA_EXT                       0x80E1
+#define GL_INTENSITY_EXT                  0x8049
 
 // Pixel type enums
+#define GL_BYTE                           0x1400
 #define GL_UNSIGNED_BYTE                  0x1401
+#define GL_SHORT                          0x1402
 #define GL_UNSIGNED_INT                   0x1405
+#define GL_INT                            0x1404
 #define GL_FLOAT                          0x1406
+#define GL_UNSIGNED_SHORT                 0x1403
+#define GL_UNSIGNED_BYTE_3_3_2            0x8032
 #define GL_UNSIGNED_SHORT_4_4_4_4         0x8033
 #define GL_UNSIGNED_SHORT_5_6_5           0x8363
 #define GL_UNSIGNED_SHORT_5_5_5_1         0x8034
+#define GL_UNSIGNED_INT_8_8_8_8           0x8035
+#define GL_UNSIGNED_INT_10_10_10_2        0x8036
+#define GL_UNSIGNED_BYTE_2_3_3_REV        0x8362
+#define GL_UNSIGNED_SHORT_5_6_5_REV       0x8364
+#define GL_UNSIGNED_SHORT_4_4_4_4_REV     0x8365
+#define GL_UNSIGNED_SHORT_1_5_5_5_REV     0x8366
+#define GL_UNSIGNED_INT_8_8_8_8_REV       0x8367
+#define GL_UNSIGNED_INT_2_10_10_10_REV    0x8368
 
 // Internal format aliases (GL 1.1+ numeric)
 #define GL_RGBA8                          0x8058
@@ -455,11 +484,6 @@ static uint32_t gl_string_vendor_addr   = 0;
 static uint32_t gl_string_renderer_addr = 0;
 static uint32_t gl_string_version_addr  = 0;
 static uint32_t gl_string_extensions_addr = 0;
-
-// Flag for deferred clear
-static bool gl_clear_pending = false;
-static uint32_t gl_clear_mask_bits = 0;
-
 
 // =========================================================================
 //  Inline 4x4 matrix math -- column-major (GL convention)
@@ -809,6 +833,32 @@ void NativeGLOrtho(GLContext *ctx, double l, double r, double b, double t, doubl
 // Forward declarations for evaluator helpers (defined in evaluator section below)
 static int gl_eval_target_index(uint32_t target);
 
+static inline int gl_clamp_texture_unit(int unit)
+{
+	if (unit < 0) return 0;
+	if (unit > 3) return 3;
+	return unit;
+}
+
+static inline void gl_clear_prepared_texture_2d_for_draw(GLContext *ctx, int unit)
+{
+	unit = gl_clamp_texture_unit(unit);
+	ctx->prepared_texture_2d_for_draw[unit] = false;
+}
+
+static inline void gl_clear_latched_texture_2d_for_array_draw(GLContext *ctx, int unit)
+{
+	unit = gl_clamp_texture_unit(unit);
+	ctx->latched_texture_2d_for_array_draw[unit] = false;
+}
+
+static inline void gl_invalidate_prepared_texcoord_array_for_draw(GLContext *ctx, int unit)
+{
+	unit = gl_clamp_texture_unit(unit);
+	ctx->prepared_texcoord_array_for_draw[unit] = false;
+	ctx->prepared_texcoord_array[unit].pointer = 0;
+}
+
 static void gl_set_cap(GLContext *ctx, uint32_t cap, bool value)
 {
 	switch (cap) {
@@ -824,7 +874,32 @@ static void gl_set_cap(GLContext *ctx, uint32_t cap, bool value)
 	case GL_COLOR_MATERIAL:       ctx->color_material_enabled = value; break;
 	case GL_STENCIL_TEST:         ctx->stencil_test = value; break;
 	case GL_TEXTURE_1D:           ctx->tex_units[ctx->active_texture].enabled_1d = value; break;
-	case GL_TEXTURE_2D:           ctx->tex_units[ctx->active_texture].enabled_2d = value; break;
+	case GL_TEXTURE_2D: {
+		const int unit = gl_clamp_texture_unit(ctx->active_texture);
+		GLTextureUnit &texUnit = ctx->tex_units[unit];
+		if (value) {
+			texUnit.enabled_2d = true;
+			ctx->texture_2d_enable_draw_serial[unit] = ctx->completed_draw_serial;
+			ctx->prepared_texture_2d_for_draw[unit] = false;
+		} else {
+			const bool hadResource =
+				texUnit.enabled_2d && texUnit.bound_texture_2d != 0;
+			const bool preparedSurvivesDisable =
+				GLMetalPreparedDrawStateSurvivesDisable(
+					ctx->texture_2d_enable_draw_serial[unit],
+					ctx->completed_draw_serial,
+					hadResource);
+			const bool latchSurvivesDisable =
+				GLMetalLatchedTexture2DSurvivesDisable(
+					ctx->texture_2d_enable_draw_serial[unit],
+					ctx->completed_draw_serial,
+					hadResource);
+			ctx->prepared_texture_2d_for_draw[unit] = preparedSurvivesDisable;
+			ctx->latched_texture_2d_for_array_draw[unit] = latchSurvivesDisable;
+			texUnit.enabled_2d = false;
+		}
+		break;
+	}
 	case GL_POLYGON_OFFSET_FILL:  ctx->polygon_offset_fill = value; break;
 	case GL_POLYGON_OFFSET_LINE:  ctx->polygon_offset_line = value; break;
 	case GL_POLYGON_OFFSET_POINT: ctx->polygon_offset_point = value; break;
@@ -1052,11 +1127,11 @@ void NativeGLClear(GLContext *ctx, uint32_t mask)
 			}
 		}
 	}
-	// Defer Metal clear bits to render time
-	uint32_t metal_bits = mask & ~GL_ACCUM_BUFFER_BIT;
-	if (metal_bits) {
-		gl_clear_pending = true;
-		gl_clear_mask_bits = metal_bits;
+	if (GLShouldApplyAttachmentClear(mask)) {
+		if (!ctx->metal) {
+			GLMetalInit(ctx);
+		}
+		GLMetalClear(ctx, mask);
 	}
 }
 
@@ -1756,11 +1831,22 @@ uint32_t NativeGLGetString(GLContext *ctx, uint32_t name)
 	// GLARBExtensionTests gate tests assert the token's absence. (The umbrella token is
 	// intentionally NOT spelled out as a literal here so the source-scan absence assertion
 	// stays robust — same robustness discipline as the COMBINE de-advertisement.)
-	case GL_EXTENSIONS: return alloc_string(gl_string_extensions_addr,
-		"GL_ARB_multitexture GL_ARB_transpose_matrix GL_ARB_texture_compression "
-		"GL_EXT_blend_color GL_EXT_blend_equation GL_EXT_compiled_vertex_array "
-		"GL_EXT_secondary_color GL_EXT_stencil_wrap "
-		"GL_EXT_fog_coord GL_EXT_texture_lod_bias");
+	case GL_EXTENSIONS: {
+		static const char *extensions =
+			"GL_ARB_multitexture GL_ARB_transpose_matrix GL_ARB_texture_compression "
+			"GL_EXT_blend_color GL_EXT_blend_equation GL_EXT_compiled_vertex_array "
+			"GL_EXT_secondary_color GL_EXT_stencil_wrap "
+			"GL_EXT_fog_coord GL_EXT_texture_lod_bias GL_EXT_paletted_texture";
+		if (gl_logging_enabled) {
+			static bool s_logged_extensions = false;
+			if (!s_logged_extensions) {
+				s_logged_extensions = true;
+				fprintf(stderr, "GL: GetString(GL_EXTENSIONS) -> %s\n", extensions);
+				fflush(stderr);
+			}
+		}
+		return alloc_string(gl_string_extensions_addr, extensions);
+	}
 	default:
 		return 0;
 	}
@@ -1900,6 +1986,10 @@ void NativeGLPopAttrib(GLContext *ctx)
 		ctx->cull_face_enabled = entry.cull_face;
 		ctx->lighting_enabled  = entry.lighting;
 		ctx->tex_units[ctx->active_texture].enabled_2d = entry.texture_2d;
+		gl_clear_prepared_texture_2d_for_draw(ctx, ctx->active_texture);
+		gl_clear_latched_texture_2d_for_array_draw(ctx, ctx->active_texture);
+		ctx->texture_2d_enable_draw_serial[ctx->active_texture] =
+			ctx->completed_draw_serial;
 		ctx->alpha_test        = entry.alpha_test;
 		ctx->scissor_test      = entry.scissor_test;
 		ctx->stencil_test      = entry.stencil_test;
@@ -2023,6 +2113,10 @@ void NativeGLPopClientAttrib(GLContext *ctx)
 		ctx->normal_array = gl_saved_normal_array;
 		ctx->color_array  = gl_saved_color_array;
 		memcpy(ctx->texcoord_array, gl_saved_texcoord_array, sizeof(gl_saved_texcoord_array));
+		for (int u = 0; u < 4; u++) {
+			ctx->texcoord_array_enable_draw_serial[u] = ctx->completed_draw_serial;
+			ctx->prepared_texcoord_array_for_draw[u] = false;
+		}
 	}
 	if (gl_client_attrib_mask & GL_CLIENT_PIXEL_STORE_BIT) {
 		ctx->pixel_store = gl_saved_pixel_store;
@@ -2140,7 +2234,13 @@ void GLContextInit(GLContext *ctx)
 		ctx->tex_units[u].env_mode = GL_MODULATE;
 		ctx->tex_units[u].env_color[3] = 1.0f;
 		ctx->tex_units[u].current_texcoord[3] = 1.0f;
+		ctx->texture_2d_enable_draw_serial[u] = 0;
+		ctx->texcoord_array_enable_draw_serial[u] = 0;
+		ctx->prepared_texture_2d_for_draw[u] = false;
+		ctx->latched_texture_2d_for_array_draw[u] = false;
+		ctx->prepared_texcoord_array_for_draw[u] = false;
 	}
+	ctx->completed_draw_serial = 0;
 
 	// Pixel store defaults
 	ctx->pixel_store.pack_alignment   = 4;
@@ -2252,8 +2352,11 @@ void NativeGLDeleteTextures(GLContext *ctx, uint32_t n, uint32_t mac_ptr)
 
 			// Unbind from any texture unit if bound
 			for (int u = 0; u < 4; u++) {
-				if (ctx->tex_units[u].bound_texture_2d == name)
+				if (ctx->tex_units[u].bound_texture_2d == name) {
 					ctx->tex_units[u].bound_texture_2d = 0;
+					gl_clear_prepared_texture_2d_for_draw(ctx, u);
+					gl_clear_latched_texture_2d_for_array_draw(ctx, u);
+				}
 				if (ctx->tex_units[u].bound_texture_1d == name)
 					ctx->tex_units[u].bound_texture_1d = 0;
 			}
@@ -2273,10 +2376,13 @@ void NativeGLBindTexture(GLContext *ctx, uint32_t target, uint32_t texture)
 
 	if (texture == 0) {
 		// Unbind: use default (no texture)
-		if (target == GL_TEXTURE_2D)
+		if (target == GL_TEXTURE_2D) {
 			ctx->tex_units[ctx->active_texture].bound_texture_2d = 0;
-		else if (target == GL_TEXTURE_1D)
+			gl_clear_prepared_texture_2d_for_draw(ctx, ctx->active_texture);
+			gl_clear_latched_texture_2d_for_array_draw(ctx, ctx->active_texture);
+		} else if (target == GL_TEXTURE_1D) {
 			ctx->tex_units[ctx->active_texture].bound_texture_1d = 0;
+		}
 		return;
 	}
 
@@ -2293,10 +2399,19 @@ void NativeGLBindTexture(GLContext *ctx, uint32_t target, uint32_t texture)
 		ctx->texture_objects[texture] = obj;
 	}
 
-	if (target == GL_TEXTURE_2D)
+	if (target == GL_TEXTURE_2D) {
+		if (ctx->tex_units[ctx->active_texture].bound_texture_2d != texture) {
+			gl_clear_prepared_texture_2d_for_draw(ctx, ctx->active_texture);
+			if (!GLMetalLatchedTexture2DSurvivesTextureRebind(
+					ctx->latched_texture_2d_for_array_draw[ctx->active_texture],
+					texture != 0)) {
+				gl_clear_latched_texture_2d_for_array_draw(ctx, ctx->active_texture);
+			}
+		}
 		ctx->tex_units[ctx->active_texture].bound_texture_2d = texture;
-	else if (target == GL_TEXTURE_1D)
+	} else if (target == GL_TEXTURE_1D) {
 		ctx->tex_units[ctx->active_texture].bound_texture_1d = texture;
+	}
 }
 
 
@@ -2391,6 +2506,234 @@ static int ComputeRowStride(int width, int bytesPerPixel, int alignment, int row
 	return rowBytes;
 }
 
+static uint8_t ReadScalarComponentTo8(uint32_t addr, uint32_t type)
+{
+	switch (type) {
+		case GL_UNSIGNED_BYTE:
+			return GLPixelScaleUnsignedTo8(ReadMacInt8(addr), 8);
+		case GL_BYTE:
+			return GLPixelScaleSignedTo8((int8_t)ReadMacInt8(addr), 8);
+		case GL_UNSIGNED_SHORT:
+			return GLPixelScaleUnsignedTo8(ReadMacInt16(addr), 16);
+		case GL_SHORT:
+			return GLPixelScaleSignedTo8((int16_t)ReadMacInt16(addr), 16);
+		case GL_UNSIGNED_INT:
+			return GLPixelScaleUnsignedTo8(ReadMacInt32(addr), 32);
+		case GL_INT:
+			return GLPixelScaleSignedTo8((int32_t)ReadMacInt32(addr), 32);
+		case GL_FLOAT: {
+			const uint32_t bits = ReadMacInt32(addr);
+			float value = 0.0f;
+			std::memcpy(&value, &bits, sizeof(value));
+			if (!(value > 0.0f)) return 0;
+			if (value >= 1.0f) return 0xffu;
+			return (uint8_t)(value * 255.0f + 0.5f);
+		}
+		default:
+			return 0;
+	}
+}
+
+static uint8_t ReadColorIndexTo8(uint32_t addr, uint32_t type)
+{
+	switch (type) {
+		case GL_UNSIGNED_BYTE:
+			return (uint8_t)ReadMacInt8(addr);
+		case GL_BYTE: {
+			const int32_t value = (int8_t)ReadMacInt8(addr);
+			return value > 0 ? (uint8_t)value : 0;
+		}
+		case GL_UNSIGNED_SHORT: {
+			const uint32_t value = ReadMacInt16(addr);
+			return value > 0xffu ? 0xffu : (uint8_t)value;
+		}
+		case GL_SHORT: {
+			const int32_t value = (int16_t)ReadMacInt16(addr);
+			if (value <= 0) return 0;
+			return value > 0xff ? 0xffu : (uint8_t)value;
+		}
+		case GL_UNSIGNED_INT: {
+			const uint32_t value = ReadMacInt32(addr);
+			return value > 0xffu ? 0xffu : (uint8_t)value;
+		}
+		case GL_INT: {
+			const int32_t value = (int32_t)ReadMacInt32(addr);
+			if (value <= 0) return 0;
+			return value > 0xff ? 0xffu : (uint8_t)value;
+		}
+		case GL_FLOAT: {
+			const uint32_t bits = ReadMacInt32(addr);
+			float value = 0.0f;
+			std::memcpy(&value, &bits, sizeof(value));
+			if (!(value > 0.0f)) return 0;
+			if (value >= 255.0f) return 0xffu;
+			return (uint8_t)(value + 0.5f);
+		}
+		default:
+			return 0;
+	}
+}
+
+static bool ConvertPackedPixelToBGRA8(uint32_t pixAddr,
+                                      uint32_t format,
+                                      uint32_t type,
+                                      uint8_t out[4])
+{
+	switch (type) {
+		case GL_UNSIGNED_BYTE_3_3_2:
+			GLPixelUnpackRGB332ToBGRA(
+				(uint8_t)ReadMacInt8(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_BYTE_2_3_3_REV:
+			GLPixelUnpackRGB332ToBGRA(
+				(uint8_t)ReadMacInt8(pixAddr), true, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_5_6_5:
+			GLPixelUnpackRGB565ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_5_6_5_REV:
+			GLPixelUnpackRGB565ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), true, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_4_4_4_4:
+			GLPixelUnpackRGBA4444ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_4_4_4_4_REV:
+			GLPixelUnpackRGBA4444ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), true, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_5_5_5_1:
+			GLPixelUnpackRGBA5551ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_SHORT_1_5_5_5_REV:
+			GLPixelUnpackRGBA5551ToBGRA(
+				(uint16_t)ReadMacInt16(pixAddr), true, format, out);
+			return true;
+		case GL_UNSIGNED_INT_8_8_8_8:
+			GLPixelUnpackRGBA8888ToBGRA(
+				ReadMacInt32(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_INT_8_8_8_8_REV:
+			GLPixelUnpackRGBA8888ToBGRA(
+				ReadMacInt32(pixAddr), true, format, out);
+			return true;
+		case GL_UNSIGNED_INT_10_10_10_2:
+			GLPixelUnpackRGBA1010102ToBGRA(
+				ReadMacInt32(pixAddr), false, format, out);
+			return true;
+		case GL_UNSIGNED_INT_2_10_10_10_REV:
+			GLPixelUnpackRGBA1010102ToBGRA(
+				ReadMacInt32(pixAddr), true, format, out);
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool ConvertScalarPixelToBGRA8(uint32_t pixAddr,
+                                      uint32_t format,
+                                      uint32_t type,
+                                      uint8_t out[4])
+{
+	const int componentCount = GLPixelFormatComponentCount(format);
+	const int scalarBytes = GLPixelScalarTypeBytes(type);
+	if (componentCount <= 0 || scalarBytes <= 0 ||
+	    format == GL_COLOR_INDEX) {
+		return false;
+	}
+
+	GLPixelInitBGRA(out);
+	for (int i = 0; i < componentCount; i++) {
+		GLPixelStoreComponentToBGRA(
+			GLPixelFormatComponentAt(format, i),
+			ReadScalarComponentTo8(pixAddr + i * scalarBytes, type),
+			out);
+	}
+	return true;
+}
+
+static bool GLDetectLegacyUnsignedShortPaletteIndexTexture(uint32_t srcBase,
+                                                           int width,
+                                                           int height,
+                                                           int srcBpp,
+                                                           int rowStride,
+                                                           bool useMacVideoPalette,
+                                                           bool hasExplicitPalette)
+{
+	if (srcBase == 0 || width <= 0 || height <= 0 || srcBpp != 2)
+		return false;
+
+	const int sampleXCount = width >= 4 ? 4 : width;
+	const int sampleYCount = height >= 4 ? 4 : height;
+	GLPixelLegacyUnsignedShortIndexStats stats;
+	GLPixelLegacyUnsignedShortIndexStatsInit(&stats);
+
+	for (int sy = 0; sy < sampleYCount; sy++) {
+		const int y =
+			(sampleYCount == 1) ? 0 : (sy * (height - 1)) / (sampleYCount - 1);
+		for (int sx = 0; sx < sampleXCount; sx++) {
+			const int x =
+				(sampleXCount == 1) ? 0 : (sx * (width - 1)) / (sampleXCount - 1);
+			const uint32_t pixAddr = srcBase + y * rowStride + x * srcBpp;
+			const uint16_t word = (uint16_t)ReadMacInt16(pixAddr);
+			GLPixelLegacyUnsignedShortIndexStatsAddWord(&stats, word);
+		}
+	}
+
+	if (useMacVideoPalette) {
+		return GLPixelLegacyUnsignedShortShouldUseMacVideoPalette(
+			stats.sampled_words,
+			stats.duplicated_byte_words,
+			stats.non_extreme_duplicated_byte_words,
+			hasExplicitPalette);
+	}
+
+	return GLPixelLegacyUnsignedShortIndexStatsShouldUsePalette(&stats);
+}
+
+static bool GLDetectLegacyUnsignedShortExactDuplicatedByteTexture(
+	uint32_t srcBase,
+	int width,
+	int height,
+	int srcBpp,
+	int rowStride,
+	bool hasExplicitPalette,
+	GLPixelLegacyUnsignedShortIndexStats *outStats)
+{
+	GLPixelLegacyUnsignedShortIndexStats stats;
+	GLPixelLegacyUnsignedShortIndexStatsInit(&stats);
+	if (srcBase != 0 && width > 0 && height > 0 && srcBpp == 2) {
+		for (int y = 0; y < height; y++) {
+			const uint32_t rowAddr = srcBase + y * rowStride;
+			for (int x = 0; x < width; x++) {
+				const uint16_t word =
+					(uint16_t)ReadMacInt16(rowAddr + x * srcBpp);
+				GLPixelLegacyUnsignedShortIndexStatsAddWord(&stats, word);
+			}
+		}
+	}
+
+	if (outStats != nullptr)
+		*outStats = stats;
+
+	return !hasExplicitPalette &&
+	       stats.sampled_words >= 4 &&
+	       stats.duplicated_byte_words == stats.sampled_words &&
+	       stats.non_extreme_duplicated_byte_words >= 2;
+}
+
+static void GLGetMacVideoPaletteSnapshot(uint8_t outRGB[768])
+{
+	for (int i = 0; i < 256; i++) {
+		outRGB[i * 3 + 0] = mac_pal[i].red;
+		outRGB[i * 3 + 1] = mac_pal[i].green;
+		outRGB[i * 3 + 2] = mac_pal[i].blue;
+	}
+}
+
 
 /*
  *  Helper: convert GL pixel data from PPC memory to BGRA8 (Metal format)
@@ -2400,42 +2743,276 @@ static int ComputeRowStride(int width, int bytesPerPixel, int alignment, int row
  */
 static uint8_t *ConvertPixelsToBGRA8(uint32_t mac_pixels, int width, int height,
                                       uint32_t format, uint32_t type,
-                                      const GLPixelStore &ps, int *outLen)
+                                      const GLPixelStore &ps,
+                                      const GLContext *ctx,
+                                      int *outLen,
+                                      GLTextureObject *textureObject = nullptr,
+                                      int32_t textureLevel = 0,
+                                      bool updateTextureLegacyState = false)
 {
 	int dstBytes = width * height * 4;
 	uint8_t *dst = (uint8_t *)malloc(dstBytes);
 	if (!dst) { *outLen = 0; return nullptr; }
 	*outLen = dstBytes;
 
-	int srcBpp = 0;  // source bytes per pixel
-	switch (format) {
-		case GL_RGBA:
-		case GL_BGRA_EXT:
-			if (type == GL_UNSIGNED_BYTE) srcBpp = 4;
-			else if (type == GL_UNSIGNED_SHORT_4_4_4_4) srcBpp = 2;
-			else if (type == GL_UNSIGNED_SHORT_5_5_5_1) srcBpp = 2;
-			break;
-		case GL_RGB:
-			if (type == GL_UNSIGNED_BYTE) srcBpp = 3;
-			else if (type == GL_UNSIGNED_SHORT_5_6_5) srcBpp = 2;
-			break;
-		case GL_LUMINANCE:
-		case GL_ALPHA_FORMAT:
-			srcBpp = 1;
-			break;
-		case GL_LUMINANCE_ALPHA:
-			srcBpp = 2;
-			break;
-		default:
-			// Unsupported format -- fill with magenta for visibility
-			for (int i = 0; i < width * height; i++) {
-				dst[i*4+0] = 255; dst[i*4+1] = 0; dst[i*4+2] = 255; dst[i*4+3] = 255;
-			}
-			return dst;
+	int srcBpp = GLPixelSourceBytesPerPixel(format, type);
+	const bool legacyUnsignedShortPacked =
+		type == GL_UNSIGNED_SHORT && (format == GL_RGB || format == GL_RGBA);
+	if (srcBpp <= 0) {
+		// Unsupported format -- fill with magenta for visibility
+		for (int i = 0; i < width * height; i++) {
+			dst[i*4+0] = 255; dst[i*4+1] = 0; dst[i*4+2] = 255; dst[i*4+3] = 255;
+		}
+		return dst;
 	}
 
 	int rowStride = ComputeRowStride(width, srcBpp, ps.unpack_alignment, ps.unpack_row_length);
 	uint32_t srcBase = mac_pixels + ps.unpack_skip_rows * rowStride + ps.unpack_skip_pixels * srcBpp;
+	const bool hasExplicitColorIndexPalette =
+		ctx != nullptr &&
+		(ctx->color_table_enabled || ctx->color_tables[0].defined ||
+		 GLColorIndexPixelMapsDefined(ctx->pixel_map_i_to_r_size,
+		                             ctx->pixel_map_i_to_g_size,
+		                             ctx->pixel_map_i_to_b_size,
+		                             ctx->pixel_map_i_to_a_size));
+	uint8_t activeDSpCLUT[768];
+	uint8_t macVideoPalette[768];
+	uint8_t raveCL8Palette[768];
+	const bool canUseActiveDSpCLUT =
+		(format == GL_COLOR_INDEX || legacyUnsignedShortPacked) &&
+		!hasExplicitColorIndexPalette &&
+		DSpGetActiveCLUTSnapshot(activeDSpCLUT) == 0;
+	const bool raveCL8PaletteAvailable =
+		legacyUnsignedShortPacked &&
+		!hasExplicitColorIndexPalette &&
+		RaveGetLastCL8ColorTableRGBSnapshot(raveCL8Palette);
+	const bool canUseRaveCL8Palette =
+		raveCL8PaletteAvailable &&
+		GLPixelPaletteHasUsableColor(raveCL8Palette, 256);
+	const bool useActiveDSpCLUT = format == GL_COLOR_INDEX && canUseActiveDSpCLUT;
+	bool legacyUnsignedShortPaletteIndex = false;
+		bool legacyUnsignedShortBGR332 = false;
+	bool legacyUnsignedShortIndexGray = false;
+	const uint8_t *colorIndexPalette = useActiveDSpCLUT ? activeDSpCLUT : nullptr;
+	int colorIndexPaletteEntries = useActiveDSpCLUT ? 256 : 0;
+	const char *legacyPaletteSource = nullptr;
+	const bool forceLegacyUnsignedShortPaletteIndex =
+		legacyUnsignedShortPacked &&
+			textureObject != nullptr &&
+			textureLevel > 0 &&
+			textureObject->legacy_ushort_palette_index_chain;
+		const bool forceLegacyUnsignedShortBGR332 =
+			legacyUnsignedShortPacked &&
+			textureObject != nullptr &&
+			textureLevel > 0 &&
+			textureObject->legacy_ushort_bgr332_chain;
+	const bool forceLegacyUnsignedShortIndexGray =
+		legacyUnsignedShortPacked &&
+		textureObject != nullptr &&
+		textureLevel > 0 &&
+		textureObject->legacy_ushort_index_gray_chain;
+
+	if (legacyUnsignedShortPacked) {
+		if (forceLegacyUnsignedShortPaletteIndex) {
+			if (canUseActiveDSpCLUT) {
+				legacyUnsignedShortPaletteIndex = true;
+				colorIndexPalette = activeDSpCLUT;
+				colorIndexPaletteEntries = 256;
+				legacyPaletteSource = "active DSp CLUT mip-chain";
+			}
+			else if (canUseRaveCL8Palette) {
+				legacyUnsignedShortPaletteIndex = true;
+				colorIndexPalette = raveCL8Palette;
+				colorIndexPaletteEntries = 256;
+				legacyPaletteSource = "RAVE CL8 color table mip-chain";
+			}
+			else {
+				GLGetMacVideoPaletteSnapshot(macVideoPalette);
+				if (GLPixelPaletteHasUsableColor(macVideoPalette, 256)) {
+					legacyUnsignedShortPaletteIndex = true;
+					colorIndexPalette = macVideoPalette;
+					colorIndexPaletteEntries = 256;
+					legacyPaletteSource = "Mac video palette mip-chain";
+				}
+				else {
+					legacyUnsignedShortIndexGray = true;
+				}
+			}
+			static int s_legacyPaletteMipChainLogCount = 0;
+			if (gl_logging_enabled && s_legacyPaletteMipChainLogCount < 96) {
+				s_legacyPaletteMipChainLogCount++;
+				if (legacyUnsignedShortPaletteIndex) {
+					fprintf(stderr,
+					        "GL:   -> legacy ushort mip-chain texture: tex=%u level=%d "
+					        "%dx%d fmt=0x%x srcBase=0x%08x rowStride=%d using "
+					        "level-0 duplicated-byte palette%s%s\n",
+					        textureObject->name, textureLevel, width, height,
+					        format, srcBase, rowStride,
+					        legacyPaletteSource ? " from " : "",
+					        legacyPaletteSource ? legacyPaletteSource : "");
+				}
+				else {
+					fprintf(stderr,
+					        "GL:   -> legacy ushort mip-chain texture: tex=%u level=%d "
+					        "%dx%d fmt=0x%x srcBase=0x%08x rowStride=%d had "
+					        "level-0 duplicated-byte palette state but no usable "
+					        "palette; using index-gray fallback\n",
+					        textureObject->name, textureLevel, width, height,
+					        format, srcBase, rowStride);
+				}
+				fflush(stderr);
+			}
+		}
+			else if (forceLegacyUnsignedShortBGR332) {
+				GLPixelLegacyUnsignedShortIndexStats mipStats;
+				const bool mipStillDuplicated =
+					GLDetectLegacyUnsignedShortExactDuplicatedByteTexture(
+						srcBase, width, height, srcBpp, rowStride,
+						hasExplicitColorIndexPalette, &mipStats);
+				legacyUnsignedShortBGR332 = mipStillDuplicated;
+				static int s_legacyBGR332MipChainLogCount = 0;
+				if (gl_logging_enabled && s_legacyBGR332MipChainLogCount < 96) {
+					s_legacyBGR332MipChainLogCount++;
+					if (mipStillDuplicated) {
+						fprintf(stderr,
+						        "GL:   -> legacy ushort mip-chain texture: tex=%u level=%d "
+						        "%dx%d fmt=0x%x srcBase=0x%08x rowStride=%d confirmed "
+						        "duplicated-byte mip; using level-0 BGR332 fallback\n",
+						        textureObject->name, textureLevel, width, height,
+						        format, srcBase, rowStride);
+					}
+					else {
+						fprintf(stderr,
+						        "GL:   -> legacy ushort mip-chain texture: tex=%u level=%d "
+						        "%dx%d fmt=0x%x srcBase=0x%08x rowStride=%d skipped "
+						        "level-0 BGR332 fallback for mixed mip data "
+						        "(sampled=%d duplicated=%d nonExtreme=%d uniqueLow=%d "
+						        "lowRange=0x%02x..0x%02x)\n",
+					        textureObject->name, textureLevel, width, height,
+					        format, srcBase, rowStride,
+					        mipStats.sampled_words,
+					        mipStats.duplicated_byte_words,
+					        mipStats.non_extreme_duplicated_byte_words,
+					        mipStats.unique_low_byte_values,
+					        mipStats.min_low_byte,
+					        mipStats.max_low_byte);
+				}
+				fflush(stderr);
+			}
+		}
+		else if (forceLegacyUnsignedShortIndexGray) {
+			legacyUnsignedShortIndexGray = true;
+			static int s_legacyMipChainLogCount = 0;
+			if (gl_logging_enabled && s_legacyMipChainLogCount < 96) {
+				s_legacyMipChainLogCount++;
+				fprintf(stderr,
+				        "GL:   -> legacy ushort mip-chain texture: tex=%u level=%d "
+				        "%dx%d fmt=0x%x srcBase=0x%08x rowStride=%d using "
+				        "level-0 duplicated-byte index-gray fallback\n",
+				        textureObject->name, textureLevel, width, height,
+				        format, srcBase, rowStride);
+				fflush(stderr);
+			}
+		}
+		else if (canUseActiveDSpCLUT &&
+		    GLDetectLegacyUnsignedShortPaletteIndexTexture(srcBase, width, height,
+		                                                   srcBpp, rowStride,
+		                                                   false, false)) {
+			legacyUnsignedShortPaletteIndex = true;
+			colorIndexPalette = activeDSpCLUT;
+			colorIndexPaletteEntries = 256;
+			legacyPaletteSource = "active DSp CLUT";
+		}
+		else if (canUseRaveCL8Palette &&
+		    GLDetectLegacyUnsignedShortPaletteIndexTexture(srcBase, width, height,
+		                                                   srcBpp, rowStride,
+		                                                   false, false)) {
+			legacyUnsignedShortPaletteIndex = true;
+			colorIndexPalette = raveCL8Palette;
+			colorIndexPaletteEntries = 256;
+			legacyPaletteSource = "RAVE CL8 color table";
+		}
+		else if (GLDetectLegacyUnsignedShortPaletteIndexTexture(srcBase, width, height,
+		                                                        srcBpp, rowStride,
+		                                                        true,
+		                                                        hasExplicitColorIndexPalette)) {
+			GLGetMacVideoPaletteSnapshot(macVideoPalette);
+			if (GLPixelPaletteHasUsableColor(macVideoPalette, 256)) {
+				legacyUnsignedShortPaletteIndex = true;
+				colorIndexPalette = macVideoPalette;
+				colorIndexPaletteEntries = 256;
+				legacyPaletteSource = "Mac video palette";
+			}
+			else {
+				if (format == GL_RGB || format == GL_BGR_EXT) {
+					legacyUnsignedShortBGR332 = true;
+					static int s_legacyEmptyMacPaletteLogCount = 0;
+					if (gl_logging_enabled && s_legacyEmptyMacPaletteLogCount < 64) {
+						s_legacyEmptyMacPaletteLogCount++;
+						fprintf(stderr,
+						        "GL:   -> legacy ushort duplicated-index texture: %dx%d "
+						        "fmt=0x%x srcBase=0x%08x rowStride=%d ignored empty "
+						        "Mac video palette; using duplicated-byte BGR332 fallback\n",
+						        width, height, format, srcBase, rowStride);
+						fflush(stderr);
+					}
+				}
+				else if (gl_logging_enabled) {
+					static int s_legacyPackedFallbackLogCount = 0;
+					if (s_legacyPackedFallbackLogCount < 64) {
+						s_legacyPackedFallbackLogCount++;
+						fprintf(stderr,
+						        "GL:   -> legacy ushort duplicated-index-like texture: %dx%d "
+						        "fmt=0x%x srcBase=0x%08x rowStride=%d ignored empty "
+						        "Mac video palette; using native packed unsigned-short decode\n",
+						        width, height, format, srcBase, rowStride);
+						fflush(stderr);
+					}
+				}
+			}
+		}
+	}
+	if (legacyUnsignedShortPacked &&
+	    updateTextureLegacyState &&
+		    textureObject != nullptr &&
+		    textureLevel == 0) {
+		const bool previousPalette =
+			textureObject->legacy_ushort_palette_index_chain;
+			const bool previousBGR332 =
+				textureObject->legacy_ushort_bgr332_chain;
+		const bool previousGray =
+			textureObject->legacy_ushort_index_gray_chain;
+		textureObject->legacy_ushort_palette_index_chain =
+			legacyUnsignedShortPaletteIndex;
+			textureObject->legacy_ushort_bgr332_chain = legacyUnsignedShortBGR332;
+			textureObject->legacy_ushort_index_gray_chain = legacyUnsignedShortIndexGray;
+			if (gl_logging_enabled &&
+			    (previousPalette != legacyUnsignedShortPaletteIndex ||
+			     previousBGR332 != legacyUnsignedShortBGR332 ||
+			     previousGray != legacyUnsignedShortIndexGray)) {
+				fprintf(stderr,
+				        "GL:   -> legacy ushort texture state: tex=%u level-0 "
+				        "palette-index mip chain %s, BGR332 mip chain %s, "
+				        "index-gray mip chain %s\n",
+				        textureObject->name,
+				        legacyUnsignedShortPaletteIndex ? "enabled" : "disabled",
+				        legacyUnsignedShortBGR332 ? "enabled" : "disabled",
+				        legacyUnsignedShortIndexGray ? "enabled" : "disabled");
+				fflush(stderr);
+			}
+	}
+	if (legacyUnsignedShortPaletteIndex && gl_logging_enabled) {
+		static int s_legacyPaletteLogCount = 0;
+		if (s_legacyPaletteLogCount < 64) {
+			s_legacyPaletteLogCount++;
+			fprintf(stderr,
+			        "GL:   -> legacy ushort duplicated-index texture: %dx%d fmt=0x%x "
+			        "srcBase=0x%08x rowStride=%d using %s\n",
+			        width, height, format, srcBase, rowStride,
+			        legacyPaletteSource ? legacyPaletteSource : "palette");
+			fflush(stderr);
+		}
+	}
 
 	for (int y = 0; y < height; y++) {
 		uint32_t rowAddr = srcBase + y * rowStride;
@@ -2443,66 +3020,46 @@ static uint8_t *ConvertPixelsToBGRA8(uint32_t mac_pixels, int width, int height,
 			uint32_t pixAddr = rowAddr + x * srcBpp;
 			uint8_t *out = dst + (y * width + x) * 4;
 
-			if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) {
-				// PPC: R G B A -> Metal BGRA: B G R A
-				uint8_t r = ReadMacInt8(pixAddr + 0);
-				uint8_t g = ReadMacInt8(pixAddr + 1);
-				uint8_t b = ReadMacInt8(pixAddr + 2);
-				uint8_t a = ReadMacInt8(pixAddr + 3);
-				out[0] = b; out[1] = g; out[2] = r; out[3] = a;
+			if (format == GL_COLOR_INDEX) {
+				const uint8_t index = ReadColorIndexTo8(pixAddr, type);
+				if (ctx) {
+					GLColorIndexToBGRA8Resolved(index,
+						ctx->pixel_map_i_to_r, ctx->pixel_map_i_to_r_size,
+						ctx->pixel_map_i_to_g, ctx->pixel_map_i_to_g_size,
+						ctx->pixel_map_i_to_b, ctx->pixel_map_i_to_b_size,
+						ctx->pixel_map_i_to_a, ctx->pixel_map_i_to_a_size,
+						colorIndexPalette, colorIndexPaletteEntries,
+						out);
+				} else {
+					GLColorIndexToBGRA8(index, out);
+				}
 			}
-			else if (format == GL_BGRA_EXT && type == GL_UNSIGNED_BYTE) {
-				// Already BGRA, direct copy
-				out[0] = ReadMacInt8(pixAddr + 0);
-				out[1] = ReadMacInt8(pixAddr + 1);
-				out[2] = ReadMacInt8(pixAddr + 2);
-				out[3] = ReadMacInt8(pixAddr + 3);
+			else if (legacyUnsignedShortPaletteIndex) {
+				const uint16_t word = (uint16_t)ReadMacInt16(pixAddr);
+				GLColorIndexToBGRA8WithPalette(
+					GLPixelLegacyUnsignedShortPaletteIndex(word),
+					colorIndexPalette, colorIndexPaletteEntries, out);
 			}
-			else if (format == GL_RGB && type == GL_UNSIGNED_BYTE) {
-				// R G B -> BGRA with alpha=0xFF
-				uint8_t r = ReadMacInt8(pixAddr + 0);
-				uint8_t g = ReadMacInt8(pixAddr + 1);
-				uint8_t b = ReadMacInt8(pixAddr + 2);
-				out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
+				else if (legacyUnsignedShortBGR332) {
+					GLPixelUnpackLegacyUnsignedShortBGR332ToBGRA(
+						(uint16_t)ReadMacInt16(pixAddr), out);
+				}
+			else if (legacyUnsignedShortIndexGray) {
+				GLPixelUnpackLegacyUnsignedShortIndexGrayToBGRA(
+					(uint16_t)ReadMacInt16(pixAddr), out);
 			}
-			else if (format == GL_LUMINANCE && type == GL_UNSIGNED_BYTE) {
-				uint8_t l = ReadMacInt8(pixAddr);
-				out[0] = l; out[1] = l; out[2] = l; out[3] = 0xFF;
+			else if (legacyUnsignedShortPacked) {
+				// Some classic Mac GL clients pass 16-bit packed pixels
+				// with the generic GL_UNSIGNED_SHORT token instead of an
+				// explicit packed OpenGL type.
+				GLPixelUnpackLegacyUnsignedShortToBGRA(
+					(uint16_t)ReadMacInt16(pixAddr), format, out);
 			}
-			else if (format == GL_LUMINANCE_ALPHA && type == GL_UNSIGNED_BYTE) {
-				uint8_t l = ReadMacInt8(pixAddr + 0);
-				uint8_t a = ReadMacInt8(pixAddr + 1);
-				out[0] = l; out[1] = l; out[2] = l; out[3] = a;
+			else if (ConvertPackedPixelToBGRA8(pixAddr, format, type, out)) {
+				// Packed pixel handled above.
 			}
-			else if (format == GL_ALPHA_FORMAT && type == GL_UNSIGNED_BYTE) {
-				uint8_t a = ReadMacInt8(pixAddr);
-				out[0] = 0; out[1] = 0; out[2] = 0; out[3] = a;
-			}
-			else if ((format == GL_RGBA) && type == GL_UNSIGNED_SHORT_4_4_4_4) {
-				// Big-endian 16-bit: RGBA4444
-				uint16_t px = ReadMacInt16(pixAddr);
-				uint8_t r = ((px >> 12) & 0xF) * 17;
-				uint8_t g = ((px >> 8)  & 0xF) * 17;
-				uint8_t b = ((px >> 4)  & 0xF) * 17;
-				uint8_t a = ((px)       & 0xF) * 17;
-				out[0] = b; out[1] = g; out[2] = r; out[3] = a;
-			}
-			else if ((format == GL_RGBA) && type == GL_UNSIGNED_SHORT_5_5_5_1) {
-				// Big-endian 16-bit: RGBA5551 — R(15:11) G(10:6) B(5:1) A(0)
-				uint16_t px = ReadMacInt16(pixAddr);
-				uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
-				uint8_t g = ((px >> 6)  & 0x1F) * 255 / 31;
-				uint8_t b = ((px >> 1)  & 0x1F) * 255 / 31;
-				uint8_t a = (px & 1) ? 0xFF : 0x00;
-				out[0] = b; out[1] = g; out[2] = r; out[3] = a;
-			}
-			else if (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) {
-				// Big-endian 16-bit: RGB565
-				uint16_t px = ReadMacInt16(pixAddr);
-				uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
-				uint8_t g = ((px >> 5)  & 0x3F) * 255 / 63;
-				uint8_t b = ((px)       & 0x1F) * 255 / 31;
-				out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
+			else if (ConvertScalarPixelToBGRA8(pixAddr, format, type, out)) {
+				// Scalar component pixel handled above.
 			}
 			else {
 				// Fallback: magenta
@@ -2512,6 +3069,24 @@ static uint8_t *ConvertPixelsToBGRA8(uint32_t mac_pixels, int width, int height,
 	}
 
 	return dst;
+}
+
+uint8_t *GLConvertMacPixelsToBGRA8(GLContext *ctx,
+                                   uint32_t mac_pixels,
+                                   int width,
+                                   int height,
+                                   uint32_t format,
+                                   uint32_t type,
+                                   int *outLen)
+{
+	if (!outLen) return nullptr;
+	if (ctx)
+		return ConvertPixelsToBGRA8(mac_pixels, width, height, format, type,
+		                            ctx->pixel_store, ctx, outLen);
+
+	GLPixelStore ps = {4, 0, 0, 0, 4, 0, 0, 0};
+	return ConvertPixelsToBGRA8(mac_pixels, width, height, format, type,
+	                            ps, nullptr, outLen);
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,7 +3103,7 @@ extern "C" uint8_t *GLTesting_ConvertPixelsToBGRA8(uint32_t mac_pixels, int widt
                                                     int unpack_alignment, int *outLen)
 {
 	GLPixelStore ps = {4, 0, 0, 0, unpack_alignment, 0, 0, 0};
-	return ConvertPixelsToBGRA8(mac_pixels, width, height, format, type, ps, outLen);
+	return ConvertPixelsToBGRA8(mac_pixels, width, height, format, type, ps, nullptr, outLen);
 }
 #endif /* TESTING_BUILD */
 
@@ -2583,6 +3158,519 @@ static void GLApplyColorTableLUT(GLContext *ctx, uint8_t *bgra, int width, int h
 		px[1] = (uint8_t)(ct.data[idx][1] * 255.0f + 0.5f);   // G <- LUT green
 		px[2] = (uint8_t)(ct.data[idx][0] * 255.0f + 0.5f);   // R <- LUT red
 	}
+}
+
+struct GLBGRAStats {
+	uint8_t min[4];
+	uint8_t max[4];
+	unsigned long long sum[4];
+	int count;
+};
+
+static void GLBGRAStatsInit(GLBGRAStats &stats)
+{
+	for (int i = 0; i < 4; i++) {
+		stats.min[i] = 255;
+		stats.max[i] = 0;
+		stats.sum[i] = 0;
+	}
+	stats.count = 0;
+}
+
+static void GLBGRAStatsAdd(GLBGRAStats &stats, const uint8_t bgra[4])
+{
+	for (int i = 0; i < 4; i++) {
+		if (bgra[i] < stats.min[i]) stats.min[i] = bgra[i];
+		if (bgra[i] > stats.max[i]) stats.max[i] = bgra[i];
+		stats.sum[i] += bgra[i];
+	}
+	stats.count++;
+}
+
+static double GLBGRAStatsAvg(const GLBGRAStats &stats, int component)
+{
+	if (stats.count <= 0) return 0.0;
+	return (double)stats.sum[component] / (double)stats.count;
+}
+
+static void GLBGRAStatsPrintRGBA(const char *label, const GLBGRAStats &stats)
+{
+	fprintf(stderr, "%s=(%.1f,%.1f,%.1f,%.1f)",
+	        label,
+	        GLBGRAStatsAvg(stats, 2),
+	        GLBGRAStatsAvg(stats, 1),
+	        GLBGRAStatsAvg(stats, 0),
+	        GLBGRAStatsAvg(stats, 3));
+}
+
+static bool GLColorTableIndexToBGRA8(const GLColorTable *ct,
+                                     uint8_t index,
+                                     uint8_t out[4])
+{
+	if (ct == nullptr || !ct->defined || ct->width <= 0)
+		return false;
+
+	int entries = ct->width;
+	if (entries > 256) entries = 256;
+	int tableIndex = index;
+	if (tableIndex >= entries) tableIndex = entries - 1;
+	out[0] = GLColorIndexFloatToByte(ct->data[tableIndex][2]);
+	out[1] = GLColorIndexFloatToByte(ct->data[tableIndex][1]);
+	out[2] = GLColorIndexFloatToByte(ct->data[tableIndex][0]);
+	out[3] = GLColorIndexFloatToByte(ct->data[tableIndex][3]);
+	return true;
+}
+
+static void GLLogLegacyUnsignedShortTopIndexes(
+	const GLPixelLegacyUnsignedShortIndexStats &indexStats,
+	const uint8_t *macVideoPalette,
+	bool macVideoPaletteUsable,
+	const uint8_t *activeDSpCLUT,
+	bool activeDSpCLUTUsable,
+	const uint8_t *raveCL8Palette,
+	bool raveCL8PaletteUsable,
+	const GLColorTable *colorTable,
+	bool colorTableUsable)
+{
+	int topIndex[8];
+	int topCount[8];
+	for (int i = 0; i < 8; i++) {
+		topIndex[i] = -1;
+		topCount[i] = 0;
+	}
+
+	for (int idx = 0; idx < 256; idx++) {
+		const int count = indexStats.low_byte_counts[idx];
+		if (count <= 0) continue;
+		for (int slot = 0; slot < 8; slot++) {
+			if (count > topCount[slot]) {
+				for (int move = 7; move > slot; move--) {
+					topCount[move] = topCount[move - 1];
+					topIndex[move] = topIndex[move - 1];
+				}
+				topCount[slot] = count;
+				topIndex[slot] = idx;
+				break;
+			}
+		}
+	}
+
+	fprintf(stderr, "GL:      top low-byte indexes:");
+	for (int i = 0; i < 8 && topIndex[i] >= 0; i++) {
+		const double pct = indexStats.sampled_words > 0
+			? (100.0 * (double)topCount[i]) / (double)indexStats.sampled_words
+			: 0.0;
+		fprintf(stderr, " 0x%02x:%d(%.1f%%)", topIndex[i], topCount[i], pct);
+	}
+	fprintf(stderr, "\n");
+
+	if (!macVideoPaletteUsable && !activeDSpCLUTUsable &&
+	    !raveCL8PaletteUsable && !colorTableUsable)
+		return;
+
+	fprintf(stderr, "GL:      top index color samples:");
+	for (int i = 0; i < 4 && topIndex[i] >= 0; i++) {
+		const int idx = topIndex[i];
+		fprintf(stderr, " idx=0x%02x", idx);
+		if (macVideoPaletteUsable) {
+			const uint8_t *entry = macVideoPalette + idx * 3;
+			fprintf(stderr, " mac=(%u,%u,%u)",
+			        entry[0], entry[1], entry[2]);
+		}
+		if (activeDSpCLUTUsable) {
+			const uint8_t *entry = activeDSpCLUT + idx * 3;
+			fprintf(stderr, " dsp=(%u,%u,%u)",
+			        entry[0], entry[1], entry[2]);
+		}
+		if (raveCL8PaletteUsable) {
+			const uint8_t *entry = raveCL8Palette + idx * 3;
+			fprintf(stderr, " rave=(%u,%u,%u)",
+			        entry[0], entry[1], entry[2]);
+		}
+		if (colorTableUsable) {
+			uint8_t tableBGRA[4];
+			if (GLColorTableIndexToBGRA8(colorTable, (uint8_t)idx, tableBGRA)) {
+				fprintf(stderr, " ct=(%u,%u,%u,%u)",
+				        tableBGRA[2], tableBGRA[1],
+				        tableBGRA[0], tableBGRA[3]);
+			}
+		}
+	}
+	fprintf(stderr, "\n");
+}
+
+static void GLLogLegacyUnsignedShortTextureDiagnostics(uint32_t texName,
+                                                       int32_t level,
+                                                       int width,
+                                                       int height,
+                                                       uint32_t format,
+                                                       uint32_t type,
+                                                       uint32_t mac_pixels,
+                                                       const GLPixelStore &ps,
+                                                       const GLContext *ctx)
+{
+	if (!gl_logging_enabled) return;
+	if (level != 0 || mac_pixels == 0 || width <= 0 || height <= 0) return;
+	if (type != GL_UNSIGNED_SHORT || (format != GL_RGB && format != GL_RGBA)) return;
+
+	static int s_diagnosticLogCount = 0;
+	if (s_diagnosticLogCount >= 64) return;
+	s_diagnosticLogCount++;
+
+	const int srcBpp = GLPixelSourceBytesPerPixel(format, type);
+	if (srcBpp <= 0) return;
+	const int rowStride = ComputeRowStride(width, srcBpp,
+	                                       ps.unpack_alignment,
+	                                       ps.unpack_row_length);
+	const uint32_t srcBase =
+		mac_pixels + ps.unpack_skip_rows * rowStride +
+		ps.unpack_skip_pixels * srcBpp;
+
+	uint8_t activeDSpCLUT[768] = {};
+	uint8_t macVideoPalette[768] = {};
+	uint8_t raveCL8Palette[768] = {};
+	const int32_t activeDSpErr = DSpGetActiveCLUTSnapshot(activeDSpCLUT);
+	const bool activeDSpCLUTUsable =
+		activeDSpErr == 0 && GLPixelPaletteHasUsableColor(activeDSpCLUT, 256);
+	GLGetMacVideoPaletteSnapshot(macVideoPalette);
+	const bool macVideoPaletteUsable =
+		GLPixelPaletteHasUsableColor(macVideoPalette, 256);
+	const bool raveCL8PaletteAvailable =
+		RaveGetLastCL8ColorTableRGBSnapshot(raveCL8Palette);
+	const bool raveCL8PaletteUsable =
+		raveCL8PaletteAvailable &&
+		GLPixelPaletteHasUsableColor(raveCL8Palette, 256);
+	GLPixelPaletteSummary activeDSpSummary;
+	GLPixelPaletteSummary macVideoSummary;
+	GLPixelPaletteSummary raveCL8Summary;
+	GLPixelPaletteSummaryAnalyze(activeDSpCLUT,
+	                             activeDSpErr == 0 ? 256 : 0,
+	                             &activeDSpSummary);
+	GLPixelPaletteSummaryAnalyze(macVideoPalette, 256, &macVideoSummary);
+	GLPixelPaletteSummaryAnalyze(raveCL8Palette,
+	                             raveCL8PaletteAvailable ? 256 : 0,
+	                             &raveCL8Summary);
+	const bool pixelMapsDefined =
+		ctx != nullptr &&
+		GLColorIndexPixelMapsDefined(ctx->pixel_map_i_to_r_size,
+		                             ctx->pixel_map_i_to_g_size,
+		                             ctx->pixel_map_i_to_b_size,
+		                             ctx->pixel_map_i_to_a_size);
+	const GLColorTable *colorTable =
+		ctx != nullptr ? &ctx->color_tables[0] : nullptr;
+	const bool colorTableDefined =
+		colorTable != nullptr && colorTable->defined;
+	const bool colorTableUsable =
+		colorTableDefined && colorTable->width > 0;
+	const bool colorTableEnabled =
+		ctx != nullptr && ctx->color_table_enabled;
+	const int colorTableWidth =
+		colorTableDefined ? colorTable->width : 0;
+
+	GLPixelLegacyUnsignedShortIndexStats indexStats;
+	GLPixelLegacyUnsignedShortIndexStatsInit(&indexStats);
+	GLBGRAStats legacyStats, rgb555Stats, bgr555Stats, rgb565Stats;
+	GLBGRAStats bgr565Stats, rgba5551Stats, indexGrayStats, rgb332Stats;
+	GLBGRAStats bgr332Stats;
+	GLBGRAStats macPaletteStats, dspPaletteStats, ravePaletteStats;
+	GLBGRAStats pixelMapStats, colorTableStats;
+	GLBGRAStatsInit(legacyStats);
+	GLBGRAStatsInit(rgb555Stats);
+	GLBGRAStatsInit(bgr555Stats);
+	GLBGRAStatsInit(rgb565Stats);
+	GLBGRAStatsInit(bgr565Stats);
+	GLBGRAStatsInit(rgba5551Stats);
+	GLBGRAStatsInit(indexGrayStats);
+	GLBGRAStatsInit(rgb332Stats);
+	GLBGRAStatsInit(bgr332Stats);
+	GLBGRAStatsInit(macPaletteStats);
+	GLBGRAStatsInit(dspPaletteStats);
+	GLBGRAStatsInit(ravePaletteStats);
+	GLBGRAStatsInit(pixelMapStats);
+	GLBGRAStatsInit(colorTableStats);
+
+	for (int y = 0; y < height; y++) {
+		const uint32_t rowAddr = srcBase + y * rowStride;
+		for (int x = 0; x < width; x++) {
+			const uint32_t pixAddr = rowAddr + x * srcBpp;
+			const uint16_t word = (uint16_t)ReadMacInt16(pixAddr);
+			const uint8_t index = GLPixelLegacyUnsignedShortPaletteIndex(word);
+			uint8_t px[4];
+
+			GLPixelLegacyUnsignedShortIndexStatsAddWord(&indexStats, word);
+
+			GLPixelUnpackLegacyUnsignedShortToBGRA(word, format, px);
+			GLBGRAStatsAdd(legacyStats, px);
+			GLPixelUnpackMacRGB555ToBGRA(word, GL_RGB, px);
+			GLBGRAStatsAdd(rgb555Stats, px);
+			GLPixelUnpackMacRGB555ToBGRA(word, GL_BGR_EXT, px);
+			GLBGRAStatsAdd(bgr555Stats, px);
+			GLPixelUnpackRGB565ToBGRA(word, false, GL_RGB, px);
+			GLBGRAStatsAdd(rgb565Stats, px);
+			GLPixelUnpackRGB565ToBGRA(word, false, GL_BGR_EXT, px);
+			GLBGRAStatsAdd(bgr565Stats, px);
+			GLPixelUnpackRGBA5551ToBGRA(word, false, GL_RGBA, px);
+			GLBGRAStatsAdd(rgba5551Stats, px);
+			px[0] = index; px[1] = index; px[2] = index; px[3] = 255;
+			GLBGRAStatsAdd(indexGrayStats, px);
+			GLPixelUnpackLegacyUnsignedShortRGB332ToBGRA(word, px);
+			GLBGRAStatsAdd(rgb332Stats, px);
+			GLPixelUnpackLegacyUnsignedShortBGR332ToBGRA(word, px);
+			GLBGRAStatsAdd(bgr332Stats, px);
+			if (macVideoPaletteUsable) {
+				GLColorIndexToBGRA8WithPalette(index, macVideoPalette, 256, px);
+				GLBGRAStatsAdd(macPaletteStats, px);
+			}
+			if (activeDSpCLUTUsable) {
+				GLColorIndexToBGRA8WithPalette(index, activeDSpCLUT, 256, px);
+				GLBGRAStatsAdd(dspPaletteStats, px);
+			}
+			if (raveCL8PaletteUsable) {
+				GLColorIndexToBGRA8WithPalette(index, raveCL8Palette, 256, px);
+				GLBGRAStatsAdd(ravePaletteStats, px);
+			}
+			if (pixelMapsDefined && ctx != nullptr) {
+				GLColorIndexToBGRA8WithPixelMaps(index,
+					ctx->pixel_map_i_to_r, ctx->pixel_map_i_to_r_size,
+					ctx->pixel_map_i_to_g, ctx->pixel_map_i_to_g_size,
+					ctx->pixel_map_i_to_b, ctx->pixel_map_i_to_b_size,
+					ctx->pixel_map_i_to_a, ctx->pixel_map_i_to_a_size,
+					px);
+				GLBGRAStatsAdd(pixelMapStats, px);
+			}
+			if (colorTableUsable &&
+			    GLColorTableIndexToBGRA8(colorTable, index, px)) {
+				GLBGRAStatsAdd(colorTableStats, px);
+			}
+		}
+	}
+
+	const bool likelyPalette =
+		GLPixelLegacyUnsignedShortIndexStatsShouldUsePalette(&indexStats);
+	fprintf(stderr,
+	        "GL:   -> legacy ushort diagnostics: tex=%u level=%d %dx%d "
+	        "fmt=0x%x type=0x%x srcBase=0x%08x rowStride=%d "
+	        "sampled=%d duplicated=%d nonExtreme=%d uniqueLow=%d "
+	        "lowRange=0x%02x..0x%02x likelyPalette=%d\n",
+	        texName, level, width, height, format, type, srcBase, rowStride,
+	        indexStats.sampled_words,
+	        indexStats.duplicated_byte_words,
+	        indexStats.non_extreme_duplicated_byte_words,
+	        indexStats.unique_low_byte_values,
+	        indexStats.min_low_byte,
+	        indexStats.max_low_byte,
+	        likelyPalette ? 1 : 0);
+	fprintf(stderr,
+	        "GL:      palette availability: activeDSpErr=%d activeDSpUsable=%d "
+	        "macVideoUsable=%d raveCL8(available=%d usable=%d) "
+	        "explicitColorTable(enabled=%d defined=%d width=%d) pixelMaps=%d\n",
+	        activeDSpErr, activeDSpCLUTUsable ? 1 : 0,
+	        macVideoPaletteUsable ? 1 : 0,
+	        raveCL8PaletteAvailable ? 1 : 0,
+	        raveCL8PaletteUsable ? 1 : 0,
+	        colorTableEnabled ? 1 : 0,
+	        colorTableDefined ? 1 : 0,
+	        colorTableWidth,
+	        pixelMapsDefined ? 1 : 0);
+	fprintf(stderr,
+	        "GL:      palette summaries: activeDSp(entries=%d nonBlack=%d "
+	        "diff0=%d nonGray=%d) macVideo(entries=%d nonBlack=%d "
+	        "diff0=%d nonGray=%d) raveCL8(entries=%d nonBlack=%d "
+	        "diff0=%d nonGray=%d)\n",
+	        activeDSpSummary.entries,
+	        activeDSpSummary.non_black_entries,
+	        activeDSpSummary.different_from_first_entries,
+	        activeDSpSummary.non_gray_entries,
+	        macVideoSummary.entries,
+	        macVideoSummary.non_black_entries,
+	        macVideoSummary.different_from_first_entries,
+	        macVideoSummary.non_gray_entries,
+	        raveCL8Summary.entries,
+	        raveCL8Summary.non_black_entries,
+	        raveCL8Summary.different_from_first_entries,
+	        raveCL8Summary.non_gray_entries);
+	GLLogLegacyUnsignedShortTopIndexes(indexStats,
+	                                   macVideoPalette, macVideoPaletteUsable,
+	                                   activeDSpCLUT, activeDSpCLUTUsable,
+	                                   raveCL8Palette, raveCL8PaletteUsable,
+	                                   colorTable, colorTableUsable);
+
+	fprintf(stderr, "GL:      candidate avgRGBA: ");
+	GLBGRAStatsPrintRGBA("legacy", legacyStats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("rgb555", rgb555Stats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("bgr555", bgr555Stats);
+	fprintf(stderr, "\n");
+
+	fprintf(stderr, "GL:      candidate avgRGBA: ");
+	GLBGRAStatsPrintRGBA("rgb565", rgb565Stats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("bgr565", bgr565Stats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("rgba5551", rgba5551Stats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("indexGray", indexGrayStats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("rgb332", rgb332Stats);
+	fprintf(stderr, " ");
+	GLBGRAStatsPrintRGBA("bgr332", bgr332Stats);
+	fprintf(stderr, "\n");
+
+	if (macVideoPaletteUsable || activeDSpCLUTUsable || raveCL8PaletteUsable ||
+	    pixelMapsDefined || colorTableUsable) {
+		fprintf(stderr, "GL:      palette candidate avgRGBA:");
+		if (macVideoPaletteUsable) {
+			fprintf(stderr, " ");
+			GLBGRAStatsPrintRGBA("macVideo", macPaletteStats);
+		}
+		if (activeDSpCLUTUsable) {
+			fprintf(stderr, " ");
+			GLBGRAStatsPrintRGBA("activeDSp", dspPaletteStats);
+		}
+		if (raveCL8PaletteUsable) {
+			fprintf(stderr, " ");
+			GLBGRAStatsPrintRGBA("raveCL8", ravePaletteStats);
+		}
+		if (pixelMapsDefined) {
+			fprintf(stderr, " ");
+			GLBGRAStatsPrintRGBA("pixelMaps", pixelMapStats);
+		}
+		if (colorTableUsable) {
+			fprintf(stderr, " ");
+			GLBGRAStatsPrintRGBA("colorTable", colorTableStats);
+		}
+		fprintf(stderr, "\n");
+	}
+	fflush(stderr);
+}
+
+static void GLLogLegacyUnsignedShortTextureSample(uint32_t texName,
+                                                   int32_t level,
+                                                   int width,
+                                                   int height,
+                                                   uint32_t format,
+                                                   uint32_t type,
+                                                   uint32_t mac_pixels,
+                                                   const GLPixelStore &ps)
+{
+	if (!gl_logging_enabled) return;
+	if (level != 0 || mac_pixels == 0 || width <= 0 || height <= 0) return;
+	if (type != GL_UNSIGNED_SHORT || (format != GL_RGB && format != GL_RGBA)) return;
+
+	static int s_sampleLogCount = 0;
+	if (s_sampleLogCount >= 64) return;
+	s_sampleLogCount++;
+
+	const int srcBpp = GLPixelSourceBytesPerPixel(format, type);
+	if (srcBpp <= 0) return;
+	const int rowStride = ComputeRowStride(width, srcBpp,
+	                                       ps.unpack_alignment,
+	                                       ps.unpack_row_length);
+	const uint32_t srcBase =
+		mac_pixels + ps.unpack_skip_rows * rowStride +
+		ps.unpack_skip_pixels * srcBpp;
+	fprintf(stderr,
+	        "GL:   -> legacy ushort texture sample: tex=%u level=%d %dx%d fmt=0x%x "
+	        "srcBase=0x%08x rowStride=%d align=%d rowLength=%d skip=(%d,%d)\n",
+	        texName, level, width, height, format, srcBase, rowStride,
+	        ps.unpack_alignment, ps.unpack_row_length,
+	        ps.unpack_skip_pixels, ps.unpack_skip_rows);
+
+	const int xs[6] = {0, width / 2, width - 1, 0, width / 2, width - 1};
+	const int ys[6] = {0, 0, 0, height / 2, height / 2, height - 1};
+	for (int i = 0; i < 6; i++) {
+		const int x = xs[i];
+		const int y = ys[i];
+		const uint32_t pixAddr = srcBase + y * rowStride + x * srcBpp;
+		const uint16_t word = (uint16_t)ReadMacInt16(pixAddr);
+		uint8_t rgb555[4], bgr555[4], rgb565[4], bgr565[4], rgba5551[4], legacy[4];
+		GLPixelUnpackMacRGB555ToBGRA(word, GL_RGB, rgb555);
+		GLPixelUnpackMacRGB555ToBGRA(word, GL_BGR_EXT, bgr555);
+		GLPixelUnpackRGB565ToBGRA(word, false, GL_RGB, rgb565);
+		GLPixelUnpackRGB565ToBGRA(word, false, GL_BGR_EXT, bgr565);
+		GLPixelUnpackRGBA5551ToBGRA(word, false, GL_RGBA, rgba5551);
+		GLPixelUnpackLegacyUnsignedShortToBGRA(word, format, legacy);
+		fprintf(stderr,
+		        "GL:      sample[%d] xy=(%d,%d) raw=0x%04x "
+		        "rgb555=(%3u,%3u,%3u) bgr555=(%3u,%3u,%3u) "
+		        "rgb565=(%3u,%3u,%3u) bgr565=(%3u,%3u,%3u) "
+		        "rgba5551=(%3u,%3u,%3u,%3u) legacy=(%3u,%3u,%3u,%3u)\n",
+		        i, x, y, word,
+		        rgb555[2], rgb555[1], rgb555[0],
+		        bgr555[2], bgr555[1], bgr555[0],
+		        rgb565[2], rgb565[1], rgb565[0],
+		        bgr565[2], bgr565[1], bgr565[0],
+		        rgba5551[2], rgba5551[1], rgba5551[0], rgba5551[3],
+		        legacy[2], legacy[1], legacy[0], legacy[3]);
+	}
+	fflush(stderr);
+}
+
+static void GLLogTerrainTextureUploadSample(uint32_t texName,
+                                             int32_t level,
+                                             int width,
+                                             int height,
+                                             uint32_t format,
+                                             uint32_t type,
+                                             uint32_t mac_pixels,
+                                             const GLPixelStore &ps,
+                                             const uint8_t *converted,
+                                             int convertedLen)
+{
+	if (!gl_logging_enabled) return;
+	if (mac_pixels == 0 || width <= 0 || height <= 0) return;
+	if (!converted || convertedLen < width * height * 4) return;
+
+	const int srcBpp = GLPixelSourceBytesPerPixel(format, type);
+	if (srcBpp <= 0) return;
+	const int rowStride = ComputeRowStride(width, srcBpp,
+	                                       ps.unpack_alignment,
+	                                       ps.unpack_row_length);
+	const uint32_t srcBase =
+		mac_pixels + ps.unpack_skip_rows * rowStride +
+		ps.unpack_skip_pixels * srcBpp;
+
+	uint8_t minB = 255, minG = 255, minR = 255, minA = 255;
+	uint8_t maxB = 0, maxG = 0, maxR = 0, maxA = 0;
+	unsigned long long sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+	const int pixels = width * height;
+	for (int i = 0; i < pixels; i++) {
+		const uint8_t *px = converted + i * 4;
+		if (px[0] < minB) minB = px[0]; if (px[0] > maxB) maxB = px[0]; sumB += px[0];
+		if (px[1] < minG) minG = px[1]; if (px[1] > maxG) maxG = px[1]; sumG += px[1];
+		if (px[2] < minR) minR = px[2]; if (px[2] > maxR) maxR = px[2]; sumR += px[2];
+		if (px[3] < minA) minA = px[3]; if (px[3] > maxA) maxA = px[3]; sumA += px[3];
+	}
+
+	fprintf(stderr,
+	        "GL:   -> terrain texture upload sample: tex=%u level=%d %dx%d "
+	        "fmt=0x%x type=0x%x srcBase=0x%08x rowStride=%d align=%d "
+	        "rowLength=%d skip=(%d,%d) convertedBGRA min=(%u,%u,%u,%u) "
+	        "max=(%u,%u,%u,%u) avg=(%.1f,%.1f,%.1f,%.1f)\n",
+	        texName, level, width, height, format, type, srcBase, rowStride,
+	        ps.unpack_alignment, ps.unpack_row_length,
+	        ps.unpack_skip_pixels, ps.unpack_skip_rows,
+	        minB, minG, minR, minA, maxB, maxG, maxR, maxA,
+	        (double)sumB / pixels, (double)sumG / pixels,
+	        (double)sumR / pixels, (double)sumA / pixels);
+
+	const int xs[6] = {0, width / 2, width - 1, 0, width / 2, width - 1};
+	const int ys[6] = {0, 0, 0, height / 2, height / 2, height - 1};
+	for (int i = 0; i < 6; i++) {
+		const int x = xs[i];
+		const int y = ys[i];
+		const uint32_t pixAddr = srcBase + y * rowStride + x * srcBpp;
+		const uint8_t *out = converted + (y * width + x) * 4;
+		fprintf(stderr, "GL:      terrain sample[%d] xy=(%d,%d) src=", i, x, y);
+		for (int b = 0; b < srcBpp; b++) {
+			fprintf(stderr, "%s%02x", b == 0 ? "" : " ", (uint8_t)ReadMacInt8(pixAddr + b));
+		}
+		fprintf(stderr, " -> bgra=(%3u,%3u,%3u,%3u) rgba=(%3u,%3u,%3u,%3u)\n",
+		        out[0], out[1], out[2], out[3],
+		        out[2], out[1], out[0], out[3]);
+	}
+	fflush(stderr);
 }
 
 
@@ -2646,9 +3734,16 @@ void NativeGLTexImage2D(GLContext *ctx, uint32_t target, int32_t level,
 		       mac_pixels, Mac2HostAddr(mac_pixels), width, height, format, type);
 		fflush(stderr);
 	}
+	GLLogLegacyUnsignedShortTextureSample(texName, level, width, height,
+	                                      format, type, mac_pixels,
+	                                      ctx->pixel_store);
+	GLLogLegacyUnsignedShortTextureDiagnostics(texName, level, width, height,
+	                                           format, type, mac_pixels,
+	                                           ctx->pixel_store, ctx);
 	int dataLen = 0;
 	uint8_t *converted = ConvertPixelsToBGRA8(mac_pixels, width, height,
-	                                           format, type, ctx->pixel_store, &dataLen);
+	                                           format, type, ctx->pixel_store, ctx, &dataLen,
+	                                           &tex, level, true);
 	if (!converted) return;
 
 	// ARB_imaging color-table LUT apply: when GL_COLOR_TABLE is
@@ -2661,6 +3756,8 @@ void NativeGLTexImage2D(GLContext *ctx, uint32_t target, int32_t level,
 	// 1-channel LUT-remap use). The index is clamped to [0, width-1] and the hard
 	// GLColorTable.data[256][4] ceiling BEFORE any LUT read.
 	GLApplyColorTableLUT(ctx, converted, width, height, dataLen);
+	GLLogTerrainTextureUploadSample(texName, level, width, height, format, type,
+	                                mac_pixels, ctx->pixel_store, converted, dataLen);
 
 	GLMetalUploadTexture(ctx, &tex, level, width, height, converted, dataLen);
 	free(converted);
@@ -2689,7 +3786,8 @@ void NativeGLTexSubImage2D(GLContext *ctx, uint32_t target, int32_t level,
 
 	int dataLen = 0;
 	uint8_t *converted = ConvertPixelsToBGRA8(mac_pixels, width, height,
-	                                           format, type, ctx->pixel_store, &dataLen);
+	                                           format, type, ctx->pixel_store, ctx, &dataLen,
+	                                           &tex, level, false);
 	if (!converted) return;
 
 	// ARB_imaging color-table LUT apply: same upload-path remap as
@@ -2812,7 +3910,7 @@ uint32_t NativeGLIsTexture(GLContext *ctx, uint32_t texture)
 
 
 // =========================================================================
-//  Remaining core GL handlers -- Plan 08
+//  Remaining core GL handlers
 //
 //  Categories: Accumulation, bitmap/raster, rectangles, finish/flush,
 //  evaluators, selection/feedback, pixel transfer/map, index mode,
@@ -2843,14 +3941,23 @@ void NativeGLClipPlane(GLContext *ctx, uint32_t plane, uint32_t mac_ptr)
 {
 	int idx = plane - GL_CLIP_PLANE0;
 	if (idx < 0 || idx >= 6) { ctx->last_error = GL_INVALID_ENUM; return; }
+	double object_plane[4];
 	for (int i = 0; i < 4; i++) {
 		uint32 hi = ReadMacInt32(mac_ptr + i * 8);
 		uint32 lo = ReadMacInt32(mac_ptr + i * 8 + 4);
 		uint64_t bits = ((uint64_t)hi << 32) | lo;
 		double d;
 		memcpy(&d, &bits, sizeof(double));
-		ctx->clip_planes[idx][i] = d;
+		object_plane[i] = d;
 	}
+	double eye_plane[4];
+	if (!GLTransformClipPlaneToEyeSpace(
+		eye_plane,
+		object_plane,
+		ctx->modelview_stack[ctx->modelview_depth])) {
+		memcpy(eye_plane, object_plane, sizeof(eye_plane));
+	}
+	memcpy(ctx->clip_planes[idx], eye_plane, sizeof(eye_plane));
 }
 
 void NativeGLGetClipPlane(GLContext *ctx, uint32_t plane, uint32_t mac_ptr)
@@ -2983,7 +4090,7 @@ void NativeGLDrawPixels(GLContext *ctx, int32_t width, int32_t height, uint32_t 
 	if (!ctx->raster_pos_valid) return;
 
 	int outLen = 0;
-	uint8_t *bgra = ConvertPixelsToBGRA8(pixels_ptr, width, height, format, type, ctx->pixel_store, &outLen);
+	uint8_t *bgra = ConvertPixelsToBGRA8(pixels_ptr, width, height, format, type, ctx->pixel_store, ctx, &outLen);
 	if (!bgra) return;
 
 	GLMetalDrawPixels(ctx, width, height, bgra, outLen);
@@ -3638,35 +4745,48 @@ void NativeGLPixelTransferi(GLContext *ctx, uint32_t pname, int32_t param)
 	NativeGLPixelTransferf(ctx, pname, (float)param);
 }
 
+static int gl_pixel_map_clamped_size(int32_t mapsize)
+{
+	if (mapsize <= 0)
+		return 0;
+	if (mapsize > 256)
+		return 256;
+	return mapsize;
+}
+
 static void gl_pixel_map_store_float(GLContext *ctx, uint32_t map, int32_t mapsize, const float *values)
 {
-	int sz = (mapsize > 256) ? 256 : mapsize;
+	int sz = gl_pixel_map_clamped_size(mapsize);
 	switch (map) {
+	case GL_PIXEL_MAP_I_TO_R: memcpy(ctx->pixel_map_i_to_r, values, sz * sizeof(float)); ctx->pixel_map_i_to_r_size = sz; break;
+	case GL_PIXEL_MAP_I_TO_G: memcpy(ctx->pixel_map_i_to_g, values, sz * sizeof(float)); ctx->pixel_map_i_to_g_size = sz; break;
+	case GL_PIXEL_MAP_I_TO_B: memcpy(ctx->pixel_map_i_to_b, values, sz * sizeof(float)); ctx->pixel_map_i_to_b_size = sz; break;
+	case GL_PIXEL_MAP_I_TO_A: memcpy(ctx->pixel_map_i_to_a, values, sz * sizeof(float)); ctx->pixel_map_i_to_a_size = sz; break;
 	case GL_PIXEL_MAP_R_TO_R: memcpy(ctx->pixel_map_r_to_r, values, sz * sizeof(float)); ctx->pixel_map_r_to_r_size = sz; break;
 	case GL_PIXEL_MAP_G_TO_G: memcpy(ctx->pixel_map_g_to_g, values, sz * sizeof(float)); ctx->pixel_map_g_to_g_size = sz; break;
 	case GL_PIXEL_MAP_B_TO_B: memcpy(ctx->pixel_map_b_to_b, values, sz * sizeof(float)); ctx->pixel_map_b_to_b_size = sz; break;
 	case GL_PIXEL_MAP_A_TO_A: memcpy(ctx->pixel_map_a_to_a, values, sz * sizeof(float)); ctx->pixel_map_a_to_a_size = sz; break;
-	default: break; // I_TO_I, S_TO_S, I_TO_R/G/B/A: accept silently (RGBA mode only)
+	default: break; // I_TO_I and S_TO_S are accepted silently; not consumed by RGBA uploads.
 	}
 }
 
 void NativeGLPixelMapfv(GLContext *ctx, uint32_t map, int32_t mapsize, uint32_t values_ptr)
 {
-	int sz = (mapsize > 256) ? 256 : mapsize;
+	int sz = gl_pixel_map_clamped_size(mapsize);
 	float tmp[256];
 	for (int i = 0; i < sz; i++) tmp[i] = ReadMacFloat(values_ptr + i * 4);
 	gl_pixel_map_store_float(ctx, map, sz, tmp);
 }
 void NativeGLPixelMapuiv(GLContext *ctx, uint32_t map, int32_t mapsize, uint32_t values_ptr)
 {
-	int sz = (mapsize > 256) ? 256 : mapsize;
+	int sz = gl_pixel_map_clamped_size(mapsize);
 	float tmp[256];
 	for (int i = 0; i < sz; i++) tmp[i] = (float)ReadMacInt32(values_ptr + i * 4) / 4294967295.0f;
 	gl_pixel_map_store_float(ctx, map, sz, tmp);
 }
 void NativeGLPixelMapusv(GLContext *ctx, uint32_t map, int32_t mapsize, uint32_t values_ptr)
 {
-	int sz = (mapsize > 256) ? 256 : mapsize;
+	int sz = gl_pixel_map_clamped_size(mapsize);
 	float tmp[256];
 	for (int i = 0; i < sz; i++) tmp[i] = (float)ReadMacInt16(values_ptr + i * 2) / 65535.0f;
 	gl_pixel_map_store_float(ctx, map, sz, tmp);
@@ -3675,6 +4795,10 @@ void NativeGLGetPixelMapfv(GLContext *ctx, uint32_t map, uint32_t values)
 {
 	const float *src = nullptr; int sz = 0;
 	switch (map) {
+	case GL_PIXEL_MAP_I_TO_R: src = ctx->pixel_map_i_to_r; sz = ctx->pixel_map_i_to_r_size; break;
+	case GL_PIXEL_MAP_I_TO_G: src = ctx->pixel_map_i_to_g; sz = ctx->pixel_map_i_to_g_size; break;
+	case GL_PIXEL_MAP_I_TO_B: src = ctx->pixel_map_i_to_b; sz = ctx->pixel_map_i_to_b_size; break;
+	case GL_PIXEL_MAP_I_TO_A: src = ctx->pixel_map_i_to_a; sz = ctx->pixel_map_i_to_a_size; break;
 	case GL_PIXEL_MAP_R_TO_R: src = ctx->pixel_map_r_to_r; sz = ctx->pixel_map_r_to_r_size; break;
 	case GL_PIXEL_MAP_G_TO_G: src = ctx->pixel_map_g_to_g; sz = ctx->pixel_map_g_to_g_size; break;
 	case GL_PIXEL_MAP_B_TO_B: src = ctx->pixel_map_b_to_b; sz = ctx->pixel_map_b_to_b_size; break;
@@ -3687,6 +4811,10 @@ void NativeGLGetPixelMapuiv(GLContext *ctx, uint32_t map, uint32_t values)
 {
 	const float *src = nullptr; int sz = 0;
 	switch (map) {
+	case GL_PIXEL_MAP_I_TO_R: src = ctx->pixel_map_i_to_r; sz = ctx->pixel_map_i_to_r_size; break;
+	case GL_PIXEL_MAP_I_TO_G: src = ctx->pixel_map_i_to_g; sz = ctx->pixel_map_i_to_g_size; break;
+	case GL_PIXEL_MAP_I_TO_B: src = ctx->pixel_map_i_to_b; sz = ctx->pixel_map_i_to_b_size; break;
+	case GL_PIXEL_MAP_I_TO_A: src = ctx->pixel_map_i_to_a; sz = ctx->pixel_map_i_to_a_size; break;
 	case GL_PIXEL_MAP_R_TO_R: src = ctx->pixel_map_r_to_r; sz = ctx->pixel_map_r_to_r_size; break;
 	case GL_PIXEL_MAP_G_TO_G: src = ctx->pixel_map_g_to_g; sz = ctx->pixel_map_g_to_g_size; break;
 	case GL_PIXEL_MAP_B_TO_B: src = ctx->pixel_map_b_to_b; sz = ctx->pixel_map_b_to_b_size; break;
@@ -3699,6 +4827,10 @@ void NativeGLGetPixelMapusv(GLContext *ctx, uint32_t map, uint32_t values)
 {
 	const float *src = nullptr; int sz = 0;
 	switch (map) {
+	case GL_PIXEL_MAP_I_TO_R: src = ctx->pixel_map_i_to_r; sz = ctx->pixel_map_i_to_r_size; break;
+	case GL_PIXEL_MAP_I_TO_G: src = ctx->pixel_map_i_to_g; sz = ctx->pixel_map_i_to_g_size; break;
+	case GL_PIXEL_MAP_I_TO_B: src = ctx->pixel_map_i_to_b; sz = ctx->pixel_map_i_to_b_size; break;
+	case GL_PIXEL_MAP_I_TO_A: src = ctx->pixel_map_i_to_a; sz = ctx->pixel_map_i_to_a_size; break;
 	case GL_PIXEL_MAP_R_TO_R: src = ctx->pixel_map_r_to_r; sz = ctx->pixel_map_r_to_r_size; break;
 	case GL_PIXEL_MAP_G_TO_G: src = ctx->pixel_map_g_to_g; sz = ctx->pixel_map_g_to_g_size; break;
 	case GL_PIXEL_MAP_B_TO_B: src = ctx->pixel_map_b_to_b; sz = ctx->pixel_map_b_to_b_size; break;
@@ -3851,7 +4983,16 @@ void NativeGLListBase(GLContext *ctx, uint32_t base) { ctx->list_base = base; }
 void NativeGLVertexPointer(GLContext *ctx, int32_t size, uint32_t type, int32_t stride, uint32_t pointer) { ctx->vertex_array.size = size; ctx->vertex_array.type = type; ctx->vertex_array.stride = stride; ctx->vertex_array.pointer = pointer; }
 void NativeGLNormalPointer(GLContext *ctx, uint32_t type, int32_t stride, uint32_t pointer) { ctx->normal_array.type = type; ctx->normal_array.stride = stride; ctx->normal_array.pointer = pointer; }
 void NativeGLColorPointer(GLContext *ctx, int32_t size, uint32_t type, int32_t stride, uint32_t pointer) { ctx->color_array.size = size; ctx->color_array.type = type; ctx->color_array.stride = stride; ctx->color_array.pointer = pointer; }
-void NativeGLTexCoordPointer(GLContext *ctx, int32_t size, uint32_t type, int32_t stride, uint32_t pointer) { int u = ctx->client_active_texture; ctx->texcoord_array[u].size = size; ctx->texcoord_array[u].type = type; ctx->texcoord_array[u].stride = stride; ctx->texcoord_array[u].pointer = pointer; }
+void NativeGLTexCoordPointer(GLContext *ctx, int32_t size, uint32_t type,
+                             int32_t stride, uint32_t pointer)
+{
+	int u = gl_clamp_texture_unit(ctx->client_active_texture);
+	ctx->texcoord_array[u].size = size;
+	ctx->texcoord_array[u].type = type;
+	ctx->texcoord_array[u].stride = stride;
+	ctx->texcoord_array[u].pointer = pointer;
+	gl_invalidate_prepared_texcoord_array_for_draw(ctx, u);
+}
 
 void NativeGLEnableClientState(GLContext *ctx, uint32_t array)
 {
@@ -3859,7 +5000,13 @@ void NativeGLEnableClientState(GLContext *ctx, uint32_t array)
 	case GL_VERTEX_ARRAY:       ctx->vertex_array.enabled = true; break;
 	case GL_NORMAL_ARRAY:       ctx->normal_array.enabled = true; break;
 	case GL_COLOR_ARRAY:        ctx->color_array.enabled = true; break;
-	case GL_TEXTURE_COORD_ARRAY:ctx->texcoord_array[ctx->client_active_texture].enabled = true; break;
+	case GL_TEXTURE_COORD_ARRAY: {
+		const int unit = gl_clamp_texture_unit(ctx->client_active_texture);
+		ctx->texcoord_array[unit].enabled = true;
+		ctx->texcoord_array_enable_draw_serial[unit] = ctx->completed_draw_serial;
+		ctx->prepared_texcoord_array_for_draw[unit] = false;
+		break;
+	}
 	case GL_EDGE_FLAG_ARRAY:    ctx->edge_flag_array.enabled = true; break;
 	case GL_INDEX_ARRAY:        ctx->index_array.enabled = true; break;
 	default: break;
@@ -3872,7 +5019,24 @@ void NativeGLDisableClientState(GLContext *ctx, uint32_t array)
 	case GL_VERTEX_ARRAY:       ctx->vertex_array.enabled = false; break;
 	case GL_NORMAL_ARRAY:       ctx->normal_array.enabled = false; break;
 	case GL_COLOR_ARRAY:        ctx->color_array.enabled = false; break;
-	case GL_TEXTURE_COORD_ARRAY:ctx->texcoord_array[ctx->client_active_texture].enabled = false; break;
+	case GL_TEXTURE_COORD_ARRAY: {
+		const int unit = gl_clamp_texture_unit(ctx->client_active_texture);
+		const bool hadResource =
+			ctx->texcoord_array[unit].enabled &&
+			ctx->texcoord_array[unit].pointer != 0;
+		if (GLMetalPreparedDrawStateSurvivesDisable(
+				ctx->texcoord_array_enable_draw_serial[unit],
+				ctx->completed_draw_serial,
+				hadResource)) {
+			ctx->prepared_texcoord_array[unit] = ctx->texcoord_array[unit];
+			ctx->prepared_texcoord_array[unit].enabled = true;
+			ctx->prepared_texcoord_array_for_draw[unit] = true;
+		} else {
+			ctx->prepared_texcoord_array_for_draw[unit] = false;
+		}
+		ctx->texcoord_array[unit].enabled = false;
+		break;
+	}
 	case GL_EDGE_FLAG_ARRAY:    ctx->edge_flag_array.enabled = false; break;
 	case GL_INDEX_ARRAY:        ctx->index_array.enabled = false; break;
 	default: break;
@@ -5573,7 +6737,7 @@ void NativeGLTexImage3DEXT(GLContext *ctx, uint32_t target, int32_t level, int32
 	for (int z = 0; z < d; z++) {
 		uint32_t sliceSrc = data + z * srcSliceBytes;
 		int outLen = 0;
-		uint8_t *sliceData = ConvertPixelsToBGRA8(sliceSrc, w, h, fmt, type, ctx->pixel_store, &outLen);
+		uint8_t *sliceData = ConvertPixelsToBGRA8(sliceSrc, w, h, fmt, type, ctx->pixel_store, ctx, &outLen);
 		if (sliceData) {
 			memcpy(converted + z * sliceSize, sliceData, sliceSize);
 			free(sliceData);
@@ -5618,7 +6782,7 @@ void NativeGLTexSubImage3DEXT(GLContext *ctx, uint32_t target, int32_t level,
 	for (int z = 0; z < d; z++) {
 		uint32_t sliceSrc = data + z * srcSliceBytes;
 		int outLen = 0;
-		uint8_t *sliceData = ConvertPixelsToBGRA8(sliceSrc, w, h, fmt, type, ctx->pixel_store, &outLen);
+		uint8_t *sliceData = ConvertPixelsToBGRA8(sliceSrc, w, h, fmt, type, ctx->pixel_store, ctx, &outLen);
 		if (sliceData) {
 			memcpy(converted + z * sliceSize, sliceData, sliceSize);
 			free(sliceData);

@@ -415,7 +415,7 @@ extern "C" int32_t pso_archive_testing_capture_stock(const char *output_path)
 		}
 
 		// ---------------------------------------------------------------
-		// NOTE: RAVE and GL PSO descriptors are deferred to Phases 8/9.
+		// NOTE: RAVE and GL PSO descriptors are deferred.
 		// The runtime-compile fallback covers any PSO not in the archive,
 		// so correctness is unaffected -- only first-launch latency for
 		// RAVE/GL-heavy apps is deferred.

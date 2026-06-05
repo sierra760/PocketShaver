@@ -4,19 +4,20 @@
  *  (C) 2026 Sierra Burkhart (sierra760)
  *
  *  Uber-shader using Metal function constants for compile-time
- *  specialization. 16 pipeline state variants are pre-built from
- *  combinations of texture/fog/alpha_test/multi_texture boolean constants.
+ *  specialization. RAVE builds texture/fog/alpha_test/multi_texture
+ *  combinations per blend mode, with premultiply tied to that blend mode.
  */
 
 #include <metal_stdlib>
 using namespace metal;
 
 // Function constants for pipeline specialization
-// 2 x 2 x 2 x 2 = 16 pipeline state combinations
+// Texture/fog/alpha/multitexture state, plus output alpha convention.
 constant bool has_texture       [[function_constant(0)]];
 constant bool has_fog           [[function_constant(1)]];
 constant bool has_alpha_test    [[function_constant(2)]];
 constant bool has_multi_texture [[function_constant(3)]];
+constant bool premultiply_output [[function_constant(4)]];
 
 struct VertexIn {
     float4 position [[attribute(0)]];
@@ -68,6 +69,7 @@ struct FragmentUniforms {
     float env_color_g;
     float env_color_b;
     float env_color_a;
+    int use_vertex_alpha_for_texture_opacity;
 };
 
 vertex VertexOut rave_vertex(VertexIn in [[stage_in]],
@@ -119,19 +121,20 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
 
         float4 texPix = tex.sample(samp, uv, bias(uniforms.mipmap_bias));
         bool sampledTransparentTexel = texPix.a <= 0.0;
+        float vertexOpacity = uniforms.use_vertex_alpha_for_texture_opacity ? color.a : 1.0;
 
         // TextureOp processing per RAVE spec: TextureOp is a mask, so the
         // decal/base step can be followed by diffuse modulation and highlight.
         if (uniforms.texture_op & 4) {  // Decal
             texPix.rgb = texPix.a * texPix.rgb + (1.0 - texPix.a) * color.rgb;
-            texPix.a = color.a;
+            texPix.a = vertexOpacity;
         } else if (uniforms.texture_op & 16) {  // Blend (bit 4): GL_TEXTURE_ENV_MODE GL_BLEND
             // Per GL spec: Cv = (1-Cs)*Cc + Cs*Cv where Cs=texture, Cc=env_color
             float3 envColor = float3(uniforms.env_color_r, uniforms.env_color_g, uniforms.env_color_b);
             texPix.rgb = (1.0 - texPix.rgb) * envColor + texPix.rgb * color.rgb;
-            texPix.a *= color.a;
+            texPix.a *= vertexOpacity;
         } else {
-            texPix.a *= color.a;
+            texPix.a *= vertexOpacity;
         }
 
         // Fully transparent samples must not write depth; Bugdom draws large
@@ -211,7 +214,7 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         float fog_factor = 1.0;
         if (uniforms.fog_mode == 1) {
             // Alpha-based fog: vertex alpha IS the fog interpolation factor
-            fog_factor = color.a;
+            fog_factor = in.color.a;
         } else if (uniforms.fog_mode == 2) {
             // Linear fog: use perspective depth; submitted z is post-projection depth and over-fogs QD3D menu billboards.
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
@@ -231,6 +234,10 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         if (uniforms.fog_mode == 1) {
             color.a = 1.0;  // FogMode_Alpha disables vertex alpha blending per spec
         }
+    }
+
+    if (premultiply_output) {
+        color.rgb *= color.a;
     }
 
     return color;

@@ -1,5 +1,7 @@
 /*
  *  nqd_main_device_policy.h - NQD policy for DSp-redirected MainDevice writes.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef NQD_MAIN_DEVICE_POLICY_H

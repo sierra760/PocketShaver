@@ -22,6 +22,7 @@
 #include "cpu_emulation.h"
 #include "macos_util.h"
 #include "gl_engine.h"
+#include "gl_agl_renderer_policy.h"
 #include "rave_metal_renderer.h"
 #include "metal_compositor.h"
 #include "gfxaccel_resources.h"
@@ -207,6 +208,7 @@ extern "C" int GLTesting_IsTestBuild(void)
 #define GL_POINT_BIT          0x00000002
 #define GL_LINE_BIT           0x00000004
 #define GL_POLYGON_BIT        0x00000008
+#define GL_PIXEL_MODE_BIT     0x00000020
 #define GL_LIGHTING_BIT       0x00000040
 #define GL_FOG_BIT            0x00000080
 #define GL_DEPTH_BUFFER_BIT   0x00000100
@@ -605,6 +607,14 @@ static GLContext *GLContextNew(int width, int height)
 	ctx->active_texture = 0;
 	ctx->client_active_texture = 0;
 	ctx->next_texture_name = 1;
+	ctx->completed_draw_serial = 0;
+	for (int u = 0; u < 4; u++) {
+		ctx->texture_2d_enable_draw_serial[u] = 0;
+		ctx->texcoord_array_enable_draw_serial[u] = 0;
+		ctx->prepared_texture_2d_for_draw[u] = false;
+		ctx->latched_texture_2d_for_array_draw[u] = false;
+		ctx->prepared_texcoord_array_for_draw[u] = false;
+	}
 
 	// ---- Enable/disable caps ----
 	ctx->depth_test = false;
@@ -998,6 +1008,37 @@ static GLContext *GLContextFromHandle(uint32_t mac_handle, int *out_idx = nullpt
 	return gl_contexts[idx];
 }
 
+extern "C" int GLContextGetOffscreenDrawable(GLContext *context,
+                                             uint32_t *outW,
+                                             uint32_t *outH,
+                                             uint32_t *outRowbytes,
+                                             uint32_t *outBaseaddr)
+{
+	if (context == nullptr) return 0;
+
+	for (int i = 0; i < GL_MAX_CONTEXTS; i++) {
+		if (gl_contexts[i] != context) continue;
+
+		const AGLContextState &state = agl_ctx_state[i];
+		if (!GLShouldReadbackOffscreenDrawable(
+		        state.agl_offscreen,
+		        state.agl_offscreen_width,
+		        state.agl_offscreen_height,
+		        state.agl_offscreen_rowbytes,
+		        state.agl_offscreen_baseaddr)) {
+			return 0;
+		}
+
+		if (outW) *outW = state.agl_offscreen_width;
+		if (outH) *outH = state.agl_offscreen_height;
+		if (outRowbytes) *outRowbytes = state.agl_offscreen_rowbytes;
+		if (outBaseaddr) *outBaseaddr = state.agl_offscreen_baseaddr;
+		return 1;
+	}
+
+	return 0;
+}
+
 
 /*
  *  NativeAGLSetCurrentContext(r3=ctx)
@@ -1356,8 +1397,8 @@ uint32_t NativeAGLDescribePixelFormat(uint32_t pix, uint32_t attrib, uint32_t va
 		case AGL_ACCUM_ALPHA_SIZE: value = 16; break;
 		case AGL_PIXEL_SIZE:       value = 32; break;
 		case AGL_WINDOW:           value = 1; break;   // always windowed
-		case AGL_RENDERER_ID:      value = 0x00020400; break;  // ATI Rage 128 Pro
-		case AGL_ACCELERATED:      value = 1; break;
+		case AGL_RENDERER_ID:      value = (int32_t)GLAGLRendererID(); break;
+		case AGL_ACCELERATED:      value = GLAGLRendererIsAccelerated() ? 1 : 0; break;
 		case AGL_COMPLIANT:        value = 1; break;
 		// Return valid values for the single-renderer/single-screen iOS
 		// Metal model instead of AGL_BAD_ATTRIBUTE. A conformant app querying
@@ -1443,6 +1484,36 @@ uint32_t NativeAGLCopyContext(uint32_t src, uint32_t dst, uint32_t mask)
 		d->fog_start = s->fog_start;
 		d->fog_end = s->fog_end;
 		memcpy(d->fog_color, s->fog_color, sizeof(s->fog_color));
+	}
+	if (mask & GL_PIXEL_MODE_BIT) {
+		d->pixel_zoom_x = s->pixel_zoom_x;
+		d->pixel_zoom_y = s->pixel_zoom_y;
+		d->pixel_transfer_red_scale = s->pixel_transfer_red_scale;
+		d->pixel_transfer_green_scale = s->pixel_transfer_green_scale;
+		d->pixel_transfer_blue_scale = s->pixel_transfer_blue_scale;
+		d->pixel_transfer_alpha_scale = s->pixel_transfer_alpha_scale;
+		d->pixel_transfer_red_bias = s->pixel_transfer_red_bias;
+		d->pixel_transfer_green_bias = s->pixel_transfer_green_bias;
+		d->pixel_transfer_blue_bias = s->pixel_transfer_blue_bias;
+		d->pixel_transfer_alpha_bias = s->pixel_transfer_alpha_bias;
+		d->pixel_transfer_depth_scale = s->pixel_transfer_depth_scale;
+		d->pixel_transfer_depth_bias = s->pixel_transfer_depth_bias;
+		memcpy(d->pixel_map_i_to_r, s->pixel_map_i_to_r, sizeof(s->pixel_map_i_to_r));
+		memcpy(d->pixel_map_i_to_g, s->pixel_map_i_to_g, sizeof(s->pixel_map_i_to_g));
+		memcpy(d->pixel_map_i_to_b, s->pixel_map_i_to_b, sizeof(s->pixel_map_i_to_b));
+		memcpy(d->pixel_map_i_to_a, s->pixel_map_i_to_a, sizeof(s->pixel_map_i_to_a));
+		memcpy(d->pixel_map_r_to_r, s->pixel_map_r_to_r, sizeof(s->pixel_map_r_to_r));
+		memcpy(d->pixel_map_g_to_g, s->pixel_map_g_to_g, sizeof(s->pixel_map_g_to_g));
+		memcpy(d->pixel_map_b_to_b, s->pixel_map_b_to_b, sizeof(s->pixel_map_b_to_b));
+		memcpy(d->pixel_map_a_to_a, s->pixel_map_a_to_a, sizeof(s->pixel_map_a_to_a));
+		d->pixel_map_i_to_r_size = s->pixel_map_i_to_r_size;
+		d->pixel_map_i_to_g_size = s->pixel_map_i_to_g_size;
+		d->pixel_map_i_to_b_size = s->pixel_map_i_to_b_size;
+		d->pixel_map_i_to_a_size = s->pixel_map_i_to_a_size;
+		d->pixel_map_r_to_r_size = s->pixel_map_r_to_r_size;
+		d->pixel_map_g_to_g_size = s->pixel_map_g_to_g_size;
+		d->pixel_map_b_to_b_size = s->pixel_map_b_to_b_size;
+		d->pixel_map_a_to_a_size = s->pixel_map_a_to_a_size;
 	}
 	if (mask & GL_DEPTH_BUFFER_BIT) {
 		d->depth_func = s->depth_func;
@@ -2061,10 +2132,10 @@ uint32_t NativeAGLDescribeRenderer(uint32_t rend, uint32_t prop, uint32_t valueP
 
 	int32_t value = 0;
 	switch (prop) {
-		case AGL_ACCELERATED:      value = 1; break;
-		case AGL_RENDERER_ID:      value = 0x00020400; break;  // ATI Rage 128 Pro
-		case AGL_VIDEO_MEMORY:     value = 16 * 1024 * 1024; break;  // 16MB
-		case AGL_TEXTURE_MEMORY:   value = 16 * 1024 * 1024; break;  // 16MB
+		case AGL_ACCELERATED:      value = GLAGLRendererIsAccelerated() ? 1 : 0; break;
+		case AGL_RENDERER_ID:      value = (int32_t)GLAGLRendererID(); break;
+		case AGL_VIDEO_MEMORY:     value = (int32_t)GLAGLRendererVideoMemoryBytes(); break;
+		case AGL_TEXTURE_MEMORY:   value = (int32_t)GLAGLRendererTextureMemoryBytes(); break;
 		case AGL_BUFFER_MODES:     value = AGL_DOUBLEBUFFER_BIT | AGL_SINGLEBUFFER_BIT; break;
 		case AGL_COLOR_MODES:      value = AGL_ARGB8888_BIT | AGL_RGB888_BIT; break;
 		case AGL_DEPTH_MODES:      value = AGL_32_BIT | AGL_16_BIT; break;
@@ -2637,6 +2708,29 @@ void GLInstallHooks()
 	};
 	const int num_gl = sizeof(gl_symbols) / sizeof(gl_symbols[0]);
 
+	// GL 1.2 / EXT palette entry points are not part of the fixed AGL context
+	// dispatch table above. Hook them separately so older games can discover a
+	// color-table path without changing GL_DISPATCH_TABLE_ENTRIES indexing.
+	GLSymbolEntry gl_extra_symbols[] = {
+		{ "\014glColorTable", GL_SUB_COLOR_TABLE, "glColorTable" },
+		{ "\017glColorTableEXT", GL_SUB_COLOR_TABLE, "glColorTableEXT" },
+		{ "\027glColorTableParameterfv", GL_SUB_COLOR_TABLE_PARAMETERFV, "glColorTableParameterfv" },
+		{ "\032glColorTableParameterfvEXT", GL_SUB_COLOR_TABLE_PARAMETERFV, "glColorTableParameterfvEXT" },
+		{ "\027glColorTableParameteriv", GL_SUB_COLOR_TABLE_PARAMETERIV, "glColorTableParameteriv" },
+		{ "\032glColorTableParameterivEXT", GL_SUB_COLOR_TABLE_PARAMETERIV, "glColorTableParameterivEXT" },
+		{ "\017glColorSubTable", GL_SUB_COLOR_SUB_TABLE, "glColorSubTable" },
+		{ "\022glColorSubTableEXT", GL_SUB_COLOR_SUB_TABLE, "glColorSubTableEXT" },
+		{ "\020glCopyColorTable", GL_SUB_COPY_COLOR_TABLE, "glCopyColorTable" },
+		{ "\023glCopyColorSubTable", GL_SUB_COPY_COLOR_SUB_TABLE, "glCopyColorSubTable" },
+		{ "\017glGetColorTable", GL_SUB_GET_COLOR_TABLE, "glGetColorTable" },
+		{ "\022glGetColorTableEXT", GL_SUB_GET_COLOR_TABLE, "glGetColorTableEXT" },
+		{ "\032glGetColorTableParameterfv", GL_SUB_GET_COLOR_TABLE_PARAMETERFV, "glGetColorTableParameterfv" },
+		{ "\035glGetColorTableParameterfvEXT", GL_SUB_GET_COLOR_TABLE_PARAMETERFV, "glGetColorTableParameterfvEXT" },
+		{ "\032glGetColorTableParameteriv", GL_SUB_GET_COLOR_TABLE_PARAMETERIV, "glGetColorTableParameteriv" },
+		{ "\035glGetColorTableParameterivEXT", GL_SUB_GET_COLOR_TABLE_PARAMETERIV, "glGetColorTableParameterivEXT" },
+	};
+	const int num_gl_extra = sizeof(gl_extra_symbols) / sizeof(gl_extra_symbols[0]);
+
 	// ---- Cache AGL TVECTs ----
 	struct CachedTVECT {
 		uint32_t tvect;     // Mac-side TVECT address found by FindLibSymbol
@@ -2674,6 +2768,23 @@ void GLInstallHooks()
 		}
 	}
 	GL_LOG("GLInstallHooks: found %d core GL functions, %d not found", gl_found, gl_notfound);
+
+	// Search color-table extension functions without expanding the AGL context
+	// dispatch table. The next F/A-18 log should show whether OpenGLLibrary
+	// exposes these symbols, and whether palette uploads then reach gl_state.
+	int gl_extra_found = 0, gl_extra_notfound = 0;
+	for (int i = 0; i < num_gl_extra; i++) {
+		uint32_t tvect = FindLibSymbol(gl_lib, gl_extra_symbols[i].pascal_sym);
+		if (tvect != 0) {
+			cached_tvects.push_back({ tvect, gl_extra_symbols[i].sub_opcode, gl_extra_symbols[i].name });
+			gl_extra_found++;
+			GL_LOG("  found %s at TVECT 0x%08x", gl_extra_symbols[i].name, tvect);
+		} else {
+			gl_extra_notfound++;
+		}
+	}
+	GL_LOG("GLInstallHooks: found %d color-table GL functions, %d not found",
+	       gl_extra_found, gl_extra_notfound);
 
 	// ---- Step 2: Patch found TVECTs ----
 	//
@@ -3297,6 +3408,10 @@ extern void NativeGLTexImage2D_Direct(GLContext *ctx, uint32_t target, int32_t l
 // binds to it — mirror gl_state.cpp:430-432.
 extern void GLMetalUploadTexture(GLContext *ctx, GLTextureObject *texObj, int level,
                                   int width, int height, const uint8_t *data, int dataLen);
+extern uint8_t *GLConvertMacPixelsToBGRA8(GLContext *ctx, uint32_t mac_pixels,
+                                          int width, int height,
+                                          uint32_t format, uint32_t type,
+                                          int *outLen);
 
 // Host-pixel -> Metal texture uploader for the mipmap path.
 //
@@ -3409,59 +3524,66 @@ uint32_t NativeGLUBuild2DMipmaps(GLContext *ctx,
 
 	if (!ctx || data_ptr == 0 || width <= 0 || height <= 0) return GLU_INVALID_VALUE;
 
-	// Determine bytes per pixel
-	int bpp;
-	switch (format) {
-		case GL_RGBA:           bpp = 4; break;
-		case GL_RGB:            bpp = 3; break;
-		case GL_LUMINANCE_ALPHA: bpp = 2; break;
-		case GL_LUMINANCE:
-		case GL_ALPHA:          bpp = 1; break;
-		default:                bpp = 4; break; // assume RGBA
+	uint32_t texName = 0;
+	if (target == GL_TEXTURE_2D)
+		texName = ctx->tex_units[ctx->active_texture].bound_texture_2d;
+	else if (target == GL_TEXTURE_1D)
+		texName = ctx->tex_units[ctx->active_texture].bound_texture_1d;
+
+	if (texName == 0) return 0;
+
+	auto texIt = ctx->texture_objects.find(texName);
+	if (texIt == ctx->texture_objects.end()) return 0;
+	GLTextureObject &tex = texIt->second;
+	tex.has_mipmaps = true;
+	tex.width = width;
+	tex.height = height;
+
+	int baseBGRABytes = 0;
+	uint8_t *baseBGRA = GLConvertMacPixelsToBGRA8(
+		ctx, data_ptr, width, height, format, type, &baseBGRABytes);
+	const int expectedBaseBGRABytes = width * height * 4;
+	if (!baseBGRA || baseBGRABytes < expectedBaseBGRABytes) {
+		if (baseBGRA) free(baseBGRA);
+		return GLU_OUT_OF_MEMORY;
 	}
 
-	if (type != GL_UNSIGNED_BYTE) {
-		GL_LOG("gluBuild2DMipmaps: unsupported type 0x%x, treating as UNSIGNED_BYTE", type);
-	}
+	std::vector<uint8_t> current(baseBGRA, baseBGRA + expectedBaseBGRABytes);
+	free(baseBGRA);
 
-	// Read base level pixels from PPC memory
-	int base_size = width * height * bpp;
-	std::vector<uint8_t> current(base_size);
-	for (int i = 0; i < base_size; i++)
-		current[i] = ReadMacInt8(data_ptr + i);
+	GLMetalUploadTexture(ctx, &tex, 0, width, height,
+	                     current.data(), (int)current.size());
 
-	// Upload level 0 via the host-pixel uploader. Previously this routed through
-	// a no-op fallback, which dropped every computed level (silent untextured output).
-	// NativeGLTexImage2D_Direct converts to BGRA8 and uploads to the bound texture.
-	NativeGLTexImage2D_Direct(ctx, target, 0, internalFormat, width, height, 0, format, type, current.data(), base_size);
-
-	// Generate mipmap chain by box filtering
+	// Generate mipmap chain by box filtering canonical BGRA8 upload pixels.
+	// This preserves legacy/packed source interpretation from the base
+	// converter instead of reinterpreting downsampled bytes as the original
+	// guest format on each mip level.
 	int level = 1;
 	int w = width, h = height;
 	while (w > 1 || h > 1) {
 		int nw = (w > 1) ? w / 2 : 1;
 		int nh = (h > 1) ? h / 2 : 1;
 
-		std::vector<uint8_t> next(nw * nh * bpp);
+		std::vector<uint8_t> next(nw * nh * 4);
 
 		for (int y = 0; y < nh; y++) {
 			for (int x = 0; x < nw; x++) {
 				int sx = x * 2, sy = y * 2;
-				for (int c = 0; c < bpp; c++) {
+				for (int c = 0; c < 4; c++) {
 					int sum = 0;
 					int count = 0;
 					// Average 2x2 block (handling edge cases)
-					sum += current[(sy * w + sx) * bpp + c]; count++;
-					if (sx + 1 < w) { sum += current[(sy * w + sx + 1) * bpp + c]; count++; }
-					if (sy + 1 < h) { sum += current[((sy + 1) * w + sx) * bpp + c]; count++; }
-					if (sx + 1 < w && sy + 1 < h) { sum += current[((sy + 1) * w + sx + 1) * bpp + c]; count++; }
-					next[(y * nw + x) * bpp + c] = (uint8_t)(sum / count);
+					sum += current[(sy * w + sx) * 4 + c]; count++;
+					if (sx + 1 < w) { sum += current[(sy * w + sx + 1) * 4 + c]; count++; }
+					if (sy + 1 < h) { sum += current[((sy + 1) * w + sx) * 4 + c]; count++; }
+					if (sx + 1 < w && sy + 1 < h) { sum += current[((sy + 1) * w + sx + 1) * 4 + c]; count++; }
+					next[(y * nw + x) * 4 + c] = (uint8_t)(sum / count);
 				}
 			}
 		}
 
-		// Upload each downsampled mip level via the host-pixel uploader.
-		NativeGLTexImage2D_Direct(ctx, target, level, internalFormat, nw, nh, 0, format, type, next.data(), nw * nh * bpp);
+		GLMetalUploadTexture(ctx, &tex, level, nw, nh,
+		                     next.data(), (int)next.size());
 
 		current = std::move(next);
 		w = nw;

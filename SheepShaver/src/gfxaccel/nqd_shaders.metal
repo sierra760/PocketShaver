@@ -369,8 +369,8 @@ kernel void nqd_bitblt(device uint8_t *buffer        [[buffer(0)]],
             //   addOver(34),subOver(38),hilite(50) -> srcXor (dst = src ^ dst)
             //   addPin(33),addMax(37)           -> srcBic   (dst = ~src & dst)
             //   subPin(35),adMin(39),transparent(36) -> srcOr (dst = src | dst)
-            // hilite(50) -> srcXor is load-bearing (the audit one-liner omitted
-            // it); it is included here per IWQD Table 4-2.
+            // hilite(50) -> srcXor is load-bearing and is included here per
+            // IWQD Table 4-2.
             if (bpp_local == 1) {
                 uint b1_src = src_val & 1u;
                 uint b1_dst = dst_val & 1u;
@@ -966,4 +966,3 @@ kernel void nqd_bitblt_scaled(device uint8_t *buffer                  [[buffer(0
 
     nqd_write_pixel(buffer, dst_addr, bpp, out_pixel);
 }
-

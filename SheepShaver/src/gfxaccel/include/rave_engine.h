@@ -14,6 +14,8 @@
 
 #include <stdint.h>
 
+#include "rave_ati_tag_policy.h"
+
 struct RaveBGRAImageStats {
 	uint32_t nonzero;       // any BGRA channel is non-zero
 	uint32_t alpha;         // alpha channel is non-zero
@@ -198,7 +200,7 @@ enum {
 	kRaveHookAccessBitmapEnd  = 219,  // QAAccessBitmapEnd hook
 	// Q3Pixmap_Set_Image intercept. Dispatch
 	// sub-opcode only — the activation path (FindLibSymbol hook on the
-	// QuickDraw 3D library fragment) is deferred to a follow-up phase.
+	// QuickDraw 3D library fragment) is deferred to a follow-up change.
 	// When activated, the PPC thunk dispatches here with
 	// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount. Tests invoke
 	// NativeHookQ3PixmapSetImage directly (no dispatch round-trip).
@@ -210,7 +212,7 @@ enum {
 };
 
 // ATI RaveExtFuncs sub-opcodes (300-303)
-// These are PPC-callable TVECTs delivered via SetPtr(kATIRaveExtFuncs)
+// These are PPC-callable TVECTs delivered via kATIRaveExtFuncs.
 enum {
 	kRaveATIClearDrawBuffer  = 300,
 	kRaveATIClearZBuffer     = 301,
@@ -232,11 +234,6 @@ enum {
  */
 
 #define RAVE_MAX_TAG 154  // covers GL tags up to kQATagGL_TextureEnvColor_b (153)
-#define RAVE_ATI_TAG_COUNT 43  // kATITriCache(0) through kATIMeshAsStrip(42)
-
-static constexpr uint32_t kRaveATIDepthWriteEnableTag = 1022;
-static constexpr uint32_t kRaveATIDepthWriteEnableIndex = kRaveATIDepthWriteEnableTag - 1000;
-
 static inline bool RaveEffectiveDepthWriteEnabled(uint32_t standardZBufferMask,
                                                   uint32_t atiDepthWriteEnable)
 {
@@ -286,6 +283,8 @@ struct ZSortTriangle {
 	uint32_t   textureMacAddr;
 	int32_t    textureOp;
 	int32_t    blendMode;
+	uint32_t   glBlendSrc;
+	uint32_t   glBlendDst;
 	int32_t    filterMode;
 };
 
@@ -349,7 +348,7 @@ extern uint32_t RaveDispatchARC(uint32_t r3, uint32_t r4, uint32_t r5,
                                 uint32_t r6, uint32_t r7, uint32_t r8);
 
 
-// Engine registration entry point (implemented in plan 02)
+// Engine registration entry point
 extern void RaveRegisterEngine(void);
 
 // Returns true if RAVE engine has been successfully registered
@@ -537,6 +536,7 @@ struct RaveResourceEntry {
 	bool             pixels_copied;   // true once non-empty direct texture data has been observed
 	uint32_t         diag_alpha_zero; // diagnostic: transparent pixels after latest CLUT expansion
 	uint32_t         diag_index_zero; // diagnostic: source index-zero pixels after latest CLUT expansion
+	uint32_t         diag_rgb_nonzero; // diagnostic: non-black level-0 RGB pixels after conversion
 
 	// CPU pixel access (AccessTexture/AccessBitmap support)
 	uint8_t         *cpu_pixel_data;       // permanent CPU copy in original Mac format
@@ -651,6 +651,7 @@ extern int32_t NativeEngineColorTableNew(uint32_t tableType, uint32_t pixelDataA
 extern void NativeEngineColorTableDelete(uint32_t colorTableAddr);
 extern int32_t NativeEngineTextureBindColorTable(uint32_t textureAddr, uint32_t colorTableAddr);
 extern int32_t NativeEngineBitmapBindColorTable(uint32_t bitmapAddr, uint32_t colorTableAddr);
+extern bool RaveGetLastCL8ColorTableRGBSnapshot(uint8_t outRGB[768]);
 
 // AccessTexture/AccessBitmap CPU pixel access (RAVE 1.6)
 // SDK signatures: AccessTexture(texture, mipmapLevel, flags, TQAPixelBuffer*)
@@ -674,7 +675,7 @@ extern void RaveReleaseTexture(void *metalTexture);
 
 /*
  *  ATI RaveExtFuncs native handlers (implemented in rave_metal_renderer.mm)
- *  Temporary weak stubs in rave_dispatch.cpp until Plan 04 provides real implementations.
+ *  Temporary weak stubs in rave_dispatch.cpp until native implementations are available.
  */
 extern int32_t NativeATIClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr);
 extern int32_t NativeATIClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr);

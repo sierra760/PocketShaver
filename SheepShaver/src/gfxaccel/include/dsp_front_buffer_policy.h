@@ -1,5 +1,7 @@
 /*
  *  dsp_front_buffer_policy.h - DrawSprocket front-buffer metadata helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_FRONT_BUFFER_POLICY_H
@@ -27,9 +29,9 @@ static inline bool DSpShouldReuseBackBufferCGrafPtrForFrontBuffer(
 
 static inline uint32_t DSpFrontBufferRowBytes(uint32_t width,
                                               uint32_t back_buffer_depth,
-                                              uint32_t display_depth)
+	uint32_t display_depth)
 {
-	return DSpDisplayModeRowBytes(
+	return DSpDisplayModePitch(
 		width,
 		DSpFrontBufferDepth(back_buffer_depth, display_depth));
 }
@@ -58,6 +60,61 @@ static inline bool DSpShouldPresentFrontBufferStagingForState(
 	                                          display_depth,
 	                                          front_staging_mac_addr,
 	                                          front_staging_size);
+}
+
+static inline bool DSpShouldPresentFrontBufferStagingForSwap(
+	uint32_t back_buffer_depth,
+	uint32_t display_depth,
+	uint32_t front_staging_mac_addr,
+	uint32_t front_staging_size,
+	uint32_t context_state,
+	uint32_t active_state)
+{
+	(void)back_buffer_depth;
+	(void)display_depth;
+	(void)front_staging_mac_addr;
+	(void)front_staging_size;
+	(void)context_state;
+	(void)active_state;
+	return false;
+}
+
+static inline bool DSpShouldSeedFrontBufferStagingFromBackStaging(
+	uint32_t back_buffer_depth,
+	uint32_t front_depth,
+	uint32_t back_staging_mac_addr,
+	uint32_t back_staging_size,
+	uint32_t back_staging_row_bytes,
+	uint32_t front_staging_size,
+	uint32_t front_staging_row_bytes)
+{
+	return back_buffer_depth != 0 &&
+	       front_depth == back_buffer_depth &&
+	       back_staging_mac_addr != 0 &&
+	       front_staging_size != 0 &&
+	       back_staging_size >= front_staging_size &&
+	       back_staging_row_bytes == front_staging_row_bytes;
+}
+
+static inline bool DSpShouldRefreshFrontBufferStagingFromBackStaging(
+	uint32_t back_buffer_depth,
+	uint32_t front_depth,
+	uint32_t back_staging_mac_addr,
+	uint32_t front_staging_mac_addr,
+	uint32_t back_staging_size,
+	uint32_t front_staging_size,
+	uint32_t back_staging_row_bytes,
+	uint32_t front_staging_row_bytes)
+{
+	return front_staging_mac_addr != 0 &&
+	       DSpShouldSeedFrontBufferStagingFromBackStaging(
+	           back_buffer_depth,
+	           front_depth,
+	           back_staging_mac_addr,
+	           back_staging_size,
+	           back_staging_row_bytes,
+	           front_staging_size,
+	           front_staging_row_bytes);
 }
 
 static inline uint32_t DSpFrontBufferPixMapRecordSize(void)

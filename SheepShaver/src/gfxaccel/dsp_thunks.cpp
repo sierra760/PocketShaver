@@ -255,7 +255,7 @@ void DSpThunksInit(void)
 	 * coords/mouse, 730-739 queries/grid, 739-747 save-restore-flatten +
 	 * queue/switch, 750 DSpProcessEvent, 760-761 blanking/debug),
 	 * so each contiguous sub-band is allocated by its own loop to avoid
-	 * reserving TVECTs for the gap integers between bands. */
+	 * reserving TVECTs for unused integers between bands. */
 	for (int op = kDSpAltBuffer_New;
 	     op <= kDSpContext_SetUnderlayAltBuffer; op++) {       /* 700..705 */
 		uint32 tvect = AllocateDSpTVECT(op, dsp_opcode);

@@ -766,11 +766,14 @@ struct GLTextureObject {
     int      depth;          // for 3D textures (GL_TEXTURE_3D_EXT)
     uint32_t min_filter;     // GLenum: GL_NEAREST, GL_LINEAR, etc.
     uint32_t mag_filter;     // GLenum
-    uint32_t wrap_s;         // GLenum: GL_REPEAT, GL_CLAMP, etc.
-    uint32_t wrap_t;         // GLenum
-    int      env_mode;       // GL_MODULATE, GL_DECAL, GL_BLEND, GL_REPLACE
-    bool     has_mipmaps;
-};
+	    uint32_t wrap_s;         // GLenum: GL_REPEAT, GL_CLAMP, etc.
+		    uint32_t wrap_t;         // GLenum
+			    int      env_mode;       // GL_MODULATE, GL_DECAL, GL_BLEND, GL_REPLACE
+			    bool     has_mipmaps;
+			    bool     legacy_ushort_palette_index_chain; // level-0 duplicated-byte indexed palette applies to mips
+				    bool     legacy_ushort_bgr332_chain; // level-0 duplicated-byte BGR332 fallback may apply to duplicated mips
+			    bool     legacy_ushort_index_gray_chain; // level-0 duplicated-byte index fallback applies to mips
+			};
 
 
 /*
@@ -1176,6 +1179,19 @@ struct GLContext {
     GLVertexArrayPointer edge_flag_array;
     GLVertexArrayPointer index_array;
 
+    // ---- Immediate draw-state latches ----
+    // ATI-era clients such as Warcraft III prepare texture state and client
+    // texcoords, then disable them immediately before glDrawElements. Track
+    // same-draw cleanup plus a bounded texture latch for subsequent array
+    // draws that keep binding textures and texcoords in the same batch.
+    uint32_t completed_draw_serial;
+    uint32_t texture_2d_enable_draw_serial[4];
+    uint32_t texcoord_array_enable_draw_serial[4];
+    bool     prepared_texture_2d_for_draw[4];
+    bool     latched_texture_2d_for_array_draw[4];
+    bool     prepared_texcoord_array_for_draw[4];
+    GLVertexArrayPointer prepared_texcoord_array[4];
+
     // ---- Display lists ----
     std::unordered_map<uint32_t, GLDisplayList> display_lists;
     uint32_t next_list_name;
@@ -1264,10 +1280,18 @@ struct GLContext {
     float    pixel_transfer_depth_scale;
     float    pixel_transfer_depth_bias;
     // Pixel maps (small tables, max 256 entries each)
+    float    pixel_map_i_to_r[256];
+    float    pixel_map_i_to_g[256];
+    float    pixel_map_i_to_b[256];
+    float    pixel_map_i_to_a[256];
     float    pixel_map_r_to_r[256];
     float    pixel_map_g_to_g[256];
     float    pixel_map_b_to_b[256];
     float    pixel_map_a_to_a[256];
+    int      pixel_map_i_to_r_size;
+    int      pixel_map_i_to_g_size;
+    int      pixel_map_i_to_b_size;
+    int      pixel_map_i_to_a_size;
     int      pixel_map_r_to_r_size;
     int      pixel_map_g_to_g_size;
     int      pixel_map_b_to_b_size;
@@ -1392,6 +1416,7 @@ extern GLFuncSignature gl_func_signatures[];
 // Metal renderer functions (implemented in gl_metal_renderer.mm)
 extern void GLMetalInit(GLContext *ctx);
 extern void GLMetalBeginFrame(GLContext *ctx);
+extern void GLMetalClear(GLContext *ctx, uint32_t mask);
 extern void GLMetalEndFrame(GLContext *ctx);
 extern void GLMetalFlushImmediateMode(GLContext *ctx);
 extern void GLMetalRelease(GLContext *ctx);
@@ -1434,6 +1459,32 @@ void gl_overlay_present(void);
 int  gl_has_active_overlay(void);
 int  gl_get_overlay_dims(uint32_t *outW, uint32_t *outH);
 void gl_release_overlay_for_detach(void);
+int  GLContextGetOffscreenDrawable(GLContext *ctx,
+                                   uint32_t *outW,
+                                   uint32_t *outH,
+                                   uint32_t *outRowbytes,
+                                   uint32_t *outBaseaddr);
+uint64_t GLCompositeLatestOffscreenToGuestSurface(uint32_t dstBaseaddr,
+                                                  uint32_t dstRowbytes,
+                                                  uint32_t dstWidth,
+                                                  uint32_t dstHeight,
+                                                  uint32_t dstDepthBits);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtent(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentDirtyRect(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits,
+	int32_t dirtyX,
+	int32_t dirtyY,
+	int32_t dirtyWidth,
+	int32_t dirtyHeight);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentIfNotSuppressed(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits);
 #ifdef __cplusplus
 }
 #endif

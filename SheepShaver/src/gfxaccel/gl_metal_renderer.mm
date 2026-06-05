@@ -19,9 +19,10 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
-#include <cstddef>   // offsetof (IN-01: clip_planes alignment static_assert)
+#include <cstddef>   // offsetof for clip_planes alignment static_assert
 #include <cmath>
 #include <unordered_map>
 #include <vector>
@@ -38,6 +39,7 @@
 #include "metal_device_shared.h"
 #include "gl_metal_coordinates.h"
 #include "gl_metal_draw_state.h"
+#include "gl_offscreen_policy.h"
 
 // Logging macro (matches gl_dispatch.cpp pattern)
 #if ACCEL_LOGGING_ENABLED
@@ -59,7 +61,10 @@ extern uint32 Mac_sysalloc(uint32 size);
  *  overlay MTLTexture at a time, vended by
  *  gfxaccel_resources_vend_overlay_texture(kGfxEngineGL, ...) and released
  *  via gfxaccel_resources_release_overlay_texture. Same-resolution rebind =
- *  cache-hit recycle; resolution change = re-vend.
+ *  cache-hit recycle; resolution change = re-vend. Display-mode handoff
+ *  may release the vended texture while keeping the drawable binding and
+ *  dimensions intact; the next present/render pass can lazily re-vend for
+ *  the still-bound drawable.
  *
  *  NativeAGLSwapBuffers emits a kLayerSlotOverlay CompositeLayer via
  *  MetalCompositorSubmitFrame — the "active" signal is the presence of the
@@ -73,6 +78,15 @@ static int32_t        s_gl_dst_left    = 0;
 static int32_t        s_gl_dst_top     = 0;
 static int32_t        s_gl_dst_width   = 0;
 static int32_t        s_gl_dst_height  = 0;
+static bool           s_gl_overlay_committed_frame = false;
+
+static bool gl_overlay_drawable_bound(void)
+{
+    return GLShouldPreserveOverlayBindingAfterResourceDetach(
+        s_gl_dst_width > 0 && s_gl_dst_height > 0,
+        s_gl_dst_width,
+        s_gl_dst_height);
+}
 
 // ---------------------------------------------------------------------------
 // Test-only device/queue/bundle/overlay override.
@@ -124,6 +138,7 @@ extern "C" void GLTesting_Reset(void)
 	s_gl_overlay_tex   = nil;
 	s_gl_overlay_w     = 0;
 	s_gl_overlay_h     = 0;
+	s_gl_overlay_committed_frame = false;
 }
 
 #endif /* TESTING_BUILD */
@@ -151,6 +166,7 @@ static id<MTLTexture> gl_acquire_overlay_texture(uint32_t width, uint32_t height
     s_gl_overlay_tex = (__bridge id<MTLTexture>)raw;
     s_gl_overlay_w = width;
     s_gl_overlay_h = height;
+    s_gl_overlay_committed_frame = false;
     return s_gl_overlay_tex;
 }
 
@@ -164,8 +180,7 @@ static void gl_release_overlay_texture(void)
     gfxaccel_resources_release_overlay_texture(
         kGfxEngineGL, (__bridge void *)s_gl_overlay_tex);
     s_gl_overlay_tex = nil;
-    s_gl_overlay_w = 0;
-    s_gl_overlay_h = 0;
+    s_gl_overlay_committed_frame = false;
 }
 
 /*
@@ -181,15 +196,19 @@ extern "C" void gl_overlay_bind(int32_t left, int32_t top, int32_t width, int32_
         GL_METAL_LOG("gl_overlay_bind: invalid dims %dx%d — ignoring", width, height);
         return;
     }
+    s_gl_dst_left   = left;
+    s_gl_dst_top    = top;
+    s_gl_dst_width  = width;
+    s_gl_dst_height = height;
+    if (s_gl_overlay_w == 0 || s_gl_overlay_h == 0) {
+        s_gl_overlay_w = (uint32_t)width;
+        s_gl_overlay_h = (uint32_t)height;
+    }
     id<MTLTexture> tex = gl_acquire_overlay_texture((uint32_t)width, (uint32_t)height);
     if (tex == nil) {
         GL_METAL_LOG("gl_overlay_bind: vend(%dx%d) FAILED", width, height);
         return;
     }
-    s_gl_dst_left   = left;
-    s_gl_dst_top    = top;
-    s_gl_dst_width  = width;
-    s_gl_dst_height = height;
     GL_METAL_LOG("gl_overlay_bind: vended overlay %dx%d at (%d,%d)", width, height, left, top);
 }
 
@@ -208,6 +227,8 @@ extern "C" void gl_overlay_unbind(void)
     s_gl_dst_top = 0;
     s_gl_dst_width = 0;
     s_gl_dst_height = 0;
+    s_gl_overlay_w = 0;
+    s_gl_overlay_h = 0;
 }
 
 /*
@@ -218,14 +239,54 @@ extern "C" void gl_overlay_unbind(void)
  *  per-frame-pacing pair — SubmitFrame's semaphore provides pacing and the
  *  layer presence is the "active" signal.
  *
- *  Silent no-op if there's no cached overlay (defensive — e.g. present
- *  called before bind).
+ *  A bind-only texture is not a frame. If the app swaps before issuing any
+ *  GL draw/clear that commits a command buffer, skip SubmitFrame so the
+ *  compositor cache is not replaced with an uninitialized overlay.
  */
 extern "C" void gl_overlay_present(void)
 {
+    if (!s_gl_overlay_committed_frame) {
+        GL_METAL_LOG("gl_overlay_present: overlay has no committed frame — skipping SubmitFrame");
+        return;
+    }
+    if (GLShouldReacquireBoundOverlayForPresent(
+            s_gl_overlay_tex != nil,
+            gl_overlay_drawable_bound(),
+            s_gl_dst_width,
+            s_gl_dst_height)) {
+        const uint32_t w = s_gl_overlay_w != 0 ? s_gl_overlay_w : (uint32_t)s_gl_dst_width;
+        const uint32_t h = s_gl_overlay_h != 0 ? s_gl_overlay_h : (uint32_t)s_gl_dst_height;
+        if (gl_acquire_overlay_texture(w, h) != nil) {
+            GL_METAL_LOG("gl_overlay_present: reacquired overlay %ux%u for bound drawable",
+                         w, h);
+        }
+    }
     if (s_gl_overlay_tex == nil) {
         GL_METAL_LOG("gl_overlay_present: no cached overlay — skipping SubmitFrame");
         return;
+    }
+    if (!GLShouldSubmitOverlayFrame(s_gl_overlay_tex != nil,
+                                    s_gl_overlay_committed_frame)) {
+        GL_METAL_LOG("gl_overlay_present: overlay has no committed frame — skipping SubmitFrame");
+        return;
+    }
+
+    const struct DMCModeSnapshot *snap = dmc_current_snapshot();
+    const GLOverlayLayerRect rect = GLMakeOverlayLayerRect(
+        s_gl_dst_left,
+        s_gl_dst_top,
+        s_gl_dst_width,
+        s_gl_dst_height,
+        s_gl_overlay_w,
+        s_gl_overlay_h,
+        snap ? snap->width : 0,
+        snap ? snap->height : 0);
+    if (rect.framebuffer_space) {
+        GL_METAL_LOG("gl_overlay_present: using framebuffer-space overlay rect %ux%u for drawable rect %dx%d",
+                     snap ? snap->width : 0,
+                     snap ? snap->height : 0,
+                     s_gl_dst_width,
+                     s_gl_dst_height);
     }
 
     struct CompositeLayer layer;
@@ -234,15 +295,14 @@ extern "C" void gl_overlay_present(void)
     layer.src_origin_y = 0;
     layer.src_size_w   = s_gl_overlay_w;
     layer.src_size_h   = s_gl_overlay_h;
-    layer.dst_origin_x = (float)s_gl_dst_left;
-    layer.dst_origin_y = (float)s_gl_dst_top;
-    layer.dst_size_w   = (float)s_gl_dst_width;
-    layer.dst_size_h   = (float)s_gl_dst_height;
+    layer.dst_origin_x = rect.dst_origin_x;
+    layer.dst_origin_y = rect.dst_origin_y;
+    layer.dst_size_w   = rect.dst_size_w;
+    layer.dst_size_h   = rect.dst_size_h;
     layer.slot         = kLayerSlotOverlay;
     layer.blend        = kBlendPremultiplied;
     layer.alpha        = 1.0f;
 
-    const struct DMCModeSnapshot *snap = dmc_current_snapshot();
     struct FrameDescriptor desc;
     desc.layers               = &layer;
     desc.layer_count          = 1;
@@ -260,39 +320,47 @@ extern "C" void gl_overlay_present(void)
 }
 
 /*
- *  gl_has_active_overlay - true iff GL currently holds a vended overlay.
+ *  gl_has_active_overlay - true iff GL currently holds a vended overlay or
+ *  still has a drawable binding whose texture can be lazily re-vended.
  *  Used by the gfxaccel_resources fan-out attach/detach handlers (in
  *  gl_engine.cpp) to decide whether to pre-vend on mode-enter / release
  *  on mode-exit.
  */
 extern "C" int gl_has_active_overlay(void)
 {
-    return (s_gl_overlay_tex != nil) ? 1 : 0;
+    return (s_gl_overlay_tex != nil || gl_overlay_drawable_bound()) ? 1 : 0;
 }
 
 /*
- *  gl_get_overlay_dims - export current overlay dimensions for the
- *  fan-out attach handler. Returns 0 if GL has no active overlay.
+ *  gl_get_overlay_dims - export current source overlay dimensions for the
+ *  fan-out attach handler. Returns 0 if GL has no cached or preserved dims.
  */
 extern "C" int gl_get_overlay_dims(uint32_t *outW, uint32_t *outH)
 {
-    if (s_gl_overlay_tex == nil) return 0;
+    if (s_gl_overlay_tex == nil && (s_gl_overlay_w == 0 || s_gl_overlay_h == 0)) return 0;
     if (outW) *outW = s_gl_overlay_w;
     if (outH) *outH = s_gl_overlay_h;
     return 1;
 }
 
 /*
- *  gl_release_overlay_for_detach - external entry to release the cached
- *  overlay (called from gfxaccel_resources fan-out detach handler).
+ *  gl_release_overlay_for_detach - external entry called from the
+ *  gfxaccel_resources fan-out detach handler. Releases the cached Metal
+ *  texture but preserves the logical AGL binding when the drawable is still
+ *  attached, so the next present can re-vend instead of dropping the frame.
  */
 extern "C" void gl_release_overlay_for_detach(void)
 {
+    const bool preserve_binding = gl_overlay_drawable_bound();
     gl_release_overlay_texture();
-    s_gl_dst_left = 0;
-    s_gl_dst_top = 0;
-    s_gl_dst_width = 0;
-    s_gl_dst_height = 0;
+    if (!preserve_binding) {
+        s_gl_dst_left = 0;
+        s_gl_dst_top = 0;
+        s_gl_dst_width = 0;
+        s_gl_dst_height = 0;
+        s_gl_overlay_w = 0;
+        s_gl_overlay_h = 0;
+    }
 }
 
 // GL constants needed for blend factor mapping
@@ -492,7 +560,7 @@ struct GLMetalLightingData {
 // Metal float3 occupies 16 bytes (padded), float4 has 16-byte alignment.
 // If any of these fail, the struct layout doesn't match gl_shaders.metal.
 static_assert(sizeof(GLMetalVertexUniforms) == 320, "GLMetalVertexUniforms size must match Metal GLVertexUniforms (320 bytes)");
-// IN-01: make the clip_planes float4 alignment explicit so a future field reorder
+// Make the clip_planes float4 alignment explicit so a future field reorder
 // (which could silently change the required _clip_pad size) can't mis-align the
 // Metal float4[6] array without tripping a compile error.
 static_assert(offsetof(GLMetalVertexUniforms, clip_planes) % 16 == 0,
@@ -539,13 +607,22 @@ struct GLMetalState {
     id<MTLRenderCommandEncoder> currentEncoder;
     id<MTLTexture>              overlayTexture;  // offscreen texture from compositor (replaces layer/drawable)
     id<MTLTexture>              depthBuffer;
+    id<MTLTexture>              depthReadbackTexture;
     id<MTLTexture>              fallbackWhiteTexture;  // 1x1 white for missing textures
-    id<MTLCommandBuffer>        lastCommittedBuffer;
-    bool                        renderPassActive;
-    bool                        initialized;
+	id<MTLCommandBuffer>        lastCommittedBuffer;
+	bool                        renderPassActive;
+	bool                        initialized;
+	bool                        viewportScissorCacheValid;
+	uint32_t                    viewportScissorTargetWidth;
+	uint32_t                    viewportScissorTargetHeight;
+	int32_t                     cachedViewport[4];
+	float                       cachedDepthRangeNear;
+	float                       cachedDepthRangeFar;
+	bool                        cachedScissorTest;
+	int32_t                     cachedScissorBox[4];
 
-    // Sampler state
-    id<MTLSamplerState>         linearSampler;
+	// Sampler state
+	id<MTLSamplerState>         linearSampler;
     id<MTLSamplerState>         nearestSampler;
 };
 
@@ -553,19 +630,928 @@ struct GLMetalState {
 // Forward declarations
 static id<MTLSamplerState> GLMetalGetSampler(GLMetalState *ms, GLTextureObject *texObj);
 
+static bool GLMetalTexCoordArrayAvailableForDraw(const GLContext *ctx, int unit)
+{
+    if (!ctx || unit < 0 || unit >= 4) return false;
+    return GLMetalTexCoordArrayAvailableForArrayDraw(
+        ctx->texcoord_array[unit].enabled,
+        ctx->prepared_texcoord_array_for_draw[unit],
+        ctx->latched_texture_2d_for_array_draw[unit],
+        ctx->prepared_texcoord_array[unit].pointer != 0);
+}
+
+static bool GLMetalTexture2DEnabledForDraw(const GLContext *ctx, int unit)
+{
+    if (!ctx || unit < 0 || unit >= 4) return false;
+    return GLMetalTexture2DEnabledForArrayDraw(
+        ctx->tex_units[unit].enabled_2d,
+        ctx->prepared_texture_2d_for_draw[unit],
+        ctx->latched_texture_2d_for_array_draw[unit],
+        ctx->tex_units[unit].bound_texture_2d != 0,
+        GLMetalTexCoordArrayAvailableForDraw(ctx, unit));
+}
+
+static const GLVertexArrayPointer *GLMetalTexCoordArrayForDraw(const GLContext *ctx,
+                                                               int unit)
+{
+    if (!ctx || unit < 0 || unit >= 4) return nullptr;
+    if (ctx->texcoord_array[unit].enabled && ctx->texcoord_array[unit].pointer)
+        return &ctx->texcoord_array[unit];
+    if ((ctx->prepared_texcoord_array_for_draw[unit] ||
+         ctx->latched_texture_2d_for_array_draw[unit]) &&
+        ctx->prepared_texcoord_array[unit].pointer)
+        return &ctx->prepared_texcoord_array[unit];
+    return nullptr;
+}
+
+static void GLMetalClearPreparedDrawState(GLContext *ctx)
+{
+    if (!ctx) return;
+    for (int unit = 0; unit < 4; unit++) {
+        ctx->prepared_texture_2d_for_draw[unit] = false;
+        ctx->prepared_texcoord_array_for_draw[unit] = false;
+    }
+}
+
+static void GLMetalMarkDrawCompleted(GLContext *ctx)
+{
+    if (!ctx) return;
+    ctx->completed_draw_serial++;
+    GLMetalClearPreparedDrawState(ctx);
+}
+
+typedef struct GLMetalLatestOffscreenReadback {
+    bool valid;
+    uint32_t width;
+    uint32_t height;
+    uint32_t rowbytes;
+    uint32_t baseaddr;
+    uint32_t bytes_per_pixel;
+    uint64_t composite_count;
+    GLOffscreenBGRAStats stats;
+} GLMetalLatestOffscreenReadback;
+
+static GLMetalLatestOffscreenReadback s_gl_latest_offscreen_readback = {};
+
+typedef struct GLMetalGuestCompositeBackup {
+    bool valid;
+    uint32_t dst_baseaddr;
+    uint32_t dst_rowbytes;
+    uint32_t dst_depth_bits;
+    uint32_t dst_width;
+    uint32_t dst_height;
+    uint32_t rect_x;
+    uint32_t rect_y;
+    uint32_t rect_w;
+    uint32_t rect_h;
+    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> composed_pixels;
+} GLMetalGuestCompositeBackup;
+
+static GLMetalGuestCompositeBackup s_gl_previous_guest_composite = {};
+
+static void GLMetalInvalidateLatestOffscreenReadback(const char *reason)
+{
+    if (!s_gl_latest_offscreen_readback.valid) return;
+
+    const uint32_t baseaddr = s_gl_latest_offscreen_readback.baseaddr;
+    memset(&s_gl_latest_offscreen_readback, 0,
+           sizeof(s_gl_latest_offscreen_readback));
+    GL_METAL_LOG("GLMetalReadbackOffscreen: invalidated cached readback from 0x%08x (%s)",
+                 baseaddr, reason ? reason : "unknown");
+}
+
+static bool GLMetalGuestCompositeSameSurface(
+    const GLMetalGuestCompositeBackup &backup,
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    uint32_t dstWidth,
+    uint32_t dstHeight)
+{
+    return backup.valid &&
+           backup.dst_baseaddr == dstBaseaddr &&
+           backup.dst_rowbytes == dstRowbytes &&
+           backup.dst_depth_bits == dstDepthBits &&
+           backup.dst_width == dstWidth &&
+           backup.dst_height == dstHeight;
+}
+
+static void GLMetalInvalidatePreviousGuestComposite()
+{
+    s_gl_previous_guest_composite.valid = false;
+    s_gl_previous_guest_composite.pixels.clear();
+    s_gl_previous_guest_composite.composed_pixels.clear();
+}
+
+static void GLMetalRestorePreviousGuestCompositeIfNeeded(
+    uint8_t *dst,
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    uint32_t dstWidth,
+    uint32_t dstHeight,
+    bool useDirtyRect,
+    int32_t dirtyX,
+    int32_t dirtyY,
+    int32_t dirtyWidth,
+    int32_t dirtyHeight)
+{
+    GLMetalGuestCompositeBackup &backup = s_gl_previous_guest_composite;
+    if (!backup.valid) return;
+
+    const bool sameSurface =
+        GLMetalGuestCompositeSameSurface(backup,
+                                         dstBaseaddr,
+                                         dstRowbytes,
+                                         dstDepthBits,
+                                         dstWidth,
+                                         dstHeight);
+    if (!sameSurface) {
+        GLMetalInvalidatePreviousGuestComposite();
+        return;
+    }
+
+    const bool dirtyIntersectsPrevious =
+        useDirtyRect &&
+        GLDirtyRectIntersectsOffscreenComposite(dirtyX,
+                                                dirtyY,
+                                                dirtyWidth,
+                                                dirtyHeight,
+                                                backup.rect_x,
+                                                backup.rect_y,
+                                                backup.rect_w,
+                                                backup.rect_h);
+    if (!GLShouldRestorePreviousOffscreenComposite(backup.valid,
+                                                   sameSurface,
+                                                   useDirtyRect,
+                                                   dirtyIntersectsPrevious)) {
+        return;
+    }
+
+    const GLOffscreenCompositeRect restoreRect =
+        GLOffscreenCompositeRectForDirty(useDirtyRect,
+                                         backup.rect_x,
+                                         backup.rect_y,
+                                         backup.rect_x + backup.rect_w - 1u,
+                                         backup.rect_y + backup.rect_h - 1u,
+                                         dirtyX,
+                                         dirtyY,
+                                         dirtyWidth,
+                                         dirtyHeight);
+    if (!restoreRect.valid) return;
+
+    const size_t bytesPerPixel = 2u;
+    const uint32_t backupOffsetX = restoreRect.x - backup.rect_x;
+    const uint32_t backupOffsetY = restoreRect.y - backup.rect_y;
+    uint64_t restoredPixels = 0;
+    for (uint32_t row = 0; row < restoreRect.height; row++) {
+        uint8_t *dstRow =
+            dst + (uint64_t)(restoreRect.y + row) * dstRowbytes +
+            (uint64_t)restoreRect.x * bytesPerPixel;
+        const uint8_t *srcRow =
+            backup.pixels.data() +
+            ((uint64_t)backupOffsetY + row) * backup.rect_w * bytesPerPixel +
+            (uint64_t)backupOffsetX * bytesPerPixel;
+        memcpy(dstRow, srcRow, (size_t)restoreRect.width * bytesPerPixel);
+        restoredPixels += restoreRect.width;
+    }
+    if (restoredPixels != 0) {
+        GL_METAL_LOG("GLCompositeLatestOffscreenToGuestSurface: restored previous rect=(%u,%u %ux%u) pixels=%llu in 0x%08x",
+                     restoreRect.x,
+                     restoreRect.y,
+                     restoreRect.width,
+                     restoreRect.height,
+                     (unsigned long long)restoredPixels,
+                     backup.dst_baseaddr);
+    }
+
+    GLMetalInvalidatePreviousGuestComposite();
+}
+
+static bool GLMetalPreviousGuestCompositeMatches(
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    uint32_t dstWidth,
+    uint32_t dstHeight)
+{
+    return GLMetalGuestCompositeSameSurface(s_gl_previous_guest_composite,
+                                            dstBaseaddr,
+                                            dstRowbytes,
+                                            dstDepthBits,
+                                            dstWidth,
+                                            dstHeight);
+}
+
+static bool GLMetalGuestCompositeRegionMatchesPixels(
+    const uint8_t *dst,
+    uint32_t dstRowbytes,
+    const GLMetalGuestCompositeBackup &backup,
+    const std::vector<uint8_t> &pixels)
+{
+    if (dst == NULL ||
+        !backup.valid ||
+        pixels.empty() ||
+        backup.rect_w == 0 ||
+        backup.rect_h == 0) {
+        return false;
+    }
+
+    const size_t bytesPerPixel = 2u;
+    const size_t rowBytes = (size_t)backup.rect_w * bytesPerPixel;
+    if (pixels.size() != rowBytes * backup.rect_h) return false;
+
+    for (uint32_t row = 0; row < backup.rect_h; row++) {
+        const uint8_t *dstRow =
+            dst + (uint64_t)(backup.rect_y + row) * dstRowbytes +
+            (uint64_t)backup.rect_x * bytesPerPixel;
+        const uint8_t *storedRow =
+            pixels.data() + (uint64_t)row * rowBytes;
+        if (memcmp(dstRow, storedRow, rowBytes) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool GLMetalGuestCompositeRegionMatchesStored(
+    const uint8_t *dst,
+    uint32_t dstRowbytes,
+    const GLMetalGuestCompositeBackup &backup)
+{
+    return GLMetalGuestCompositeRegionMatchesPixels(dst,
+                                                    dstRowbytes,
+                                                    backup,
+                                                    backup.composed_pixels) ||
+           GLMetalGuestCompositeRegionMatchesPixels(dst,
+                                                    dstRowbytes,
+                                                    backup,
+                                                    backup.pixels);
+}
+
+static bool GLMetalCaptureGuestCompositeBackground(
+    uint8_t *dst,
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    uint32_t dstWidth,
+    uint32_t dstHeight,
+    uint32_t rectX,
+    uint32_t rectY,
+    uint32_t rectW,
+    uint32_t rectH)
+{
+    GLMetalInvalidatePreviousGuestComposite();
+    if (dst == NULL ||
+        dstDepthBits != 16 ||
+        rectW == 0 ||
+        rectH == 0 ||
+        rectX >= dstWidth ||
+        rectY >= dstHeight ||
+        rectW > dstWidth - rectX ||
+        rectH > dstHeight - rectY) {
+        return false;
+    }
+
+    const size_t bytesPerPixel = 2u;
+    GLMetalGuestCompositeBackup &backup = s_gl_previous_guest_composite;
+    backup.pixels.resize((size_t)rectW * rectH * bytesPerPixel);
+    backup.composed_pixels.clear();
+    for (uint32_t row = 0; row < rectH; row++) {
+        const uint8_t *srcRow =
+            dst + (uint64_t)(rectY + row) * dstRowbytes +
+            (uint64_t)rectX * bytesPerPixel;
+        uint8_t *dstRow =
+            backup.pixels.data() + (uint64_t)row * rectW * bytesPerPixel;
+        memcpy(dstRow, srcRow, (size_t)rectW * bytesPerPixel);
+    }
+
+    backup.valid = true;
+    backup.dst_baseaddr = dstBaseaddr;
+    backup.dst_rowbytes = dstRowbytes;
+    backup.dst_depth_bits = dstDepthBits;
+    backup.dst_width = dstWidth;
+    backup.dst_height = dstHeight;
+    backup.rect_x = rectX;
+    backup.rect_y = rectY;
+    backup.rect_w = rectW;
+    backup.rect_h = rectH;
+    return true;
+}
+
+static void GLMetalCaptureGuestCompositeOutput(
+    const uint8_t *dst,
+    uint32_t dstRowbytes,
+    uint32_t rectX,
+    uint32_t rectY,
+    uint32_t rectW,
+    uint32_t rectH)
+{
+    GLMetalGuestCompositeBackup &backup = s_gl_previous_guest_composite;
+    if (!backup.valid ||
+        backup.rect_x != rectX ||
+        backup.rect_y != rectY ||
+        backup.rect_w != rectW ||
+        backup.rect_h != rectH ||
+        dst == NULL) {
+        return;
+    }
+
+    const size_t bytesPerPixel = 2u;
+    backup.composed_pixels.resize((size_t)rectW * rectH * bytesPerPixel);
+    for (uint32_t row = 0; row < rectH; row++) {
+        const uint8_t *srcRow =
+            dst + (uint64_t)(rectY + row) * dstRowbytes +
+            (uint64_t)rectX * bytesPerPixel;
+        uint8_t *dstRow =
+            backup.composed_pixels.data() +
+            (uint64_t)row * rectW * bytesPerPixel;
+        memcpy(dstRow, srcRow, (size_t)rectW * bytesPerPixel);
+    }
+}
+
+static uint64_t GLCompositeLatestOffscreenToGuestSurfaceInternal(uint32_t dstBaseaddr,
+                                                                 uint32_t dstRowbytes,
+                                                                 uint32_t dstWidth,
+                                                                 uint32_t dstHeight,
+                                                                 uint32_t dstDepthBits,
+                                                                 bool respectAutomaticSuppression,
+                                                                 bool useLatestExtent,
+                                                                 bool useDirtyRect,
+                                                                 int32_t dirtyX,
+                                                                 int32_t dirtyY,
+                                                                 int32_t dirtyWidth,
+                                                                 int32_t dirtyHeight)
+{
+    GLMetalLatestOffscreenReadback &latest =
+        s_gl_latest_offscreen_readback;
+    if (!GLShouldCompositeOffscreenIntoGuestSurface(
+            latest.valid,
+            latest.stats.alpha_bounds_valid,
+            latest.baseaddr,
+            latest.width,
+            latest.height,
+            latest.bytes_per_pixel,
+            dstBaseaddr,
+            dstRowbytes,
+            dstDepthBits)) {
+        return 0;
+    }
+
+    if (!useLatestExtent &&
+        (dstWidth != latest.width || dstHeight != latest.height)) {
+        return 0;
+    }
+
+    const uint32_t compositeWidth =
+        useLatestExtent ? latest.width : dstWidth;
+    const uint32_t compositeHeight =
+        useLatestExtent ? latest.height : dstHeight;
+
+    uint8_t *src = Mac2HostAddr(latest.baseaddr);
+    uint8_t *dst = Mac2HostAddr(dstBaseaddr);
+    if (src == NULL || dst == NULL) return 0;
+
+    const GLOffscreenBGRAStats &stats = latest.stats;
+    const bool previousCompositeMatches =
+        GLMetalPreviousGuestCompositeMatches(dstBaseaddr,
+                                             dstRowbytes,
+                                             dstDepthBits,
+                                             compositeWidth,
+                                             compositeHeight);
+    const bool dirtyIntersectsPreviousComposite =
+        useDirtyRect &&
+        previousCompositeMatches &&
+        GLDirtyRectIntersectsOffscreenComposite(dirtyX,
+                                                dirtyY,
+                                                dirtyWidth,
+                                                dirtyHeight,
+                                                s_gl_previous_guest_composite.rect_x,
+                                                s_gl_previous_guest_composite.rect_y,
+                                                s_gl_previous_guest_composite.rect_w,
+                                                s_gl_previous_guest_composite.rect_h);
+    const bool dirtyIntersectsCurrentComposite =
+        stats.alpha_bounds_valid &&
+        GLShouldCompositeCurrentOffscreenDirtyRect(
+            useDirtyRect,
+            stats.alpha_min_x,
+            stats.alpha_min_y,
+            stats.alpha_max_x,
+            stats.alpha_max_y,
+            dirtyX,
+            dirtyY,
+            dirtyWidth,
+            dirtyHeight,
+            compositeWidth,
+            compositeHeight);
+    const GLOffscreenCompositeRect compositeRect =
+        dirtyIntersectsCurrentComposite
+            ? GLOffscreenCurrentCompositeRectForDirty(useDirtyRect,
+                                                      stats.alpha_min_x,
+                                                      stats.alpha_min_y,
+                                                      stats.alpha_max_x,
+                                                      stats.alpha_max_y,
+                                                      dirtyX,
+                                                      dirtyY,
+                                                      dirtyWidth,
+                                                      dirtyHeight,
+                                                      compositeWidth,
+                                                      compositeHeight)
+            : GLOffscreenCompositeRect{false, 0, 0, 0, 0};
+    const GLOffscreenCompositeRect fullCompositeRect =
+        GLOffscreenCompositeRectForDirty(false,
+                                         stats.alpha_min_x,
+                                         stats.alpha_min_y,
+                                         stats.alpha_max_x,
+                                         stats.alpha_max_y,
+                                         0,
+                                         0,
+                                         0,
+                                         0);
+    if (!dirtyIntersectsCurrentComposite && !previousCompositeMatches) {
+        return 0;
+    }
+
+    const bool destinationMatchesPreviousCompositeRegion =
+        !previousCompositeMatches ||
+        GLMetalGuestCompositeRegionMatchesStored(dst,
+                                                 dstRowbytes,
+                                                 s_gl_previous_guest_composite);
+    if (GLShouldSkipAutomaticOffscreenCompositeForChangedDestination(
+            respectAutomaticSuppression,
+            useDirtyRect,
+            s_gl_previous_guest_composite.valid,
+            previousCompositeMatches,
+            destinationMatchesPreviousCompositeRegion)) {
+        GL_METAL_LOG("GLCompositeLatestOffscreenToGuestSurface: skipped automatic composite because destination changed under previous rect=(%u,%u %ux%u)",
+                     s_gl_previous_guest_composite.rect_x,
+                     s_gl_previous_guest_composite.rect_y,
+                     s_gl_previous_guest_composite.rect_w,
+                     s_gl_previous_guest_composite.rect_h);
+        return 0;
+    }
+
+    GLMetalRestorePreviousGuestCompositeIfNeeded(dst,
+                                                 dstBaseaddr,
+                                                 dstRowbytes,
+                                                 dstDepthBits,
+                                                 compositeWidth,
+                                                 compositeHeight,
+                                                 useDirtyRect,
+                                                 dirtyX,
+                                                 dirtyY,
+                                                 dirtyWidth,
+                                                 dirtyHeight);
+    if (!compositeRect.valid) {
+        if (dirtyIntersectsPreviousComposite) {
+            GLMetalInvalidatePreviousGuestComposite();
+        }
+        return 0;
+    }
+
+    const uint32_t rectX = compositeRect.x;
+    const uint32_t rectY = compositeRect.y;
+    const uint32_t rectW = compositeRect.width;
+    const uint32_t rectH = compositeRect.height;
+    const bool compositeCoversFull =
+        fullCompositeRect.valid &&
+        rectX == fullCompositeRect.x &&
+        rectY == fullCompositeRect.y &&
+        rectW == fullCompositeRect.width &&
+        rectH == fullCompositeRect.height;
+    const bool dirtyFullyCoversCurrent =
+        !useDirtyRect ||
+        GLDirtyRectFullyCoversOffscreenComposite(dirtyX,
+                                                 dirtyY,
+                                                 dirtyWidth,
+                                                 dirtyHeight,
+                                                 rectX,
+                                                 rectY,
+                                                 rectW,
+                                                 rectH);
+    if (!useDirtyRect || (compositeCoversFull && dirtyFullyCoversCurrent)) {
+        GLMetalCaptureGuestCompositeBackground(dst,
+                                               dstBaseaddr,
+                                               dstRowbytes,
+                                               dstDepthBits,
+                                               compositeWidth,
+                                               compositeHeight,
+                                               rectX,
+                                               rectY,
+                                               rectW,
+                                               rectH);
+    }
+    const uint64_t copied =
+        GLOffscreenCompositeARGB1555OverRGB555Rect(
+            src,
+            latest.width,
+            latest.height,
+            latest.rowbytes,
+            dst,
+            compositeWidth,
+            compositeHeight,
+            dstRowbytes,
+            rectX,
+            rectY,
+            rectW,
+            rectH);
+    if (copied != 0) {
+        GLMetalCaptureGuestCompositeOutput(dst,
+                                           dstRowbytes,
+                                           rectX,
+                                           rectY,
+                                           rectW,
+                                           rectH);
+        s_gl_latest_offscreen_readback.composite_count++;
+        GL_METAL_LOG("GLCompositeLatestOffscreenToGuestSurface: composited %llu pixels from 0x%08x to 0x%08x rect=(%u,%u %ux%u)",
+                     (unsigned long long)copied,
+                     latest.baseaddr,
+                     dstBaseaddr, rectX, rectY, rectW, rectH);
+    } else {
+        GLMetalInvalidatePreviousGuestComposite();
+    }
+    return copied;
+}
+
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurface(uint32_t dstBaseaddr,
+                                                             uint32_t dstRowbytes,
+                                                             uint32_t dstWidth,
+                                                             uint32_t dstHeight,
+                                                             uint32_t dstDepthBits)
+{
+    return GLCompositeLatestOffscreenToGuestSurfaceInternal(dstBaseaddr,
+                                                           dstRowbytes,
+                                                           dstWidth,
+                                                           dstHeight,
+                                                           dstDepthBits,
+                                                           false,
+                                                           false,
+                                                           false,
+                                                           0,
+                                                           0,
+                                                           0,
+                                                           0);
+}
+
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtent(
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits)
+{
+    return GLCompositeLatestOffscreenToGuestSurfaceInternal(dstBaseaddr,
+                                                           dstRowbytes,
+                                                           0,
+                                                           0,
+                                                           dstDepthBits,
+                                                           false,
+                                                           true,
+                                                           false,
+                                                           0,
+                                                           0,
+                                                           0,
+                                                           0);
+}
+
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentDirtyRect(
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    int32_t dirtyX,
+    int32_t dirtyY,
+    int32_t dirtyWidth,
+    int32_t dirtyHeight)
+{
+    return GLCompositeLatestOffscreenToGuestSurfaceInternal(dstBaseaddr,
+                                                           dstRowbytes,
+                                                           0,
+                                                           0,
+                                                           dstDepthBits,
+                                                           false,
+                                                           true,
+                                                           true,
+                                                           dirtyX,
+                                                           dirtyY,
+                                                           dirtyWidth,
+                                                           dirtyHeight);
+}
+
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentIfNotSuppressed(
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits)
+{
+    return GLCompositeLatestOffscreenToGuestSurfaceInternal(dstBaseaddr,
+                                                           dstRowbytes,
+                                                           0,
+                                                           0,
+                                                           dstDepthBits,
+                                                           true,
+                                                           true,
+                                                           false,
+                                                           0,
+                                                           0,
+                                                           0,
+                                                           0);
+}
+
+static void GLMetalStoreBGRA8PixelsToGuestOffscreen(const uint8_t *bgra,
+                                                    uint32_t width,
+                                                    uint32_t height,
+                                                    uint32_t dstRowbytes,
+                                                    uint32_t dstBaseaddr,
+                                                    uint32_t dstBytesPerPixel)
+{
+    uint8_t *dstBase = Mac2HostAddr(dstBaseaddr);
+
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *srcRow = bgra + (size_t)y * (size_t)width * 4u;
+
+        if (dstBase != NULL) {
+            uint8_t *dstRow = dstBase + (size_t)y * (size_t)dstRowbytes;
+            for (uint32_t x = 0; x < width; x++) {
+                const uint8_t *src = srcRow + (size_t)x * 4u;
+                const uint8_t b = src[0];
+                const uint8_t g = src[1];
+                const uint8_t r = src[2];
+                const uint8_t a = src[3];
+
+                if (dstBytesPerPixel == 2) {
+                    uint8_t bytes[2];
+                    GLOffscreenStoreRGB555Bytes(
+                        GLOffscreenPackARGB1555BigEndian(r, g, b, a), bytes);
+                    dstRow[(size_t)x * 2u + 0] = bytes[0];
+                    dstRow[(size_t)x * 2u + 1] = bytes[1];
+                } else {
+                    uint8_t bytes[4];
+                    GLOffscreenStoreARGB8888Bytes(r, g, b, a, bytes);
+                    dstRow[(size_t)x * 4u + 0] = bytes[0];
+                    dstRow[(size_t)x * 4u + 1] = bytes[1];
+                    dstRow[(size_t)x * 4u + 2] = bytes[2];
+                    dstRow[(size_t)x * 4u + 3] = bytes[3];
+                }
+            }
+            continue;
+        }
+
+        const uint32_t dstRowAddr =
+            dstBaseaddr + (uint32_t)((uint64_t)y * (uint64_t)dstRowbytes);
+        for (uint32_t x = 0; x < width; x++) {
+            const uint8_t *src = srcRow + (size_t)x * 4u;
+            const uint8_t b = src[0];
+            const uint8_t g = src[1];
+            const uint8_t r = src[2];
+            const uint8_t a = src[3];
+
+            if (dstBytesPerPixel == 2) {
+                uint8_t bytes[2];
+                GLOffscreenStoreRGB555Bytes(
+                    GLOffscreenPackARGB1555BigEndian(r, g, b, a), bytes);
+                const uint32_t dstAddr = dstRowAddr + x * 2u;
+                WriteMacInt8(dstAddr + 0, bytes[0]);
+                WriteMacInt8(dstAddr + 1, bytes[1]);
+            } else {
+                uint8_t bytes[4];
+                GLOffscreenStoreARGB8888Bytes(r, g, b, a, bytes);
+                const uint32_t dstAddr = dstRowAddr + x * 4u;
+                WriteMacInt8(dstAddr + 0, bytes[0]);
+                WriteMacInt8(dstAddr + 1, bytes[1]);
+                WriteMacInt8(dstAddr + 2, bytes[2]);
+                WriteMacInt8(dstAddr + 3, bytes[3]);
+            }
+        }
+    }
+}
+
+static bool GLMetalReadbackOffscreenDrawable(GLContext *ctx,
+                                             GLMetalState *ms,
+                                             id<MTLCommandBuffer> committedBuffer)
+{
+    uint32_t dstW = 0;
+    uint32_t dstH = 0;
+    uint32_t dstRowbytes = 0;
+    uint32_t dstBaseaddr = 0;
+    if (!GLContextGetOffscreenDrawable(ctx, &dstW, &dstH,
+                                       &dstRowbytes, &dstBaseaddr)) {
+        return false;
+    }
+
+    if (!ms || !ms->initialized || ms->overlayTexture == nil ||
+        ms->device == nil || ms->commandQueue == nil) {
+        return false;
+    }
+
+    const uint32_t dstBytesPerPixel =
+        GLOffscreenDrawableBytesPerPixel(dstW, dstRowbytes);
+    if (dstBytesPerPixel == 0) return false;
+
+    if (committedBuffer != nil) {
+        [committedBuffer waitUntilCompleted];
+    }
+
+    const uint32_t texW = (uint32_t)[ms->overlayTexture width];
+    const uint32_t texH = (uint32_t)[ms->overlayTexture height];
+    const uint32_t readW = std::min(dstW, texW);
+    const uint32_t readH = std::min(dstH, texH);
+    if (readW == 0 || readH == 0) return false;
+
+    if (readW != dstW || readH != dstH) {
+        GL_METAL_LOG("GLMetalReadbackOffscreen: texture size %ux%u smaller than offscreen %ux%u",
+                     texW, texH, dstW, dstH);
+    }
+
+    MTLTextureDescriptor *stagingDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                          width:readW
+                                                         height:readH
+                                                      mipmapped:NO];
+    stagingDesc.usage = MTLTextureUsageShaderRead;
+    stagingDesc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> staging = [ms->device newTextureWithDescriptor:stagingDesc];
+    if (staging == nil) {
+        GL_METAL_LOG("GLMetalReadbackOffscreen: failed to allocate staging texture %ux%u",
+                     readW, readH);
+        return false;
+    }
+
+    id<MTLCommandBuffer> blitCmdBuf = [ms->commandQueue commandBuffer];
+    if (blitCmdBuf == nil) return false;
+    id<MTLBlitCommandEncoder> blit = [blitCmdBuf blitCommandEncoder];
+    if (blit == nil) return false;
+    [blit copyFromTexture:ms->overlayTexture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(readW, readH, 1)
+                toTexture:staging
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [blitCmdBuf commit];
+    [blitCmdBuf waitUntilCompleted];
+
+    std::vector<uint8_t> bgra((size_t)readW * (size_t)readH * 4u);
+    MTLRegion region = MTLRegionMake2D(0, 0, readW, readH);
+    [staging getBytes:bgra.data()
+          bytesPerRow:(NSUInteger)readW * 4u
+           fromRegion:region
+          mipmapLevel:0];
+
+    const GLOffscreenBGRAStats stats =
+        GLOffscreenAnalyzeBGRA8Pixels(bgra.data(), readW, readH, readW * 4u);
+
+    GLMetalStoreBGRA8PixelsToGuestOffscreen(
+        bgra.data(), readW, readH, dstRowbytes, dstBaseaddr,
+        dstBytesPerPixel);
+
+    s_gl_latest_offscreen_readback.valid = true;
+    s_gl_latest_offscreen_readback.width = readW;
+    s_gl_latest_offscreen_readback.height = readH;
+    s_gl_latest_offscreen_readback.rowbytes = dstRowbytes;
+    s_gl_latest_offscreen_readback.baseaddr = dstBaseaddr;
+    s_gl_latest_offscreen_readback.bytes_per_pixel = dstBytesPerPixel;
+    s_gl_latest_offscreen_readback.composite_count = 0;
+    s_gl_latest_offscreen_readback.stats = stats;
+
+    if (stats.rgb_bounds_valid) {
+        GL_METAL_LOG("GLMetalReadbackOffscreen: copied %ux%u to 0x%08x rowbytes=%u bpp=%u rgb=%llu alpha=%llu opaque=%llu rgb_bbox=(%u,%u)-(%u,%u) alpha_bbox=%s",
+                     readW, readH, dstBaseaddr, dstRowbytes,
+                     dstBytesPerPixel * 8u,
+                     (unsigned long long)stats.rgb_nonzero_pixels,
+                     (unsigned long long)stats.alpha_nonzero_pixels,
+                     (unsigned long long)stats.alpha_opaque_pixels,
+                     stats.rgb_min_x, stats.rgb_min_y,
+                     stats.rgb_max_x, stats.rgb_max_y,
+                     stats.alpha_bounds_valid ? "valid" : "none");
+        if (stats.alpha_bounds_valid) {
+            GL_METAL_LOG("GLMetalReadbackOffscreen: alpha_bbox=(%u,%u)-(%u,%u)",
+                         stats.alpha_min_x, stats.alpha_min_y,
+                         stats.alpha_max_x, stats.alpha_max_y);
+        }
+    } else {
+        GL_METAL_LOG("GLMetalReadbackOffscreen: copied %ux%u to 0x%08x rowbytes=%u bpp=%u rgb=%llu alpha=%llu opaque=%llu rgb_bbox=none alpha_bbox=%s",
+                     readW, readH, dstBaseaddr, dstRowbytes,
+                     dstBytesPerPixel * 8u,
+                     (unsigned long long)stats.rgb_nonzero_pixels,
+                     (unsigned long long)stats.alpha_nonzero_pixels,
+                     (unsigned long long)stats.alpha_opaque_pixels,
+                     stats.alpha_bounds_valid ? "valid" : "none");
+        if (stats.alpha_bounds_valid) {
+            GL_METAL_LOG("GLMetalReadbackOffscreen: alpha_bbox=(%u,%u)-(%u,%u)",
+                         stats.alpha_min_x, stats.alpha_min_y,
+                         stats.alpha_max_x, stats.alpha_max_y);
+        }
+    }
+    return true;
+}
+
 #if ACCEL_LOGGING_ENABLED
+struct GLMetalTextureBGRAStats {
+    uint8_t minB, minG, minR, minA;
+    uint8_t maxB, maxG, maxR, maxA;
+    double avgB, avgG, avgR, avgA;
+    uint32_t hash;
+    uint8_t first[4];
+    uint8_t mid[4];
+    uint8_t last[4];
+};
+
+static bool GLMetalTextureDiagnosticsShouldTrace(uint32_t texName, int level)
+{
+    (void)texName;
+    (void)level;
+    return true;
+}
+
+static bool GLMetalTextureBGRAStatsAnalyze(const uint8_t *data, int width, int height,
+                                           int dataLen, GLMetalTextureBGRAStats *out)
+{
+    if (!data || !out || width <= 0 || height <= 0)
+        return false;
+    const int pixelCount = width * height;
+    if (pixelCount <= 0 || dataLen < pixelCount * 4)
+        return false;
+
+    out->minB = out->minG = out->minR = out->minA = 255;
+    out->maxB = out->maxG = out->maxR = out->maxA = 0;
+    unsigned long long sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+    uint32_t hash = 2166136261u;
+    const int midIndex = pixelCount / 2;
+
+    for (int i = 0; i < pixelCount; i++) {
+        const uint8_t *px = data + i * 4;
+        if (i == 0) memcpy(out->first, px, 4);
+        if (i == midIndex) memcpy(out->mid, px, 4);
+        if (i == pixelCount - 1) memcpy(out->last, px, 4);
+
+        if (px[0] < out->minB) out->minB = px[0]; if (px[0] > out->maxB) out->maxB = px[0]; sumB += px[0];
+        if (px[1] < out->minG) out->minG = px[1]; if (px[1] > out->maxG) out->maxG = px[1]; sumG += px[1];
+        if (px[2] < out->minR) out->minR = px[2]; if (px[2] > out->maxR) out->maxR = px[2]; sumR += px[2];
+        if (px[3] < out->minA) out->minA = px[3]; if (px[3] > out->maxA) out->maxA = px[3]; sumA += px[3];
+
+        for (int c = 0; c < 4; c++) {
+            hash ^= px[c];
+            hash *= 16777619u;
+        }
+    }
+
+    out->avgB = (double)sumB / (double)pixelCount;
+    out->avgG = (double)sumG / (double)pixelCount;
+    out->avgR = (double)sumR / (double)pixelCount;
+    out->avgA = (double)sumA / (double)pixelCount;
+    out->hash = hash;
+    return true;
+}
+
+static void GLMetalLogTextureBGRAStats(const char *label, uint32_t texName, int level,
+                                       int width, int height, const uint8_t *data,
+                                       int dataLen)
+{
+    GLMetalTextureBGRAStats stats;
+    if (!GLMetalTextureBGRAStatsAnalyze(data, width, height, dataLen, &stats))
+        return;
+
+    GL_METAL_LOG("%s: tex=%u level=%d %dx%d bgra min=(%u,%u,%u,%u) "
+                 "max=(%u,%u,%u,%u) avg=(%.1f,%.1f,%.1f,%.1f) "
+                 "first=(%u,%u,%u,%u) mid=(%u,%u,%u,%u) last=(%u,%u,%u,%u) hash=0x%08x",
+                 label, texName, level, width, height,
+                 stats.minB, stats.minG, stats.minR, stats.minA,
+                 stats.maxB, stats.maxG, stats.maxR, stats.maxA,
+                 stats.avgB, stats.avgG, stats.avgR, stats.avgA,
+                 stats.first[0], stats.first[1], stats.first[2], stats.first[3],
+                 stats.mid[0], stats.mid[1], stats.mid[2], stats.mid[3],
+                 stats.last[0], stats.last[1], stats.last[2], stats.last[3],
+                 stats.hash);
+}
+
 static void GLMetalLogDrawState(GLContext *ctx, const GLMetalVertex *verts,
                                 size_t vertCount, int mtlPrim,
                                 const GLMetalVertexUniforms &vu,
                                 const GLMetalFragmentUniforms &fu,
                                 int texUnit, int nextOffset)
 {
+    if (!gl_logging_enabled)
+        return;
+
     float min_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float max_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float min_sec[3] = {0.0f, 0.0f, 0.0f};
     float max_sec[3] = {0.0f, 0.0f, 0.0f};
     float min_pos[3] = {0.0f, 0.0f, 0.0f};
     float max_pos[3] = {0.0f, 0.0f, 0.0f};
+    float min_tex0[3] = {0.0f, 0.0f, 0.0f};
+    float max_tex0[3] = {0.0f, 0.0f, 0.0f};
+    float min_tex1[3] = {0.0f, 0.0f, 0.0f};
+    float max_tex1[3] = {0.0f, 0.0f, 0.0f};
+    float min_uv0[2] = {0.0f, 0.0f};
+    float max_uv0[2] = {0.0f, 0.0f};
+    float min_uv1[2] = {0.0f, 0.0f};
+    float max_uv1[2] = {0.0f, 0.0f};
+    auto texUV = [](const float texcoord[3], int c) -> float {
+        const float q = texcoord[2];
+        return (q != 0.0f) ? texcoord[c] / q : texcoord[c];
+    };
 
     if (vertCount > 0) {
         for (int c = 0; c < 4; c++) {
@@ -574,6 +1560,12 @@ static void GLMetalLogDrawState(GLContext *ctx, const GLMetalVertex *verts,
         for (int c = 0; c < 3; c++) {
             min_sec[c] = max_sec[c] = verts[0].secondary_color[c];
             min_pos[c] = max_pos[c] = verts[0].position[c];
+            min_tex0[c] = max_tex0[c] = verts[0].texcoord[c];
+            min_tex1[c] = max_tex1[c] = verts[0].texcoord1[c];
+        }
+        for (int c = 0; c < 2; c++) {
+            min_uv0[c] = max_uv0[c] = texUV(verts[0].texcoord, c);
+            min_uv1[c] = max_uv1[c] = texUV(verts[0].texcoord1, c);
         }
 
         for (size_t i = 1; i < vertCount; i++) {
@@ -589,73 +1581,332 @@ static void GLMetalLogDrawState(GLContext *ctx, const GLMetalVertex *verts,
                 float p = verts[i].position[c];
                 if (p < min_pos[c]) min_pos[c] = p;
                 if (p > max_pos[c]) max_pos[c] = p;
+                float t0 = verts[i].texcoord[c];
+                if (t0 < min_tex0[c]) min_tex0[c] = t0;
+                if (t0 > max_tex0[c]) max_tex0[c] = t0;
+                float t1 = verts[i].texcoord1[c];
+                if (t1 < min_tex1[c]) min_tex1[c] = t1;
+                if (t1 > max_tex1[c]) max_tex1[c] = t1;
+            }
+            for (int c = 0; c < 2; c++) {
+                float uv0 = texUV(verts[i].texcoord, c);
+                if (uv0 < min_uv0[c]) min_uv0[c] = uv0;
+                if (uv0 > max_uv0[c]) max_uv0[c] = uv0;
+                float uv1 = texUV(verts[i].texcoord1, c);
+                if (uv1 < min_uv1[c]) min_uv1[c] = uv1;
+                if (uv1 > max_uv1[c]) max_uv1[c] = uv1;
             }
         }
     }
 
-    uint32_t tex0Name = fu.has_texture_3d
-        ? ctx->tex_units[texUnit].bound_texture_3d
-        : ctx->tex_units[texUnit].bound_texture_2d;
-    int tex0W = 0;
-    int tex0H = 0;
-    auto tex0It = ctx->texture_objects.find(tex0Name);
-    if (tex0It != ctx->texture_objects.end()) {
-        tex0W = tex0It->second.width;
-        tex0H = tex0It->second.height;
+	uint32_t tex0Name = fu.has_texture_3d
+	    ? ctx->tex_units[texUnit].bound_texture_3d
+	    : ctx->tex_units[texUnit].bound_texture_2d;
+	int tex0W = 0;
+	int tex0H = 0;
+	uint32_t tex0MinFilter = 0;
+	uint32_t tex0MagFilter = 0;
+	uint32_t tex0WrapS = 0;
+	uint32_t tex0WrapT = 0;
+	int tex0HasMipmaps = 0;
+	unsigned long tex0MetalMips = 0;
+	unsigned long tex0MetalW = 0;
+	unsigned long tex0MetalH = 0;
+	auto tex0It = ctx->texture_objects.find(tex0Name);
+	if (tex0It != ctx->texture_objects.end()) {
+	    const GLTextureObject &tex0 = tex0It->second;
+	    tex0W = tex0.width;
+	    tex0H = tex0.height;
+	    tex0MinFilter = tex0.min_filter;
+	    tex0MagFilter = tex0.mag_filter;
+	    tex0WrapS = tex0.wrap_s;
+	    tex0WrapT = tex0.wrap_t;
+	    tex0HasMipmaps = tex0.has_mipmaps ? 1 : 0;
+	    if (tex0.metal_texture) {
+	        id<MTLTexture> mtlTex0 = (__bridge id<MTLTexture>)(tex0.metal_texture);
+	        tex0MetalMips = (unsigned long)[mtlTex0 mipmapLevelCount];
+	        tex0MetalW = (unsigned long)[mtlTex0 width];
+	        tex0MetalH = (unsigned long)[mtlTex0 height];
+	    }
+	}
+
+	uint32_t tex1Name = ctx->tex_units[1].bound_texture_2d;
+	int tex1W = 0;
+	int tex1H = 0;
+	uint32_t tex1MinFilter = 0;
+	uint32_t tex1MagFilter = 0;
+	uint32_t tex1WrapS = 0;
+	uint32_t tex1WrapT = 0;
+	int tex1HasMipmaps = 0;
+	unsigned long tex1MetalMips = 0;
+	unsigned long tex1MetalW = 0;
+	unsigned long tex1MetalH = 0;
+	auto tex1It = ctx->texture_objects.find(tex1Name);
+	if (tex1It != ctx->texture_objects.end()) {
+	    const GLTextureObject &tex1 = tex1It->second;
+	    tex1W = tex1.width;
+	    tex1H = tex1.height;
+	    tex1MinFilter = tex1.min_filter;
+	    tex1MagFilter = tex1.mag_filter;
+	    tex1WrapS = tex1.wrap_s;
+	    tex1WrapT = tex1.wrap_t;
+	    tex1HasMipmaps = tex1.has_mipmaps ? 1 : 0;
+	    if (tex1.metal_texture) {
+	        id<MTLTexture> mtlTex1 = (__bridge id<MTLTexture>)(tex1.metal_texture);
+	        tex1MetalMips = (unsigned long)[mtlTex1 mipmapLevelCount];
+	        tex1MetalW = (unsigned long)[mtlTex1 width];
+	        tex1MetalH = (unsigned long)[mtlTex1 height];
+	    }
+	}
+
+    const bool isOffscreen = GLContextGetOffscreenDrawable(ctx, NULL, NULL, NULL, NULL);
+    const uint32_t drawableMask =
+        GLMetalDrawableColorWriteMask(isOffscreen,
+                                      ctx->color_mask[0], ctx->color_mask[1],
+                                      ctx->color_mask[2], ctx->color_mask[3]);
+
+    uint32_t projectedFinite = 0;
+    uint32_t projectedInside = 0;
+    float min_ndc[3] = {0.0f, 0.0f, 0.0f};
+    float max_ndc[3] = {0.0f, 0.0f, 0.0f};
+    auto projectVertex = [&](const GLMetalVertex &v, float ndc[3],
+                             bool countInside) -> bool {
+        const float x = v.position[0];
+        const float y = v.position[1];
+        const float z = v.position[2];
+        const float w = v.position[3];
+        const float cx = vu.mvp_matrix[0] * x + vu.mvp_matrix[4] * y +
+                         vu.mvp_matrix[8] * z + vu.mvp_matrix[12] * w;
+        const float cy = vu.mvp_matrix[1] * x + vu.mvp_matrix[5] * y +
+                         vu.mvp_matrix[9] * z + vu.mvp_matrix[13] * w;
+        const float cz = vu.mvp_matrix[2] * x + vu.mvp_matrix[6] * y +
+                         vu.mvp_matrix[10] * z + vu.mvp_matrix[14] * w;
+        const float cw = vu.mvp_matrix[3] * x + vu.mvp_matrix[7] * y +
+                         vu.mvp_matrix[11] * z + vu.mvp_matrix[15] * w;
+        if (!std::isfinite(cx) || !std::isfinite(cy) ||
+            !std::isfinite(cz) || !std::isfinite(cw) || fabsf(cw) < 1.0e-20f) {
+            return false;
+        }
+
+        ndc[0] = cx / cw;
+        ndc[1] = cy / cw;
+        ndc[2] = cz / cw;
+        const float aw = fabsf(cw);
+        if (countInside &&
+            fabsf(cx) <= aw && fabsf(cy) <= aw && fabsf(cz) <= aw) {
+            projectedInside++;
+        }
+        return std::isfinite(ndc[0]) && std::isfinite(ndc[1]) && std::isfinite(ndc[2]);
+    };
+
+    for (size_t i = 0; i < vertCount; i++) {
+        float ndc[3];
+        if (!projectVertex(verts[i], ndc, true)) continue;
+        if (projectedFinite == 0) {
+            memcpy(min_ndc, ndc, sizeof(min_ndc));
+            memcpy(max_ndc, ndc, sizeof(max_ndc));
+        } else {
+            for (int c = 0; c < 3; c++) {
+                if (ndc[c] < min_ndc[c]) min_ndc[c] = ndc[c];
+                if (ndc[c] > max_ndc[c]) max_ndc[c] = ndc[c];
+            }
+        }
+        projectedFinite++;
     }
 
-    uint32_t tex1Name = ctx->tex_units[1].bound_texture_2d;
-    int tex1W = 0;
-    int tex1H = 0;
-    auto tex1It = ctx->texture_objects.find(tex1Name);
-    if (tex1It != ctx->texture_objects.end()) {
-        tex1W = tex1It->second.width;
-        tex1H = tex1It->second.height;
+    const bool suspectQuakeForegroundModel =
+        tex0Name == 1342u && (vertCount == 513 || vertCount == 216);
+    if (suspectQuakeForegroundModel) {
+        static uint32_t s_suspectQuakeForegroundModelLogCount = 0;
+        if (s_suspectQuakeForegroundModelLogCount < 64) {
+            float min_eye[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float max_eye[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float min_clip[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float max_clip[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            uint32_t transformedFinite = 0;
+            for (size_t i = 0; i < vertCount; i++) {
+                const float x = verts[i].position[0];
+                const float y = verts[i].position[1];
+                const float z = verts[i].position[2];
+                const float w = verts[i].position[3];
+                const float eye[4] = {
+                    vu.modelview_matrix[0] * x + vu.modelview_matrix[4] * y +
+                        vu.modelview_matrix[8] * z + vu.modelview_matrix[12] * w,
+                    vu.modelview_matrix[1] * x + vu.modelview_matrix[5] * y +
+                        vu.modelview_matrix[9] * z + vu.modelview_matrix[13] * w,
+                    vu.modelview_matrix[2] * x + vu.modelview_matrix[6] * y +
+                        vu.modelview_matrix[10] * z + vu.modelview_matrix[14] * w,
+                    vu.modelview_matrix[3] * x + vu.modelview_matrix[7] * y +
+                        vu.modelview_matrix[11] * z + vu.modelview_matrix[15] * w
+                };
+                const float clip[4] = {
+                    vu.mvp_matrix[0] * x + vu.mvp_matrix[4] * y +
+                        vu.mvp_matrix[8] * z + vu.mvp_matrix[12] * w,
+                    vu.mvp_matrix[1] * x + vu.mvp_matrix[5] * y +
+                        vu.mvp_matrix[9] * z + vu.mvp_matrix[13] * w,
+                    vu.mvp_matrix[2] * x + vu.mvp_matrix[6] * y +
+                        vu.mvp_matrix[10] * z + vu.mvp_matrix[14] * w,
+                    vu.mvp_matrix[3] * x + vu.mvp_matrix[7] * y +
+                        vu.mvp_matrix[11] * z + vu.mvp_matrix[15] * w
+                };
+                bool finite = true;
+                for (int c = 0; c < 4; c++) {
+                    finite = finite && std::isfinite(eye[c]) && std::isfinite(clip[c]);
+                }
+                if (!finite) continue;
+                if (transformedFinite == 0) {
+                    memcpy(min_eye, eye, sizeof(min_eye));
+                    memcpy(max_eye, eye, sizeof(max_eye));
+                    memcpy(min_clip, clip, sizeof(min_clip));
+                    memcpy(max_clip, clip, sizeof(max_clip));
+                } else {
+                    for (int c = 0; c < 4; c++) {
+                        if (eye[c] < min_eye[c]) min_eye[c] = eye[c];
+                        if (eye[c] > max_eye[c]) max_eye[c] = eye[c];
+                        if (clip[c] < min_clip[c]) min_clip[c] = clip[c];
+                        if (clip[c] > max_clip[c]) max_clip[c] = clip[c];
+                    }
+                }
+                transformedFinite++;
+            }
+
+            GL_METAL_LOG("GLMetalDrawSuspect: verts=%zu tex=%u matrixMode=0x%x mvDepth=%d projDepth=%d "
+                         "activeClipPlanes=%d transformedFinite=%u eyeX %.6g..%.6g eyeY %.6g..%.6g "
+                         "eyeZ %.6g..%.6g eyeW %.6g..%.6g clipX %.6g..%.6g clipY %.6g..%.6g "
+                         "clipZ %.6g..%.6g clipW %.6g..%.6g",
+                         vertCount, tex0Name, ctx->matrix_mode, ctx->modelview_depth,
+                         ctx->projection_depth, vu.num_clip_planes, transformedFinite,
+                         min_eye[0], max_eye[0], min_eye[1], max_eye[1],
+                         min_eye[2], max_eye[2], min_eye[3], max_eye[3],
+                         min_clip[0], max_clip[0], min_clip[1], max_clip[1],
+                         min_clip[2], max_clip[2], min_clip[3], max_clip[3]);
+            GL_METAL_LOG("GLMetalDrawSuspectMatrix: verts=%zu tex=%u "
+                         "mv=[%.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g] "
+                         "proj=[%.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g] "
+                         "mvp=[%.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g]",
+                         vertCount, tex0Name,
+                         vu.modelview_matrix[0], vu.modelview_matrix[4], vu.modelview_matrix[8], vu.modelview_matrix[12],
+                         vu.modelview_matrix[1], vu.modelview_matrix[5], vu.modelview_matrix[9], vu.modelview_matrix[13],
+                         vu.modelview_matrix[2], vu.modelview_matrix[6], vu.modelview_matrix[10], vu.modelview_matrix[14],
+                         vu.modelview_matrix[3], vu.modelview_matrix[7], vu.modelview_matrix[11], vu.modelview_matrix[15],
+                         ctx->projection_stack[ctx->projection_depth][0], ctx->projection_stack[ctx->projection_depth][4], ctx->projection_stack[ctx->projection_depth][8], ctx->projection_stack[ctx->projection_depth][12],
+                         ctx->projection_stack[ctx->projection_depth][1], ctx->projection_stack[ctx->projection_depth][5], ctx->projection_stack[ctx->projection_depth][9], ctx->projection_stack[ctx->projection_depth][13],
+                         ctx->projection_stack[ctx->projection_depth][2], ctx->projection_stack[ctx->projection_depth][6], ctx->projection_stack[ctx->projection_depth][10], ctx->projection_stack[ctx->projection_depth][14],
+                         ctx->projection_stack[ctx->projection_depth][3], ctx->projection_stack[ctx->projection_depth][7], ctx->projection_stack[ctx->projection_depth][11], ctx->projection_stack[ctx->projection_depth][15],
+                         vu.mvp_matrix[0], vu.mvp_matrix[4], vu.mvp_matrix[8], vu.mvp_matrix[12],
+                         vu.mvp_matrix[1], vu.mvp_matrix[5], vu.mvp_matrix[9], vu.mvp_matrix[13],
+                         vu.mvp_matrix[2], vu.mvp_matrix[6], vu.mvp_matrix[10], vu.mvp_matrix[14],
+                         vu.mvp_matrix[3], vu.mvp_matrix[7], vu.mvp_matrix[11], vu.mvp_matrix[15]);
+            s_suspectQuakeForegroundModelLogCount++;
+        }
+    }
+
+    uint32_t trisCW = 0;
+    uint32_t trisCCW = 0;
+    uint32_t trisDegenerate = 0;
+    if (mtlPrim == (int)MTLPrimitiveTypeTriangle) {
+        for (size_t i = 0; i + 2 < vertCount; i += 3) {
+            float a[3], b[3], c[3];
+            if (!projectVertex(verts[i], a, false) ||
+                !projectVertex(verts[i + 1], b, false) ||
+                !projectVertex(verts[i + 2], c, false)) {
+                trisDegenerate++;
+                continue;
+            }
+            const float area = (b[0] - a[0]) * (c[1] - a[1]) -
+                               (b[1] - a[1]) * (c[0] - a[0]);
+            if (fabsf(area) < 1.0e-8f) {
+                trisDegenerate++;
+            } else if (area > 0.0f) {
+                trisCCW++;
+            } else {
+                trisCW++;
+            }
+        }
     }
 
     GL_METAL_LOG("GLMetalDrawState: verts=%zu prim=%d nextOffset=%d activeTex=%d "
-                 "tex0(unit=%d has=%d has3=%d en2=%d en3=%d name=%u %dx%d env=0x%x shader=%d) "
-                 "tex1(has=%d en2=%d name=%u %dx%d env=0x%x shader=%d) "
+	             "tex0(unit=%d has=%d has3=%d en2=%d en3=%d name=%u %dx%d env=0x%x shader=%d "
+	             "filter=0x%x/0x%x wrap=0x%x/0x%x mips=%d metal=%lux%lu/%lu) "
+	             "tex1(has=%d en2=%d name=%u %dx%d env=0x%x shader=%d "
+	             "filter=0x%x/0x%x wrap=0x%x/0x%x mips=%d metal=%lux%lu/%lu) "
                  "blend=%d src=0x%x dst=0x%x eq=0x%x alpha=%d func=0x%x ref=%.3f "
                  "depth=%d func=0x%x mask=%d lighting=%d lights=%d localViewer=%d twoSide=%d "
-                 "colorSum=%d fog=%d cull=%d shade=0x%x colorMask=%d%d%d%d overlayMask=0x%x "
+                 "colorSum=%d fog=%d fogMode=0x%x/%d fogRGBA=(%.3f,%.3f,%.3f,%.3f) "
+                 "fogRange=(%.3f,%.3f) fogDensity=%.6f cull=%d cullMode=0x%x front=0x%x shade=0x%x "
+                 "viewport=(%d,%d %dx%d) scissor=%d(%d,%d %dx%d) "
+                 "colorMask=%d%d%d%d drawableMask=0x%x "
                  "arrays(v=%d c=%d ct=0x%x n=%d t0=%d t1=%d) "
                  "color(r %.3f..%.3f g %.3f..%.3f b %.3f..%.3f a %.3f..%.3f) "
                  "sec(r %.3f..%.3f g %.3f..%.3f b %.3f..%.3f) "
-                 "pos(x %.3f..%.3f y %.3f..%.3f z %.3f..%.3f)",
+                 "pos(x %.3f..%.3f y %.3f..%.3f z %.3f..%.3f) "
+                 "tc0(s %.3f..%.3f t %.3f..%.3f q %.3f..%.3f uv %.3f..%.3f %.3f..%.3f) "
+                 "tc1(s %.3f..%.3f t %.3f..%.3f q %.3f..%.3f uv %.3f..%.3f %.3f..%.3f) "
+                 "proj(finite=%u inside=%u ndcX %.3f..%.3f ndcY %.3f..%.3f ndcZ %.3f..%.3f trisCW=%u trisCCW=%u trisDeg=%u)",
                  vertCount, mtlPrim, nextOffset, ctx->active_texture,
                  texUnit, fu.has_texture, fu.has_texture_3d,
-                 ctx->tex_units[texUnit].enabled_2d ? 1 : 0,
+                 GLMetalTexture2DEnabledForDraw(ctx, texUnit) ? 1 : 0,
                  ctx->tex_units[texUnit].enabled_3d ? 1 : 0,
-                 tex0Name, tex0W, tex0H, ctx->tex_units[texUnit].env_mode, fu.texenv_mode,
-                 fu.has_texture_unit1, ctx->tex_units[1].enabled_2d ? 1 : 0,
-                 tex1Name, tex1W, tex1H, ctx->tex_units[1].env_mode, fu.texenv1_mode,
+	             tex0Name, tex0W, tex0H, ctx->tex_units[texUnit].env_mode, fu.texenv_mode,
+	             tex0MinFilter, tex0MagFilter, tex0WrapS, tex0WrapT,
+	             tex0HasMipmaps, tex0MetalW, tex0MetalH, tex0MetalMips,
+	             fu.has_texture_unit1, GLMetalTexture2DEnabledForDraw(ctx, 1) ? 1 : 0,
+	             tex1Name, tex1W, tex1H, ctx->tex_units[1].env_mode, fu.texenv1_mode,
+	             tex1MinFilter, tex1MagFilter, tex1WrapS, tex1WrapT,
+	             tex1HasMipmaps, tex1MetalW, tex1MetalH, tex1MetalMips,
                  ctx->blend ? 1 : 0, ctx->blend_src, ctx->blend_dst, ctx->blend_equation,
                  ctx->alpha_test ? 1 : 0, ctx->alpha_func, ctx->alpha_ref,
                  ctx->depth_test ? 1 : 0, ctx->depth_func, ctx->depth_mask ? 1 : 0,
                  ctx->lighting_enabled ? 1 : 0, vu.num_active_lights,
                  ctx->light_model_local_viewer ? 1 : 0, ctx->light_model_two_side ? 1 : 0,
                  ctx->color_sum ? 1 : 0, ctx->fog_enabled ? 1 : 0,
-                 ctx->cull_face_enabled ? 1 : 0, ctx->shade_model,
+                 ctx->fog_mode, vu.fog_mode,
+                 fu.fog_color[0], fu.fog_color[1], fu.fog_color[2], fu.fog_color[3],
+                 vu.fog_start, vu.fog_end, vu.fog_density,
+                 ctx->cull_face_enabled ? 1 : 0, ctx->cull_face_mode,
+                 ctx->front_face, ctx->shade_model,
+                 ctx->viewport[0], ctx->viewport[1], ctx->viewport[2], ctx->viewport[3],
+                 ctx->scissor_test ? 1 : 0,
+                 ctx->scissor_box[0], ctx->scissor_box[1],
+                 ctx->scissor_box[2], ctx->scissor_box[3],
                  ctx->color_mask[0] ? 1 : 0, ctx->color_mask[1] ? 1 : 0,
                  ctx->color_mask[2] ? 1 : 0, ctx->color_mask[3] ? 1 : 0,
-                 GLMetalOverlayColorWriteMask(ctx->color_mask[0], ctx->color_mask[1],
-                                              ctx->color_mask[2], ctx->color_mask[3]),
+                 drawableMask,
                  ctx->vertex_array.enabled ? 1 : 0,
                  ctx->color_array.enabled ? 1 : 0, ctx->color_array.type,
                  ctx->normal_array.enabled ? 1 : 0,
-                 ctx->texcoord_array[0].enabled ? 1 : 0,
-                 ctx->texcoord_array[1].enabled ? 1 : 0,
+                 GLMetalTexCoordArrayAvailableForDraw(ctx, 0) ? 1 : 0,
+                 GLMetalTexCoordArrayAvailableForDraw(ctx, 1) ? 1 : 0,
                  min_color[0], max_color[0], min_color[1], max_color[1],
                  min_color[2], max_color[2], min_color[3], max_color[3],
                  min_sec[0], max_sec[0], min_sec[1], max_sec[1], min_sec[2], max_sec[2],
-                 min_pos[0], max_pos[0], min_pos[1], max_pos[1], min_pos[2], max_pos[2]);
+                 min_pos[0], max_pos[0], min_pos[1], max_pos[1], min_pos[2], max_pos[2],
+                 min_tex0[0], max_tex0[0], min_tex0[1], max_tex0[1],
+                 min_tex0[2], max_tex0[2], min_uv0[0], max_uv0[0],
+                 min_uv0[1], max_uv0[1],
+                 min_tex1[0], max_tex1[0], min_tex1[1], max_tex1[1],
+                 min_tex1[2], max_tex1[2], min_uv1[0], max_uv1[0],
+                 min_uv1[1], max_uv1[1],
+                 projectedFinite, projectedInside,
+                 min_ndc[0], max_ndc[0], min_ndc[1], max_ndc[1], min_ndc[2], max_ndc[2],
+                 trisCW, trisCCW, trisDegenerate);
 }
 #endif
 
 static void GLMetalApplyViewportAndScissor(GLMetalState *ms, GLContext *ctx,
                                            uint32_t target_w, uint32_t target_h)
 {
+    if (ms->viewportScissorCacheValid &&
+        ms->viewportScissorTargetWidth == target_w &&
+        ms->viewportScissorTargetHeight == target_h &&
+        memcmp(ms->cachedViewport, ctx->viewport, sizeof(ms->cachedViewport)) == 0 &&
+        ms->cachedDepthRangeNear == ctx->depth_range_near &&
+        ms->cachedDepthRangeFar == ctx->depth_range_far &&
+        ms->cachedScissorTest == ctx->scissor_test &&
+        memcmp(ms->cachedScissorBox, ctx->scissor_box, sizeof(ms->cachedScissorBox)) == 0) {
+        return;
+    }
+
     GLMetalViewportRect rect = GLMetalMakeViewportRect(
         ctx->viewport[0], ctx->viewport[1], ctx->viewport[2], ctx->viewport[3],
         target_h, ctx->depth_range_near, ctx->depth_range_far);
@@ -669,18 +1920,34 @@ static void GLMetalApplyViewportAndScissor(GLMetalState *ms, GLContext *ctx,
     vp.zfar    = rect.zfar;
     [ms->currentEncoder setViewport:vp];
 
-    if (ctx->scissor_test) {
-        GLMetalScissorRect converted = GLMetalMakeScissorRect(
-            ctx->scissor_box[0], ctx->scissor_box[1],
-            ctx->scissor_box[2], ctx->scissor_box[3],
-            target_w, target_h);
+	if (ctx->scissor_test) {
+		GLMetalScissorRect converted = GLMetalMakeScissorRect(
+			ctx->scissor_box[0], ctx->scissor_box[1],
+			ctx->scissor_box[2], ctx->scissor_box[3],
+			target_w, target_h);
         MTLScissorRect sr;
         sr.x = converted.x;
         sr.y = converted.y;
         sr.width = converted.width;
-        sr.height = converted.height;
-        [ms->currentEncoder setScissorRect:sr];
-    }
+		sr.height = converted.height;
+		[ms->currentEncoder setScissorRect:sr];
+	} else {
+		MTLScissorRect sr;
+		sr.x = 0;
+		sr.y = 0;
+		sr.width = target_w;
+		sr.height = target_h;
+		[ms->currentEncoder setScissorRect:sr];
+	}
+
+    ms->viewportScissorCacheValid = true;
+    ms->viewportScissorTargetWidth = target_w;
+    ms->viewportScissorTargetHeight = target_h;
+    memcpy(ms->cachedViewport, ctx->viewport, sizeof(ms->cachedViewport));
+    ms->cachedDepthRangeNear = ctx->depth_range_near;
+    ms->cachedDepthRangeFar = ctx->depth_range_far;
+    ms->cachedScissorTest = ctx->scissor_test;
+    memcpy(ms->cachedScissorBox, ctx->scissor_box, sizeof(ms->cachedScissorBox));
 }
 
 static void GLMetalFillPixelQuadVertices(GLMetalVertex verts[4],
@@ -1032,12 +2299,14 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
     uint32_t blend_src = ctx->blend_src;
     uint32_t blend_dst = ctx->blend_dst;
     bool depth_write = ctx->depth_mask;
-    uint32_t color_mask_bits = GLMetalOverlayColorWriteMask(ctx->color_mask[0],
-                                                            ctx->color_mask[1],
-                                                            ctx->color_mask[2],
-                                                            ctx->color_mask[3]);
+    const bool isOffscreen = GLContextGetOffscreenDrawable(ctx, NULL, NULL, NULL, NULL);
+    uint32_t color_mask_bits = GLMetalDrawableColorWriteMask(isOffscreen,
+                                                             ctx->color_mask[0],
+                                                             ctx->color_mask[1],
+                                                             ctx->color_mask[2],
+                                                             ctx->color_mask[3]);
     int texUnit = GLMetalPrimaryTextureUnitForDraw(ctx->active_texture);
-    bool has_texture = (ctx->tex_units[texUnit].enabled_2d &&
+    bool has_texture = (GLMetalTexture2DEnabledForDraw(ctx, texUnit) &&
                         ctx->tex_units[texUnit].bound_texture_2d != 0) ||
                        (ctx->tex_units[texUnit].enabled_3d &&
                         ctx->tex_units[texUnit].bound_texture_3d != 0);
@@ -1074,16 +2343,16 @@ static id<MTLRenderPipelineState> GLMetalGetPipeline(GLMetalState *ms, GLContext
         pipeDesc.colorAttachments[0].alphaBlendOperation = blendOp;
         pipeDesc.colorAttachments[0].sourceRGBBlendFactor = GLBlendToMetal(blend_src);
         pipeDesc.colorAttachments[0].destinationRGBBlendFactor = GLBlendToMetal(blend_dst);
-        // Independent alpha factors: maintain alpha=1.0 invariant regardless of RGB blend mode.
-        // Independent alpha factors for overlay compositing.
+        // The compositor treats GL overlay contents as premultiplied BGRA.
+        // RGB blend factors follow GL; alpha tracks coverage for final compositing.
         pipeDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
         pipeDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     } else {
         pipeDesc.colorAttachments[0].blendingEnabled = NO;
     }
 
-    // Color write mask: alpha is intentionally stripped by color_mask_bits to
-    // preserve overlay alpha=1.0 for compositor compositing.
+    // Normal GL overlays keep alpha writable for compositor coverage. AGL
+    // offscreen drawables keep the guest alpha mask for ARGB1555 readback.
     MTLColorWriteMask mask = MTLColorWriteMaskNone;
     if (color_mask_bits & 1) mask |= MTLColorWriteMaskRed;
     if (color_mask_bits & 2) mask |= MTLColorWriteMaskGreen;
@@ -1239,21 +2508,31 @@ void GLMetalBeginFrame(GLContext *ctx)
     //
     // If bind happened before the context's viewport was set (unusual but
     // possible), the cached overlay dims and the context's dims might
-    // differ — gl_acquire_overlay_texture re-vends if dims don't match the
-    // cache, so we're safe to pass whatever GL currently believes the
-    // drawable size is.
-    int w = ctx->viewport[2];
-    int h = ctx->viewport[3];
-    if (w <= 0 || h <= 0) {
-        // No viewport yet — fall back to cached overlay dims if we have one.
-        if (s_gl_overlay_tex != nil) {
-            w = (int)s_gl_overlay_w;
-            h = (int)s_gl_overlay_h;
+    // differ. Window overlays keep the historical viewport-sized target, but
+    // AGL offscreen drawables must render into the full guest drawable so
+    // non-zero viewport origins map correctly during readback.
+    uint32_t offscreenW = 0;
+    uint32_t offscreenH = 0;
+    const bool isOffscreen =
+        GLContextGetOffscreenDrawable(ctx, &offscreenW, &offscreenH, NULL, NULL);
+    int viewportW = ctx->viewport[2];
+    int viewportH = ctx->viewport[3];
+    if (viewportW <= 0 || viewportH <= 0) {
+        // No viewport yet — fall back to the last bound overlay dims.
+        if (s_gl_overlay_w != 0 && s_gl_overlay_h != 0) {
+            viewportW = (int)s_gl_overlay_w;
+            viewportH = (int)s_gl_overlay_h;
         } else {
             GL_METAL_LOG("GLMetalBeginFrame: no viewport and no cached overlay");
             return;
         }
     }
+
+    const GLMetalRenderTargetSize targetSize = GLMetalChooseRenderTargetSize(
+        isOffscreen, offscreenW, offscreenH,
+        (uint32_t)viewportW, (uint32_t)viewportH);
+    const int w = (int)targetSize.width;
+    const int h = (int)targetSize.height;
 
     ms->overlayTexture = gl_acquire_overlay_texture((uint32_t)w, (uint32_t)h);
     if (!ms->overlayTexture) {
@@ -1269,16 +2548,24 @@ void GLMetalBeginFrame(GLContext *ctx)
     rpd.colorAttachments[0].texture = ms->overlayTexture;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    // Clear alpha to 1.0 (opaque): the compositor uses MTLViewport set to the
-    // GL render rect, so 2D content outside the 3D viewport is visible.
+    const float clearAlpha =
+        GLMetalOverlayClearAlpha(isOffscreen, ctx->clear_color[3]);
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(
-        ctx->clear_color[0], ctx->clear_color[1],
-        ctx->clear_color[2], 1.0
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[0], clearAlpha),
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[1], clearAlpha),
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[2], clearAlpha),
+        clearAlpha
     );
 
     rpd.depthAttachment.texture = ms->depthBuffer;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
-    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rpd.depthAttachment.storeAction =
+        GLMetalDepthAttachmentShouldStoreForReadback()
+            ? MTLStoreActionStore
+            : MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = ctx->clear_depth;
 
     rpd.stencilAttachment.texture = ms->depthBuffer;
@@ -1286,14 +2573,100 @@ void GLMetalBeginFrame(GLContext *ctx)
     rpd.stencilAttachment.storeAction = MTLStoreActionDontCare;
     rpd.stencilAttachment.clearStencil = ctx->clear_stencil;
 
-    ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->viewportScissorCacheValid = false;
 
-    GLMetalApplyViewportAndScissor(ms, ctx, (uint32_t)w, (uint32_t)h);
+	GLMetalApplyViewportAndScissor(ms, ctx, (uint32_t)w, (uint32_t)h);
 
     ms->renderPassActive = true;
     ms->bufferOffset = 0;  // Reset ring buffer offset for new frame
 
-    GL_METAL_LOG("GLMetalBeginFrame: encoder=%p overlayTexture=%p", ms->currentEncoder, ms->overlayTexture);
+    GL_METAL_LOG("GLMetalBeginFrame: encoder=%p overlayTexture=%p target=%dx%d viewport=(%d,%d %dx%d) offscreen=%d drawable=%ux%u",
+                 ms->currentEncoder, ms->overlayTexture, w, h,
+                 ctx->viewport[0], ctx->viewport[1],
+                 ctx->viewport[2], ctx->viewport[3],
+	                 isOffscreen ? 1 : 0, offscreenW, offscreenH);
+}
+
+void GLMetalClear(GLContext *ctx, uint32_t mask)
+{
+    GLMetalState *ms = (GLMetalState *)ctx->metal;
+    if (!ms || !ms->initialized) return;
+    if (!GLShouldApplyAttachmentClear(mask)) return;
+
+    if (!ms->renderPassActive) {
+        if (GLShouldBeginRenderPassForClear(mask)) {
+            GLMetalBeginFrame(ctx);
+        }
+        return;
+    }
+
+    if (!ms->overlayTexture || !ms->currentCommandBuffer) {
+        GL_METAL_LOG("GLMetalClear: missing active target for mask=0x%x", mask);
+        return;
+    }
+
+    const bool clearColor = GLShouldClearColorAttachment(mask);
+    const bool clearDepth = GLShouldClearDepthAttachment(mask);
+    const bool clearStencil = GLShouldClearStencilAttachment(mask);
+    const uint32_t targetW = (uint32_t)[ms->overlayTexture width];
+    const uint32_t targetH = (uint32_t)[ms->overlayTexture height];
+
+    if ((clearDepth || clearStencil) && !ms->depthBuffer) {
+        EnsureDepthBuffer(ms, (int)targetW, (int)targetH);
+    }
+
+    if (ms->currentEncoder) {
+        [ms->currentEncoder endEncoding];
+        ms->currentEncoder = nil;
+    }
+
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = ms->overlayTexture;
+    rpd.colorAttachments[0].loadAction = clearColor ? MTLLoadActionClear : MTLLoadActionLoad;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    uint32_t offscreenW = 0;
+    uint32_t offscreenH = 0;
+    const bool isOffscreen =
+        GLContextGetOffscreenDrawable(ctx, &offscreenW, &offscreenH, NULL, NULL);
+    const float clearAlpha =
+        GLMetalOverlayClearAlpha(isOffscreen, ctx->clear_color[3]);
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[0], clearAlpha),
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[1], clearAlpha),
+        GLMetalOverlayClearColorComponent(isOffscreen,
+                                          ctx->clear_color[2], clearAlpha),
+        clearAlpha
+    );
+
+    if (ms->depthBuffer) {
+        rpd.depthAttachment.texture = ms->depthBuffer;
+        rpd.depthAttachment.loadAction = clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+        rpd.depthAttachment.clearDepth = ctx->clear_depth;
+
+        rpd.stencilAttachment.texture = ms->depthBuffer;
+        rpd.stencilAttachment.loadAction = clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+        rpd.stencilAttachment.clearStencil = ctx->clear_stencil;
+    }
+
+	ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->viewportScissorCacheValid = false;
+	if (!ms->currentEncoder) {
+		GL_METAL_LOG("GLMetalClear: failed to restart encoder for mask=0x%x", mask);
+        ms->renderPassActive = false;
+        return;
+    }
+
+    GLMetalApplyViewportAndScissor(ms, ctx, targetW, targetH);
+
+    GL_METAL_LOG("GLMetalClear: mask=0x%x color=%d depth=%d stencil=%d viewport=(%d,%d %dx%d)",
+                 mask, clearColor ? 1 : 0, clearDepth ? 1 : 0, clearStencil ? 1 : 0,
+                 ctx->viewport[0], ctx->viewport[1], ctx->viewport[2], ctx->viewport[3]);
 }
 
 
@@ -1584,9 +2957,10 @@ static bool GLMetalFlushAndResetRingBuffer(GLContext *ctx)
     }
 
     // (f) Begin a new render command encoder
-    ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
-    if (!ms->currentEncoder) {
-        GL_METAL_LOG("GLMetalFlushAndResetRingBuffer: failed to create new encoder");
+	ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->viewportScissorCacheValid = false;
+	if (!ms->currentEncoder) {
+		GL_METAL_LOG("GLMetalFlushAndResetRingBuffer: failed to create new encoder");
         return false;
     }
 
@@ -1615,12 +2989,17 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     if (ctx->im_vertices.empty()) return;
 
     // Auto-start frame if needed
-    if (!ms->renderPassActive) {
-        GLMetalBeginFrame(ctx);
-        if (!ms->renderPassActive) return;
-    }
+	if (!ms->renderPassActive) {
+		GLMetalBeginFrame(ctx);
+		if (!ms->renderPassActive) return;
+	}
+	if (ms->overlayTexture) {
+		GLMetalApplyViewportAndScissor(ms, ctx,
+		                               (uint32_t)[ms->overlayTexture width],
+		                               (uint32_t)[ms->overlayTexture height]);
+	}
 
-    // ---- Determine primitive type and expand if needed ----
+	// ---- Determine primitive type and expand if needed ----
     MTLPrimitiveType mtlPrim;
     std::vector<GLMetalVertex> expandedVerts;
     bool expanded = ExpandPrimitives(ctx->im_mode, ctx->im_vertices, expandedVerts, mtlPrim);
@@ -1672,6 +3051,57 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
         vertData = expandedVerts.data();
     }
 
+    // Hornet Korea renders its 2D/HUD surface as textured GL quads in
+    // viewport pixel coordinates after loading an identity projection.
+    // Classic GL drivers accepted that compatibility pattern; Metal clip
+    // space does not, so remap only this tightly-scoped screen-space case.
+    const float *mv = ctx->modelview_stack[ctx->modelview_depth];
+    const float *proj = ctx->projection_stack[ctx->projection_depth];
+    float mvp[16];
+    mat4_multiply(mvp, proj, mv);
+    const int texUnit = GLMetalPrimaryTextureUnitForDraw(ctx->active_texture);
+    const bool hasPrimaryTexture =
+        ((GLMetalTexture2DEnabledForDraw(ctx, texUnit) &&
+          ctx->tex_units[texUnit].bound_texture_2d != 0) ||
+         (ctx->tex_units[texUnit].enabled_3d &&
+          ctx->tex_units[texUnit].bound_texture_3d != 0));
+    const uint32_t viewportW =
+        ctx->viewport[2] > 0 ? (uint32_t)ctx->viewport[2] : 0u;
+    const uint32_t viewportH =
+        ctx->viewport[3] > 0 ? (uint32_t)ctx->viewport[3] : 0u;
+
+    float minX = vertData[0].position[0], maxX = vertData[0].position[0];
+    float minY = vertData[0].position[1], maxY = vertData[0].position[1];
+    float minZ = vertData[0].position[2], maxZ = vertData[0].position[2];
+    for (size_t i = 1; i < vertCount; i++) {
+        minX = std::min(minX, vertData[i].position[0]);
+        maxX = std::max(maxX, vertData[i].position[0]);
+        minY = std::min(minY, vertData[i].position[1]);
+        maxY = std::max(maxY, vertData[i].position[1]);
+        minZ = std::min(minZ, vertData[i].position[2]);
+        maxZ = std::max(maxZ, vertData[i].position[2]);
+    }
+
+    const bool screenSpaceRemap = GLMetalIdentityPixelProjectionApplies(
+        mvp, hasPrimaryTexture, ctx->depth_test, ctx->lighting_enabled,
+        viewportW, viewportH, minX, maxX, minY, maxY, minZ, maxZ);
+    if (screenSpaceRemap) {
+        for (GLMetalVertex &v : expandedVerts) {
+            v.position[0] = GLMetalPixelToClipX(v.position[0], viewportW);
+            v.position[1] = GLMetalPixelToClipY(v.position[1], viewportH);
+            v.position[3] = 1.0f;
+        }
+        vertData = expandedVerts.data();
+#if ACCEL_LOGGING_ENABLED
+        static uint32_t s_screen_space_remap_log_count = 0;
+        if (s_screen_space_remap_log_count < 16) {
+            GL_METAL_LOG("GLMetalFlushImmediateMode: remapped identity pixel projection draw viewport=%ux%u bounds=(%.1f..%.1f, %.1f..%.1f)",
+                         viewportW, viewportH, minX, maxX, minY, maxY);
+            s_screen_space_remap_log_count++;
+        }
+#endif
+    }
+
     size_t vertBytes = vertCount * sizeof(GLMetalVertex);
 
     // ---- Check ring buffer space ----
@@ -1693,13 +3123,8 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     id<MTLBuffer> vb = ms->vertexBuffers[ms->currentBufferIndex];
     memcpy((uint8_t *)[vb contents] + ms->bufferOffset, vertData, vertBytes);
 
-    // ---- Compute MVP matrix ----
-    const float *mv = ctx->modelview_stack[ctx->modelview_depth];
-    const float *proj = ctx->projection_stack[ctx->projection_depth];
-    float mvp[16];
-    mat4_multiply(mvp, proj, mv);
-
     // ---- Upload vertex uniforms ----
+    const bool fogActiveForDraw = ctx->fog_enabled && !screenSpaceRemap;
     GLMetalVertexUniforms vu;
     memcpy(vu.mvp_matrix, mvp, sizeof(float) * 16);
     memcpy(vu.modelview_matrix, mv, sizeof(float) * 16);
@@ -1710,8 +3135,8 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     for (int i = 0; i < 8; i++) {
         if (ctx->lights[i].enabled) vu.num_active_lights++;
     }
-    vu.fog_enabled = ctx->fog_enabled ? 1 : 0;
-    vu.fog_mode = ctx->fog_enabled ? GLFogModeToShader(ctx->fog_mode) : 0;
+    vu.fog_enabled = fogActiveForDraw ? 1 : 0;
+    vu.fog_mode = fogActiveForDraw ? GLFogModeToShader(ctx->fog_mode) : 0;
     vu.fog_start = ctx->fog_start;
     vu.fog_end = ctx->fog_end;
     vu.fog_density = ctx->fog_density;
@@ -1724,7 +3149,7 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     memset(vu._clip_pad, 0, sizeof(vu._clip_pad));
     for (int i = 0; i < 6; i++) {
         if (ctx->clip_plane_enabled[i]) {
-            memcpy(vu.clip_planes[nClipPlanes], ctx->clip_planes[i], sizeof(float) * 4);
+            GLMetalCopyClipPlaneToUniform(vu.clip_planes[nClipPlanes], ctx->clip_planes[i]);
             nClipPlanes++;
         }
     }
@@ -1732,10 +3157,9 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
 
     // ---- Upload fragment uniforms ----
     GLMetalFragmentUniforms fu;
-    int texUnit = GLMetalPrimaryTextureUnitForDraw(ctx->active_texture);
     fu.texenv_mode = GLTexEnvModeToShader(ctx->tex_units[texUnit].env_mode);
     memcpy(fu.texenv_color, ctx->tex_units[texUnit].env_color, sizeof(float) * 4);
-    if (ctx->fog_enabled) {
+    if (fogActiveForDraw) {
         memcpy(fu.fog_color, ctx->fog_color, sizeof(float) * 4);
     } else {
         fu.fog_color[0] = fu.fog_color[1] = fu.fog_color[2] = 0.0f;
@@ -1744,12 +3168,9 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     fu.alpha_test_enabled = ctx->alpha_test ? 1 : 0;
     fu.alpha_func = GLAlphaFuncToShader(ctx->alpha_func);
     fu.alpha_ref = ctx->alpha_ref;
-    fu.has_texture = ((ctx->tex_units[texUnit].enabled_2d &&
-                        ctx->tex_units[texUnit].bound_texture_2d != 0) ||
-                       (ctx->tex_units[texUnit].enabled_3d &&
-                        ctx->tex_units[texUnit].bound_texture_3d != 0)) ? 1 : 0;
+    fu.has_texture = hasPrimaryTexture ? 1 : 0;
     fu.has_texture_3d = (ctx->tex_units[texUnit].enabled_3d &&
-                          ctx->tex_units[texUnit].bound_texture_3d != 0) ? 1 : 0;
+                         ctx->tex_units[texUnit].bound_texture_3d != 0) ? 1 : 0;
     fu.shade_model = (ctx->shade_model == GL_SMOOTH) ? 1 : 0;
     // EXT_secondary_color / GL_COLOR_SUM: honestly gated on the tracked enable bit
     // (NOT silently always-on) — secondary color is added after texturing only
@@ -1760,7 +3181,7 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     // modulate/add scope). Gated honestly on unit 1 being enabled with a bound 2D
     // texture (NOT silently always-on). The GL_COMBINE crossbar is store-only
     // and GL_EXT_texture_env_combine is de-advertised — only modes 0-4 are honored.
-    fu.has_texture_unit1 = (ctx->tex_units[1].enabled_2d &&
+    fu.has_texture_unit1 = (GLMetalTexture2DEnabledForDraw(ctx, 1) &&
                             ctx->tex_units[1].bound_texture_2d != 0) ? 1 : 0;
     fu.texenv1_mode = GLTexEnvModeToShader(ctx->tex_units[1].env_mode);
 
@@ -1825,7 +3246,10 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
         // GL_BACK (0x0405) = cull back faces = MTLCullModeBack; GL_FRONT (0x0404) = cull front faces = MTLCullModeFront
         MTLCullMode cm = (ctx->cull_face_mode == 0x0405) ? MTLCullModeBack : MTLCullModeFront;
         [ms->currentEncoder setCullMode:cm];
-        MTLWinding winding = (ctx->front_face == 0x0901) ? MTLWindingCounterClockwise : MTLWindingClockwise;  // GL_CCW=0x0901
+        MTLWinding winding =
+            GLMetalFrontFacingWindingIsCounterClockwise(ctx->front_face)
+                ? MTLWindingCounterClockwise
+                : MTLWindingClockwise;
         [ms->currentEncoder setFrontFacingWinding:winding];
     } else {
         [ms->currentEncoder setCullMode:MTLCullModeNone];
@@ -1929,9 +3353,10 @@ void GLMetalFlushImmediateMode(GLContext *ctx)
     GLMetalLogDrawState(ctx, vertData, vertCount, (int)mtlPrim, vu, fu, texUnit, ms->bufferOffset);
 #endif
 
-    GL_METAL_LOG("GLMetalFlushImmediateMode: drew %zu verts as prim %d, offset now %d",
-                 vertCount, (int)mtlPrim, ms->bufferOffset);
-}
+	    GL_METAL_LOG("GLMetalFlushImmediateMode: drew %zu verts as prim %d, offset now %d",
+	                 vertCount, (int)mtlPrim, ms->bufferOffset);
+	    GLMetalMarkDrawCompleted(ctx);
+	}
 
 
 /*
@@ -1947,12 +3372,17 @@ void GLMetalDrawPixels(GLContext *ctx, int width, int height, const uint8_t *bgr
     if (!ms || !ms->initialized) return;
 
     // Auto-start frame if needed
-    if (!ms->renderPassActive) {
-        GLMetalBeginFrame(ctx);
-        if (!ms->renderPassActive) return;
-    }
+	if (!ms->renderPassActive) {
+		GLMetalBeginFrame(ctx);
+		if (!ms->renderPassActive) return;
+	}
+	if (ms->overlayTexture) {
+		GLMetalApplyViewportAndScissor(ms, ctx,
+		                               (uint32_t)[ms->overlayTexture width],
+		                               (uint32_t)[ms->overlayTexture height]);
+	}
 
-    // Create transient texture from BGRA8 data
+	// Create transient texture from BGRA8 data
     MTLTextureDescriptor *texDesc = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                      width:width
@@ -2071,12 +3501,17 @@ void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *bgra_da
     if (!ms || !ms->initialized) return;
 
     // Auto-start frame if needed
-    if (!ms->renderPassActive) {
-        GLMetalBeginFrame(ctx);
-        if (!ms->renderPassActive) return;
-    }
+	if (!ms->renderPassActive) {
+		GLMetalBeginFrame(ctx);
+		if (!ms->renderPassActive) return;
+	}
+	if (ms->overlayTexture) {
+		GLMetalApplyViewportAndScissor(ms, ctx,
+		                               (uint32_t)[ms->overlayTexture width],
+		                               (uint32_t)[ms->overlayTexture height]);
+	}
 
-    // Create transient texture from BGRA8 data
+	// Create transient texture from BGRA8 data
     MTLTextureDescriptor *texDesc = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                      width:width
@@ -2213,11 +3648,18 @@ void GLMetalEndFrame(GLContext *ctx)
     [ms->currentEncoder endEncoding];
     ms->currentEncoder = nil;
 
-    [ms->currentCommandBuffer commit];
-    ms->lastCommittedBuffer = ms->currentCommandBuffer;
+    id<MTLCommandBuffer> committedBuffer = ms->currentCommandBuffer;
+    [committedBuffer commit];
+    ms->lastCommittedBuffer = committedBuffer;
     ms->currentCommandBuffer = nil;
 
     ms->renderPassActive = false;
+    s_gl_overlay_committed_frame = true;
+    const bool didReadback =
+        GLMetalReadbackOffscreenDrawable(ctx, ms, committedBuffer);
+    if (GLShouldInvalidateOffscreenReadbackAfterGLFlush(true, didReadback)) {
+        GLMetalInvalidateLatestOffscreenReadback("end frame without offscreen readback");
+    }
 
     // Advance ring buffer
     ms->currentBufferIndex = (ms->currentBufferIndex + 1) % GL_RING_BUFFER_COUNT;
@@ -2240,11 +3682,23 @@ void NativeGLFinish(GLContext *ctx)
         ms->currentEncoder = nil;
     }
     if (ms->currentCommandBuffer) {
-        [ms->currentCommandBuffer commit];
-        [ms->currentCommandBuffer waitUntilCompleted];
-        ms->lastCommittedBuffer = ms->currentCommandBuffer;
+        id<MTLCommandBuffer> committedBuffer = ms->currentCommandBuffer;
+        [committedBuffer commit];
+        [committedBuffer waitUntilCompleted];
+        ms->lastCommittedBuffer = committedBuffer;
         ms->currentCommandBuffer = nil;
         ms->renderPassActive = false;
+        s_gl_overlay_committed_frame = true;
+        const bool didReadback =
+            GLMetalReadbackOffscreenDrawable(ctx, ms, committedBuffer);
+        if (GLShouldInvalidateOffscreenReadbackAfterGLFlush(true, didReadback)) {
+            GLMetalInvalidateLatestOffscreenReadback("finish without offscreen readback");
+        }
+    } else if (GLShouldInvalidateOffscreenReadbackAfterNoCommandBufferFlush(
+                   s_gl_latest_offscreen_readback.valid,
+                   s_gl_latest_offscreen_readback.composite_count)) {
+        GLMetalInvalidateLatestOffscreenReadback(
+            "finish without command buffer after bridge composite");
     }
     GL_METAL_LOG("NativeGLFinish: completed");
 }
@@ -2263,10 +3717,22 @@ void NativeGLFlush(GLContext *ctx)
         ms->currentEncoder = nil;
     }
     if (ms->currentCommandBuffer) {
-        [ms->currentCommandBuffer commit];
-        ms->lastCommittedBuffer = ms->currentCommandBuffer;
+        id<MTLCommandBuffer> committedBuffer = ms->currentCommandBuffer;
+        [committedBuffer commit];
+        ms->lastCommittedBuffer = committedBuffer;
         ms->currentCommandBuffer = nil;
         ms->renderPassActive = false;
+        s_gl_overlay_committed_frame = true;
+        const bool didReadback =
+            GLMetalReadbackOffscreenDrawable(ctx, ms, committedBuffer);
+        if (GLShouldInvalidateOffscreenReadbackAfterGLFlush(true, didReadback)) {
+            GLMetalInvalidateLatestOffscreenReadback("flush without offscreen readback");
+        }
+    } else if (GLShouldInvalidateOffscreenReadbackAfterNoCommandBufferFlush(
+                   s_gl_latest_offscreen_readback.valid,
+                   s_gl_latest_offscreen_readback.composite_count)) {
+        GLMetalInvalidateLatestOffscreenReadback(
+            "flush without command buffer after bridge composite");
     }
     GL_METAL_LOG("NativeGLFlush: committed");
 }
@@ -2363,6 +3829,7 @@ void GLMetalRelease(GLContext *ctx)
 
 // GL pixel format constants
 #define GL_RGBA                           0x1908
+#define GL_DEPTH_COMPONENT                0x1902
 // GL_UNSIGNED_BYTE defined above with data types
 
 
@@ -2473,14 +3940,39 @@ void GLMetalUploadTexture(GLContext *ctx, GLTextureObject *texObj, int level,
     int mipHeight = height;
     // For mip levels > 0, the width/height should already be correct from the caller
 
-    MTLRegion region = MTLRegionMake2D(0, 0, mipWidth, mipHeight);
-    [existing replaceRegion:region
-                mipmapLevel:level
-                  withBytes:data
-                bytesPerRow:mipWidth * 4];
+	MTLRegion region = MTLRegionMake2D(0, 0, mipWidth, mipHeight);
+	[existing replaceRegion:region
+	            mipmapLevel:level
+	              withBytes:data
+	            bytesPerRow:mipWidth * 4];
 
-    GL_METAL_LOG("GLMetalUploadTexture: tex=%u level=%d %dx%d (%d bytes)",
-                 texObj->name, level, mipWidth, mipHeight, dataLen);
+#if ACCEL_LOGGING_ENABLED
+	if (gl_logging_enabled &&
+	    GLMetalTextureDiagnosticsShouldTrace(texObj->name, level)) {
+	    GLMetalLogTextureBGRAStats("GLMetalUploadTexture source",
+	                               texObj->name, level,
+	                               mipWidth, mipHeight, data, dataLen);
+	    std::vector<uint8_t> readback((size_t)mipWidth * (size_t)mipHeight * 4u);
+	    if (!readback.empty()) {
+	        [existing getBytes:readback.data()
+	               bytesPerRow:mipWidth * 4
+	                fromRegion:region
+	               mipmapLevel:level];
+	        GLMetalLogTextureBGRAStats("GLMetalUploadTexture readback",
+	                                   texObj->name, level,
+	                                   mipWidth, mipHeight,
+	                                   readback.data(), (int)readback.size());
+	    }
+	}
+#endif
+
+	GL_METAL_LOG("GLMetalUploadTexture: tex=%u level=%d %dx%d (%d bytes) "
+	             "metal=%lux%lu mips=%lu hasMipmaps=%d",
+	             texObj->name, level, mipWidth, mipHeight, dataLen,
+	             (unsigned long)[existing width],
+	             (unsigned long)[existing height],
+	             (unsigned long)[existing mipmapLevelCount],
+	             texObj->has_mipmaps ? 1 : 0);
 }
 
 
@@ -2683,19 +4175,151 @@ static id<MTLSamplerState> GLMetalGetSampler(GLMetalState *ms, GLTextureObject *
  *  Returns a malloc'd buffer (caller must free), or NULL on failure.
  *  Temporarily ends the current render encoder and restarts it with LoadAction::Load.
  */
-uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int height, int *out_len)
+static void GLMetalWaitForCommittedReadbackWork(GLMetalState *ms)
 {
-    if (out_len) *out_len = 0;
-    GLMetalState *ms = (GLMetalState *)ctx->metal;
-    if (!ms || !ms->initialized) return NULL;
+    if (!ms) return;
+    if (ms->lastCommittedBuffer) {
+        [ms->lastCommittedBuffer waitUntilCompleted];
+        ms->lastCommittedBuffer = nil;
+    }
+}
 
-    if (ms->renderPassActive && ms->currentEncoder) {
+static void GLMetalEndAndCommitForReadback(GLMetalState *ms)
+{
+    if (!ms) return;
+
+    if (ms->currentEncoder) {
         [ms->currentEncoder endEncoding];
         ms->currentEncoder = nil;
     }
 
+    if (ms->currentCommandBuffer) {
+        id<MTLCommandBuffer> committedBuffer = ms->currentCommandBuffer;
+        [committedBuffer commit];
+        [committedBuffer waitUntilCompleted];
+        ms->lastCommittedBuffer = committedBuffer;
+        ms->currentCommandBuffer = nil;
+    }
+
+    GLMetalWaitForCommittedReadbackWork(ms);
+    ms->renderPassActive = false;
+}
+
+static bool GLMetalRestartRenderPassForReadback(GLContext *ctx)
+{
+    GLMetalState *ms = (GLMetalState *)ctx->metal;
+    if (!ms || !ms->overlayTexture) return false;
+
+    ms->currentCommandBuffer = [ms->commandQueue commandBuffer];
+    if (!ms->currentCommandBuffer) {
+        GL_METAL_LOG("GLMetalRestartRenderPassForReadback: failed to create command buffer");
+        return false;
+    }
+
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = ms->overlayTexture;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    if (ms->depthBuffer) {
+        rpd.depthAttachment.texture = ms->depthBuffer;
+        rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+        rpd.stencilAttachment.texture = ms->depthBuffer;
+        rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
+        rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+
+	ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->viewportScissorCacheValid = false;
+	if (!ms->currentEncoder) {
+		GL_METAL_LOG("GLMetalRestartRenderPassForReadback: failed to create encoder");
+        ms->currentCommandBuffer = nil;
+        ms->renderPassActive = false;
+        return false;
+    }
+
+    GLMetalApplyViewportAndScissor(ms, ctx,
+                                   (uint32_t)[ms->overlayTexture width],
+                                   (uint32_t)[ms->overlayTexture height]);
+    ms->renderPassActive = true;
+    return true;
+}
+
+static bool GLMetalReadRectIsInTexture(id<MTLTexture> tex,
+                                       int32_t x, int32_t y,
+                                       int32_t width, int32_t height)
+{
+    if (!tex || x < 0 || y < 0 || width <= 0 || height <= 0) return false;
+    const uint64_t x1 = (uint64_t)(uint32_t)x + (uint32_t)width;
+    const uint64_t y1 = (uint64_t)(uint32_t)y + (uint32_t)height;
+    return x1 <= [tex width] && y1 <= [tex height];
+}
+
+static uint32_t GLMetalPackRowStride(int32_t width,
+                                     int32_t bytesPerPixel,
+                                     const GLPixelStore &ps)
+{
+    int32_t alignment = ps.pack_alignment;
+    if (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) {
+        alignment = 4;
+    }
+
+    int32_t rowPixels = ps.pack_row_length > 0 ? ps.pack_row_length : width;
+    rowPixels = std::max(rowPixels, width);
+    const uint32_t rawBytes = (uint32_t)(rowPixels * bytesPerPixel);
+    return (rawBytes + (uint32_t)alignment - 1u) & ~((uint32_t)alignment - 1u);
+}
+
+static uint32_t GLMetalPackPixelAddress(uint32_t base,
+                                        int32_t row,
+                                        int32_t col,
+                                        int32_t bytesPerPixel,
+                                        uint32_t rowStride,
+                                        const GLPixelStore &ps)
+{
+    const int32_t skipRows = std::max(0, ps.pack_skip_rows);
+    const int32_t skipPixels = std::max(0, ps.pack_skip_pixels);
+    return base + (uint32_t)(skipRows + row) * rowStride +
+           (uint32_t)(skipPixels + col) * (uint32_t)bytesPerPixel;
+}
+
+static id<MTLTexture> GLMetalGetDepthReadbackTexture(GLMetalState *ms,
+                                                     int32_t width,
+                                                     int32_t height)
+{
+    if (ms->depthReadbackTexture &&
+        (int32_t)[ms->depthReadbackTexture width] == width &&
+        (int32_t)[ms->depthReadbackTexture height] == height) {
+        return ms->depthReadbackTexture;
+    }
+
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                     width:(NSUInteger)width
+                                    height:(NSUInteger)height
+                                 mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead;
+    ms->depthReadbackTexture = [ms->device newTextureWithDescriptor:desc];
+    return ms->depthReadbackTexture;
+}
+
+uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int height, int *out_len)
+{
+    if (out_len) *out_len = 0;
+    GLMetalState *ms = (GLMetalState *)ctx->metal;
+    if (!ms || !ms->initialized || width <= 0 || height <= 0) return NULL;
+
     id<MTLTexture> srcTex = ms->overlayTexture;
-    if (!srcTex) return NULL;
+    if (!srcTex || !GLMetalReadRectIsInTexture(srcTex, x, y, width, height)) return NULL;
+
+    const bool restartRenderPass = ms->renderPassActive;
+    if (restartRenderPass) {
+        GLMetalEndAndCommitForReadback(ms);
+    } else {
+        GLMetalWaitForCommittedReadbackWork(ms);
+    }
 
     MTLTextureDescriptor *stagingDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                           width:width
@@ -2704,12 +4328,18 @@ uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int
     stagingDesc.usage = MTLTextureUsageShaderRead;
     stagingDesc.storageMode = MTLStorageModeShared;
     id<MTLTexture> staging = [ms->device newTextureWithDescriptor:stagingDesc];
-    if (!staging) return NULL;
+    if (!staging) {
+        if (restartRenderPass) GLMetalRestartRenderPassForReadback(ctx);
+        return NULL;
+    }
 
     id<MTLCommandBuffer> blitCmdBuf = [ms->commandQueue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [blitCmdBuf blitCommandEncoder];
+    const uint32_t sourceY =
+        GLMetalTextureYForGLRead(y, height, (uint32_t)[srcTex height]);
     [blit copyFromTexture:srcTex sourceSlice:0 sourceLevel:0
-             sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(width, height, 1)
+             sourceOrigin:MTLOriginMake((NSUInteger)x, sourceY, 0)
+               sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
                 toTexture:staging destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
@@ -2718,28 +4348,14 @@ uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int
 
     int bufLen = width * height * 4;
     uint8_t *pixels = (uint8_t *)malloc(bufLen);
-    if (!pixels) return NULL;
+    if (!pixels) {
+        if (restartRenderPass) GLMetalRestartRenderPassForReadback(ctx);
+        return NULL;
+    }
 
     [staging getBytes:pixels bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
 
-    // Restart render encoder with LoadAction::Load to preserve content
-    if (ms->renderPassActive && ms->overlayTexture) {
-        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = ms->overlayTexture;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        if (ms->depthBuffer) {
-            rpd.depthAttachment.texture = ms->depthBuffer;
-            rpd.depthAttachment.loadAction = MTLLoadActionLoad;
-            rpd.depthAttachment.storeAction = MTLStoreActionStore;
-            rpd.stencilAttachment.texture = ms->depthBuffer;
-            rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
-            rpd.stencilAttachment.storeAction = MTLStoreActionStore;
-        }
-        if (!ms->currentCommandBuffer)
-            ms->currentCommandBuffer = [ms->commandQueue commandBuffer];
-        ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
-    }
+    if (restartRenderPass) GLMetalRestartRenderPassForReadback(ctx);
 
     if (out_len) *out_len = bufLen;
     return pixels;
@@ -2753,21 +4369,107 @@ void NativeGLReadPixels(GLContext *ctx, int32_t x, int32_t y, int32_t width, int
                          uint32_t format, uint32_t type, uint32_t mac_pixels)
 {
     GLMetalState *ms = (GLMetalState *)ctx->metal;
-    if (!ms || !ms->initialized || mac_pixels == 0) return;
+    if (!ms || !ms->initialized || mac_pixels == 0 || width <= 0 || height <= 0) return;
 
-    // Need to end current encoder to access framebuffer
-    if (ms->renderPassActive && ms->currentEncoder) {
-        [ms->currentEncoder endEncoding];
-        ms->currentEncoder = nil;
+    const bool restartRenderPass = ms->renderPassActive;
+    if (restartRenderPass) {
+        GLMetalEndAndCommitForReadback(ms);
+    } else {
+        GLMetalWaitForCommittedReadbackWork(ms);
     }
 
-    // Get the current overlay texture
+    auto restartIfNeeded = [&]() {
+        if (restartRenderPass) GLMetalRestartRenderPassForReadback(ctx);
+    };
+
+    if (format == GL_DEPTH_COMPONENT && type == GL_UNSIGNED_SHORT) {
+        id<MTLTexture> depthTex = ms->depthBuffer;
+        if (!depthTex || !GLMetalReadRectIsInTexture(depthTex, x, y, width, height)) {
+            restartIfNeeded();
+            return;
+        }
+
+        id<MTLTexture> staging =
+            GLMetalGetDepthReadbackTexture(ms, width, height);
+        if (!staging) {
+            restartIfNeeded();
+            return;
+        }
+
+        id<MTLCommandBuffer> blitCmdBuf = [ms->commandQueue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [blitCmdBuf blitCommandEncoder];
+        const uint32_t sourceY =
+            GLMetalTextureYForGLRead(y, height, (uint32_t)[depthTex height]);
+        [blit copyFromTexture:depthTex
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake((NSUInteger)x, sourceY, 0)
+                   sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+                    toTexture:staging
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [blitCmdBuf commit];
+        [blitCmdBuf waitUntilCompleted];
+
+        const size_t depthCount = (size_t)width * (size_t)height;
+        float *depthValues = (float *)malloc(depthCount * sizeof(float));
+        if (!depthValues) {
+            restartIfNeeded();
+            return;
+        }
+
+        [staging getBytes:depthValues
+              bytesPerRow:(NSUInteger)width * sizeof(float)
+               fromRegion:MTLRegionMake2D(0, 0, width, height)
+              mipmapLevel:0];
+
+        const int32_t bytesPerPixel = 2;
+        const uint32_t rowStride =
+            GLMetalPackRowStride(width, bytesPerPixel, ctx->pixel_store);
+        float sampleDepth = 0.0f;
+        uint16_t samplePacked = 0;
+        bool haveSampleDepth = false;
+        for (int32_t row = 0; row < height; row++) {
+            const int32_t srcRow = height - 1 - row;
+            for (int32_t col = 0; col < width; col++) {
+                const float depth = depthValues[srcRow * width + col];
+                const uint16_t packed =
+                    GLMetalDepthFloatToUnsignedShort(depth);
+                if (!haveSampleDepth) {
+                    sampleDepth = depth;
+                    samplePacked = packed;
+                    haveSampleDepth = true;
+                }
+                const uint32_t dstAddr =
+                    GLMetalPackPixelAddress(mac_pixels, row, col, bytesPerPixel,
+                                            rowStride, ctx->pixel_store);
+                WriteMacInt16(dstAddr, packed);
+            }
+        }
+
+        free(depthValues);
+        restartIfNeeded();
+        GL_METAL_LOG("NativeGLReadPixels: depth read %dx%d at (%d,%d) sample=%.6f packed=0x%04x -> mac addr 0x%08x",
+                     width, height, x, y, sampleDepth, samplePacked, mac_pixels);
+        return;
+    }
+
+    if (format == GL_DEPTH_COMPONENT) {
+        GL_METAL_LOG("NativeGLReadPixels: unsupported depth format/type fmt=0x%x type=0x%x",
+                     format, type);
+        restartIfNeeded();
+        return;
+    }
+
     id<MTLTexture> srcTex = nil;
     if (ms->overlayTexture) {
         srcTex = ms->overlayTexture;
     }
-    if (!srcTex) {
+    if (!srcTex || !GLMetalReadRectIsInTexture(srcTex, x, y, width, height)) {
         GL_METAL_LOG("NativeGLReadPixels: no overlay texture available");
+        restartIfNeeded();
         return;
     }
 
@@ -2780,17 +4482,22 @@ void NativeGLReadPixels(GLContext *ctx, int32_t x, int32_t y, int32_t width, int
     stagingDesc.storageMode = MTLStorageModeShared;
 
     id<MTLTexture> staging = [ms->device newTextureWithDescriptor:stagingDesc];
-    if (!staging) return;
+    if (!staging) {
+        restartIfNeeded();
+        return;
+    }
 
     // Blit from drawable to staging
     id<MTLCommandBuffer> blitCmdBuf = [ms->commandQueue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [blitCmdBuf blitCommandEncoder];
+    const uint32_t sourceY =
+        GLMetalTextureYForGLRead(y, height, (uint32_t)[srcTex height]);
 
     [blit copyFromTexture:srcTex
               sourceSlice:0
               sourceLevel:0
-             sourceOrigin:MTLOriginMake(x, y, 0)
-               sourceSize:MTLSizeMake(width, height, 1)
+             sourceOrigin:MTLOriginMake((NSUInteger)x, sourceY, 0)
+               sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
                 toTexture:staging
          destinationSlice:0
          destinationLevel:0
@@ -2802,30 +4509,34 @@ void NativeGLReadPixels(GLContext *ctx, int32_t x, int32_t y, int32_t width, int
 
     // Read pixels from staging texture and write to PPC memory
     uint8_t *stagingBytes = (uint8_t *)malloc(width * height * 4);
-    if (!stagingBytes) return;
+    if (!stagingBytes) {
+        restartIfNeeded();
+        return;
+    }
 
     MTLRegion region = MTLRegionMake2D(0, 0, width, height);
     [staging getBytes:stagingBytes bytesPerRow:width * 4 fromRegion:region mipmapLevel:0];
 
-    // Get pack alignment from context pixel store
-    int packAlign = ctx->pixel_store.pack_alignment;
-    if (packAlign < 1) packAlign = 4;
-
     // Convert from BGRA8 to requested format and write to PPC memory
+    const int32_t bytesPerPixel = 4;
+    const uint32_t rowStride =
+        GLMetalPackRowStride(width, bytesPerPixel, ctx->pixel_store);
     for (int row = 0; row < height; row++) {
         for (int col = 0; col < width; col++) {
-            uint8_t *src = stagingBytes + (row * width + col) * 4;
+            const int srcRow = height - 1 - row;
+            uint8_t *src = stagingBytes + (srcRow * width + col) * 4;
             uint8_t b = src[0], g = src[1], r = src[2], a = src[3];
+            const uint32_t dstAddr =
+                GLMetalPackPixelAddress(mac_pixels, row, col, bytesPerPixel,
+                                        rowStride, ctx->pixel_store);
 
             if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) {
-                uint32_t dstAddr = mac_pixels + (row * width + col) * 4;
                 WriteMacInt8(dstAddr + 0, r);
                 WriteMacInt8(dstAddr + 1, g);
                 WriteMacInt8(dstAddr + 2, b);
                 WriteMacInt8(dstAddr + 3, a);
             } else {
                 // Minimal fallback: write RGBA
-                uint32_t dstAddr = mac_pixels + (row * width + col) * 4;
                 WriteMacInt8(dstAddr + 0, r);
                 WriteMacInt8(dstAddr + 1, g);
                 WriteMacInt8(dstAddr + 2, b);
@@ -2836,29 +4547,7 @@ void NativeGLReadPixels(GLContext *ctx, int32_t x, int32_t y, int32_t width, int
 
     free(stagingBytes);
 
-    // Restart render encoder if we were mid-frame
-    if (ms->renderPassActive) {
-        // Re-create encoder -- GLMetalBeginFrame will handle this
-        // Actually we need to create a new pass that loads existing content
-        if (ms->overlayTexture) {
-            MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-            rpd.colorAttachments[0].texture = ms->overlayTexture;
-            rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-            if (ms->depthBuffer) {
-                rpd.depthAttachment.texture = ms->depthBuffer;
-                rpd.depthAttachment.loadAction = MTLLoadActionLoad;
-                rpd.depthAttachment.storeAction = MTLStoreActionStore;
-                rpd.stencilAttachment.texture = ms->depthBuffer;
-                rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
-                rpd.stencilAttachment.storeAction = MTLStoreActionStore;
-            }
-            if (!ms->currentCommandBuffer) {
-                ms->currentCommandBuffer = [ms->commandQueue commandBuffer];
-            }
-            ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
-        }
-    }
+    restartIfNeeded();
 
     GL_METAL_LOG("NativeGLReadPixels: read %dx%d at (%d,%d) -> mac addr 0x%08x",
                  width, height, x, y, mac_pixels);
@@ -2982,7 +4671,8 @@ static void gl_accum_restart_encoder(GLContext *ctx)
     if (!ms->currentCommandBuffer) {
         ms->currentCommandBuffer = [ms->commandQueue commandBuffer];
     }
-    ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->currentEncoder = [ms->currentCommandBuffer renderCommandEncoderWithDescriptor:rpd];
+	ms->viewportScissorCacheValid = false;
 }
 
 // Write accum buffer contents back to framebuffer (float RGBA -> BGRA8)
@@ -3112,10 +4802,10 @@ void NativeGLAccum(GLContext *ctx, uint32_t op, float value)
 
 void NativeGLBegin(GLContext *ctx, uint32_t mode)
 {
-    ctx->in_begin = true;
-    ctx->im_mode = mode;
-    ctx->im_vertices.clear();
-    GL_METAL_LOG("glBegin(0x%04x)", mode);
+	ctx->in_begin = true;
+	ctx->im_mode = mode;
+	ctx->im_vertices.clear();
+	GL_METAL_LOG("glBegin(0x%04x)", mode);
 }
 
 // Forward declaration from gl_state.cpp (selection hit recording)
@@ -3131,9 +4821,9 @@ void NativeGLEnd(GLContext *ctx)
     } else {
         GLMetalFlushImmediateMode(ctx);
     }
-    GL_METAL_LOG("glEnd: %s %zu vertices",
-                 ctx->render_mode == 0x1C02 ? "selection" : "flushed",
-                 ctx->im_vertices.size());
+	GL_METAL_LOG("glEnd: %s %zu vertices",
+	             ctx->render_mode == 0x1C02 ? "selection" : "flushed",
+	             ctx->im_vertices.size());
 }
 
 
@@ -3610,23 +5300,22 @@ static void FetchArrayVertex(GLContext *ctx, int32_t i, GLVertex &v) {
         memcpy(v.normal, ctx->current_normal, sizeof(float) * 3);
     }
 
-    // Texcoord from texcoord array or current texcoord (unit 0)
-    if (ctx->texcoord_array[0].enabled && ctx->texcoord_array[0].pointer) {
-        int es = EffectiveStride(ctx->texcoord_array[0]);
-        uint32_t base = ctx->texcoord_array[0].pointer + i * es;
-        int sz = ctx->texcoord_array[0].size;
-        uint32_t ct = ctx->texcoord_array[0].type;
-        v.texcoord[0][0] = (sz >= 1) ? ReadArrayComponent(base + 0 * TypeSize(ct), ct) : 0.0f;
-        v.texcoord[0][1] = (sz >= 2) ? ReadArrayComponent(base + 1 * TypeSize(ct), ct) : 0.0f;
-        v.texcoord[0][2] = (sz >= 3) ? ReadArrayComponent(base + 2 * TypeSize(ct), ct) : 0.0f;
-        v.texcoord[0][3] = (sz >= 4) ? ReadArrayComponent(base + 3 * TypeSize(ct), ct) : 1.0f;
-    } else {
-        memcpy(v.texcoord[0], ctx->current_texcoord[0], sizeof(float) * 4);
+    // Texcoords from active/prepared texcoord arrays or current texcoords.
+    for (int u = 0; u < 4; u++) {
+        const GLVertexArrayPointer *texcoord = GLMetalTexCoordArrayForDraw(ctx, u);
+        if (texcoord) {
+            int es = EffectiveStride(*texcoord);
+            uint32_t base = texcoord->pointer + i * es;
+            int sz = texcoord->size;
+            uint32_t ct = texcoord->type;
+            v.texcoord[u][0] = (sz >= 1) ? ReadArrayComponent(base + 0 * TypeSize(ct), ct) : 0.0f;
+            v.texcoord[u][1] = (sz >= 2) ? ReadArrayComponent(base + 1 * TypeSize(ct), ct) : 0.0f;
+            v.texcoord[u][2] = (sz >= 3) ? ReadArrayComponent(base + 2 * TypeSize(ct), ct) : 0.0f;
+            v.texcoord[u][3] = (sz >= 4) ? ReadArrayComponent(base + 3 * TypeSize(ct), ct) : 1.0f;
+        } else {
+            memcpy(v.texcoord[u], ctx->current_texcoord[u], sizeof(float) * 4);
+        }
     }
-
-    // Zero remaining texcoord units
-    for (int u = 1; u < 4; u++)
-        memcpy(v.texcoord[u], ctx->current_texcoord[u], sizeof(float) * 4);
 
     memcpy(v.secondary_color, ctx->current_secondary_color, sizeof(float) * 3);
     v.fog_coord = ctx->current_fog_coord;
@@ -3749,7 +5438,6 @@ void NativeGLInterleavedArrays(GLContext *ctx, uint32_t format, int32_t stride, 
     ctx->index_array.enabled = false;
 
     // Set up based on format enum
-    int offset = 0;
     int totalStride = 0;
 
     switch (format) {

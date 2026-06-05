@@ -1,6 +1,8 @@
 /*
  *  dsp_cgraf_port_policy.h - classic QuickDraw CGrafPort layout helpers.
  *
+ *  (C) 2026 Sierra Burkhart (sierra760)
+ *
  *  DrawSprocket back/alt-buffer shims are PixMap-shaped for direct byte
  *  access, but the front buffer is the screen display and can be consumed as
  *  a real CGrafPort by QuickDraw/RAVE setup code.

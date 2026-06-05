@@ -301,7 +301,7 @@ extern "C" void gfxaccel_resources_heap_engine_detach(uint32_t engine_id,
 		return;
 	}
 	// Detach does NOT release the heap (heap persists for re-attach).
-	// Future Wave 2 plans may add ring buffer offset reset here.
+	// Ring buffer offset reset can be added here if detach semantics change.
 }
 
 // ---------------------------------------------------------------------------

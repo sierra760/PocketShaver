@@ -35,8 +35,8 @@
  *  RAVE and GL engines submit overlay frames via SubmitFrame only when
  *  they actually render (e.g. on RAVE's QARenderEnd).  Nanosaur and
  *  similar full-3D apps destroy and recreate their QADrawContext during
- *  scene transitions, which produces a ~20-log-line gap with no
- *  SubmitFrame calls.  During that gap MetalCompositorPresent (called
+ *  scene transitions, which produces a short interval with no
+ *  SubmitFrame calls.  During that interval MetalCompositorPresent (called
  *  every emulated VBL from VideoVBL) presents the 2D framebuffer only;
  *  for a full-3D app the 2D framebuffer is black, so the user sees a
  *  visible black flash.
@@ -79,9 +79,9 @@
  *  Concurrency: s_inflight_semaphore bounds in-flight drawables to 3
  *  (matching CAMetalLayer.maximumDrawableCount). Wait on SubmitFrame
  *  entry (AFTER cheap validation gates), signal in
- *  addCompletedHandler (GPU completion, NOT CPU present - Pitfall 2).
+ *  addCompletedHandler (GPU completion, NOT CPU present).
  *  __block retain breaks the strong cycle on the block capture
- *  (Pitfall 9).  In production (cache-only path) the semaphore is NOT
+ *  to avoid a strong capture cycle.  In production (cache-only path) the semaphore is NOT
  *  consumed -- SubmitFrame does no GPU work so there is nothing to
  *  gate on.
  */
@@ -164,7 +164,7 @@ static const uint32_t kMaxLayers = 16;
 // Single kLayerSlotOverlay layer kept around between SubmitFrame calls so
 // that MetalCompositorPresent can keep composing the last-known overlay
 // while the submitting engine is between frames (QADrawContextDelete ->
-// QADrawContextNew gap, etc.).  The lock is os_unfair_lock (same primitive
+// QADrawContextNew interval, etc.).  The lock is os_unfair_lock (same primitive
 // family as the project's minimal-primitive concurrency pattern; writes
 // happen on the emul thread from SubmitFrame and the clear helpers, reads
 // happen on the VBL / emul thread from Present).
@@ -778,7 +778,7 @@ extern "C" int32_t MetalCompositorSubmitFrame(const struct FrameDescriptor *desc
 
         [enc endEncoding];
 
-        // Signal on GPU completion (Pitfall 2).  __block retain (Pitfall 9).
+        // Signal on GPU completion. __block retain avoids a strong capture cycle.
         __block dispatch_semaphore_t block_sem = s_inflight_semaphore;
         [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull __unused cb) {
             dispatch_semaphore_signal(block_sem);
@@ -846,7 +846,7 @@ extern "C" void DSpTesting_CaptureCompositorOutput(uint8_t **out_bytes,
         /* Shared storage required for getBytes. Test environments use
          * Shared-storage framebuffer textures (CompositorTesting_MakeSolidTexture
          * + DSpTestEnvironment); production CAMetalLayer drawables are
-         * not reachable via this helper but Wave D tests do not run
+         * not reachable via this helper but unit tests do not run
          * against the live drawable. */
         if (tex.storageMode != MTLStorageModeShared) return;
 

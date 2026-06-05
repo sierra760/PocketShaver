@@ -8,11 +8,11 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
  *
- *  Master compile-time switch for RAVE, GL, and NQD diagnostic logging.
- *  When ACCEL_LOGGING_ENABLED is 1 (default): all subsystem logging macros
+ *  Master compile-time switch for NQD, RAVE, GL, and DSp diagnostic logging.
+ *  When ACCEL_LOGGING_ENABLED is 1: all subsystem logging macros
  *  (RAVE_LOG, GL_LOG, GL_METAL_LOG, NQD_LOG) compile in and are controlled
  *  by their respective runtime bools.
- *  When ACCEL_LOGGING_ENABLED is 0: all diagnostic logging compiles to
+ *  When ACCEL_LOGGING_ENABLED is 0 (default): all diagnostic logging compiles to
  *  zero-cost no-ops, runtime bools become compile-time false for dead-code
  *  elimination, and Apple-specific os_log imports/objects are excluded.
  *  NQD_ERR (always-on error logging) is NOT gated by this flag.
@@ -22,7 +22,7 @@
 #define ACCEL_LOGGING_H
 
 #ifndef ACCEL_LOGGING_ENABLED
-#define ACCEL_LOGGING_ENABLED 1
+#define ACCEL_LOGGING_ENABLED 0
 #endif
 
 #endif /* ACCEL_LOGGING_H */

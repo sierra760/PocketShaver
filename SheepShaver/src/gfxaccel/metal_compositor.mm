@@ -47,6 +47,7 @@
 #include "display_mode_controller.h"
 #include "gfxaccel_resources.h"
 #include "gfxaccel_resources_heap.h"
+#include "metal_compositor_drawable_policy.h"
 #include "vbl_source.h"
 #include "prefs.h"
 #include "MiscellaneousSettingsObjCCppHeader.h"
@@ -159,6 +160,7 @@ static uint32_t                     s_latched_fade_active = 0;
 // Depth-aware state (added in S02)
 static int                          compositor_depth    = 0;
 static int                          compositor_pixel_width   = 0;
+static int                          compositor_pixel_height  = 0;
 static int                          compositor_bits_per_pixel = 0;
 static bool                         compositor_use_fallback_texture = false;
 static int                          compositor_row_bytes = 0;
@@ -166,6 +168,11 @@ static int                          compositor_pitch     = 0;
 
 // Shader library cache (retained across Init/Resize cycles for reuse).
 static id<MTLLibrary>               compositor_library  = nil;
+
+static NSUInteger                   s_last_overlay_scale_target_w = 0;
+static NSUInteger                   s_last_overlay_scale_target_h = 0;
+static int                          s_last_overlay_scale_fb_w = 0;
+static int                          s_last_overlay_scale_fb_h = 0;
 
 // ---------------------------------------------------------------------------
 // Frame-pacing state — local cadence cache refreshed from DMC snapshots.
@@ -199,6 +206,63 @@ extern "C" int  MetalCompositorSubmitFrame_BindPresentationContext(
     void *device, void *queue, void *cametal_layer);
 extern "C" void MetalCompositorSubmitFrame_UnbindPresentationContext(void);
 extern "C" void MetalCompositorSubmitFrame_SetFramebufferTexture(void *texture);
+
+static MetalCompositorDrawableSize MetalCompositorCurrentDrawableSize(int framebuffer_width,
+                                                                      int framebuffer_height)
+{
+    UIWindow *uiWindow = GetSDLUIWindow();
+    int view_width = 0;
+    int view_height = 0;
+    if (uiWindow) {
+        view_width = (int)(uiWindow.bounds.size.width + 0.5);
+        view_height = (int)(uiWindow.bounds.size.height + 0.5);
+    }
+    return MetalCompositorTargetDrawableSize(framebuffer_width,
+                                             framebuffer_height,
+                                             view_width,
+                                             view_height);
+}
+
+static void MetalCompositorScaleLayerToDrawable(struct CompositeLayer *layer,
+                                                NSUInteger drawable_width,
+                                                NSUInteger drawable_height)
+{
+    if (!layer || drawable_width == 0 || drawable_height == 0) return;
+
+    int fb_width = compositor_pixel_width;
+    int fb_height = compositor_texture ? (int)[compositor_texture height] : 0;
+    if (fb_height <= 0 && compositor_layer) {
+        fb_height = (int)compositor_layer.drawableSize.height;
+    }
+    if (fb_width <= 0 || fb_height <= 0) return;
+
+    if ((NSUInteger)fb_width == drawable_width &&
+        (NSUInteger)fb_height == drawable_height) {
+        return;
+    }
+
+    const float sx = (float)drawable_width / (float)fb_width;
+    const float sy = (float)drawable_height / (float)fb_height;
+    layer->dst_origin_x *= sx;
+    layer->dst_origin_y *= sy;
+    layer->dst_size_w *= sx;
+    layer->dst_size_h *= sy;
+
+    if (s_last_overlay_scale_target_w != drawable_width ||
+        s_last_overlay_scale_target_h != drawable_height ||
+        s_last_overlay_scale_fb_w != fb_width ||
+        s_last_overlay_scale_fb_h != fb_height) {
+        s_last_overlay_scale_target_w = drawable_width;
+        s_last_overlay_scale_target_h = drawable_height;
+        s_last_overlay_scale_fb_w = fb_width;
+        s_last_overlay_scale_fb_h = fb_height;
+        COMPOSITOR_LOG("MetalCompositorPresent: scaled cached overlay from framebuffer %dx%d to drawable %lux%lu (scale %.3fx%.3f)",
+                       fb_width, fb_height,
+                       (unsigned long)drawable_width,
+                       (unsigned long)drawable_height,
+                       sx, sy);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DMC subscriber callbacks
@@ -250,11 +314,11 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
     }
 
     /* CF-22.3-06 + CF-22.3-07: when DSp owns the framebuffer, resize the
-     * compositor texture to match the Mac mode so CALayer's
-     * kCAGravityResizeAspect upscales the smaller drawable to fill the
-     * window. Without this, the framebuffer texture stays at the init-time
-     * window dimensions while DSp only writes a top-left region = the "small
-     * corner" UX symptom.
+     * compositor texture to match the Mac mode. Presentation still renders into
+     * the host window-sized drawable; the compositor shader scales the Mac-mode
+     * framebuffer texture across that drawable. Without this, the framebuffer
+     * texture stays at the init-time window dimensions while DSp only writes a
+     * top-left region = the "small corner" UX symptom.
      *
      * The compositor texture is forced to BGRA8Unorm (VIDEO_DEPTH_32BIT)
      * because DSp decodes its source-format back buffer (e.g. R16Uint
@@ -278,7 +342,7 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
         int new_w = (int)incoming->width;
         int new_h = (int)incoming->height;
         int cur_w = compositor_pixel_width;
-        int cur_h = (int)compositor_layer.drawableSize.height;
+        int cur_h = compositor_pixel_height;
         if (new_w != cur_w || new_h != cur_h || compositor_depth != VIDEO_DEPTH_32BIT) {
             uint32_t bgra_row_bytes = (uint32_t)new_w * 4;
             uint32_t bgra_size      = bgra_row_bytes * (uint32_t)new_h;
@@ -307,7 +371,7 @@ static int32_t MetalCompositor_OnModeEnter(const struct DMCModeSnapshot *incomin
         int new_row_bytes = (int)incoming->row_bytes;
         int new_pitch = (int)incoming->pitch;
         int cur_w = compositor_pixel_width;
-        int cur_h = (int)compositor_layer.drawableSize.height;
+        int cur_h = compositor_pixel_height;
         if (new_w != cur_w ||
             new_h != cur_h ||
             compositor_depth != new_depth ||
@@ -457,6 +521,7 @@ int MetalCompositorInit(int width, int height, int depth, int row_bytes,
     // --- Store depth state ---
     compositor_depth = depth;
     compositor_pixel_width = width;
+    compositor_pixel_height = height;
     compositor_bits_per_pixel = bits_per_pixel_for_depth(depth);
     compositor_row_bytes = row_bytes;
     compositor_pitch = pitch;
@@ -498,7 +563,9 @@ int MetalCompositorInit(int width, int height, int depth, int row_bytes,
     compositor_layer.device = compositor_device;
     compositor_layer.maximumDrawableCount = 3;         // triple buffering
     compositor_layer.framebufferOnly = YES;
-    compositor_layer.drawableSize = CGSizeMake(width, height);  // Mac framebuffer dims
+    MetalCompositorDrawableSize target_size =
+        MetalCompositorCurrentDrawableSize(width, height);
+    compositor_layer.drawableSize = CGSizeMake(target_size.width, target_size.height);
     compositor_layer.contentsGravity = kCAGravityResizeAspect;  // preserve aspect ratio (letterbox)
 
     // --- CAMetalLayer scaling filter from user preference ---
@@ -520,8 +587,10 @@ int MetalCompositorInit(int width, int height, int depth, int row_bytes,
 
     [uiWindow addSubview:compositor_view];
 
-    COMPOSITOR_LOG("View created: layer=%p view=%p drawableSize=%dx%d windowBounds=%.0fx%.0f",
-                   compositor_layer, compositor_view, width, height,
+    COMPOSITOR_LOG("View created: layer=%p view=%p framebuffer=%dx%d drawableSize=%dx%d windowBounds=%.0fx%.0f",
+                   compositor_layer, compositor_view,
+                   width, height,
+                   target_size.width, target_size.height,
                    uiWindow.bounds.size.width, uiWindow.bounds.size.height);
 
     // --- Zero-copy shared buffer wrapping the_buffer ---
@@ -957,7 +1026,7 @@ void MetalCompositorPresent(void)
     // now sitting in gamma_lut_buffer. We do NOT re-fetch dmc_current_snapshot()
     // here — a fresh present-time read could observe a newer fade_active than
     // the LUT bytes the VBL callback latched, pairing a mid-fade LUT with an
-    // end-of-fade flag on the final fade frame (Pitfall-3 torn read → one
+    // end-of-fade flag on the final fade frame (torn read: one
     // warped frame). The (LUT, fade_active) pair the shader sees must come from
     // one coherent snapshot/gen.
     uint32_t fade_active = s_latched_fade_active;
@@ -977,19 +1046,19 @@ void MetalCompositorPresent(void)
         uint32_t bpp = (uint32_t)compositor_bits_per_pixel;
         [enc setFragmentBytes:&bpp length:sizeof(bpp) atIndex:1];
 
-        // Bind gamma LUT buffer at index 2 (Pitfall 4) — always bound.
+        // Bind gamma LUT buffer at index 2 - always bound.
         [enc setFragmentBuffer:gamma_to_bind offset:0 atIndex:2];
 
-        // pixel_width shifts to index 3 (Pitfall 4: gamma_lut takes index 2)
+        // pixel_width shifts to index 3 (gamma_lut takes index 2)
         uint32_t pw  = (uint32_t)compositor_pixel_width;
         [enc setFragmentBytes:&pw  length:sizeof(pw)  atIndex:3];
 
-        // fade_active lands at the next free buffer index 4 (Pitfall 2).
+        // fade_active lands at the next free buffer index 4.
         [enc setFragmentBytes:&fade_active length:sizeof(fade_active) atIndex:4];
     } else if (compositor_depth == VIDEO_DEPTH_16BIT) {
         // 16bpp now samples the gamma LUT. The 16bpp shader's buffer
         // namespace is empty (it previously bound nothing), so gamma_lut=0,
-        // fade_active=1 (Pitfall 2 — separate per-branch index namespaces).
+        // fade_active=1 (separate per-branch index namespaces).
         // Always bound.
         [enc setFragmentBuffer:gamma_to_bind offset:0 atIndex:0];
         [enc setFragmentBytes:&fade_active length:sizeof(fade_active) atIndex:1];
@@ -1012,10 +1081,10 @@ void MetalCompositorPresent(void)
     // MTLTexture).  During active 3D submission SubmitFrame also calls
     // presentDrawable with its own overlay-only pass and the two present
     // calls race for the CAMetalLayer drawable pool -- in steady state the
-    // user sees whichever landed last.  During engine-paused gaps (the
+    // user sees whichever landed last.  During engine-paused intervals (the
     // QADrawContextDelete -> QADrawContextNew window, ~20 log lines of
     // host gestalt probing) SubmitFrame stops firing and only this present
-    // path runs; before this fix, the gap produced a visible black flash
+    // path runs; before this fix, the interval produced a visible black flash
     // because the 2D framebuffer is blank/black for full-3D apps.  The
     // cache + this composite step keeps the last overlay visible until a
     // fresh SubmitFrame arrives or the cache is invalidated on mode-exit.
@@ -1029,6 +1098,9 @@ void MetalCompositorPresent(void)
         void *cached_tex_retained = NULL;
         if (MetalCompositorSubmitFrame_AcquireCachedOverlay(&cached,
                                                             &cached_tex_retained)) {
+            MetalCompositorScaleLayerToDrawable(&cached,
+                                                (NSUInteger)drawable.texture.width,
+                                                (NSUInteger)drawable.texture.height);
             MetalCompositorSubmitFrame_EncodeCachedOverlay(
                 (__bridge void *)enc, &cached);
             MetalCompositorSubmitFrame_ReleaseCachedOverlay(cached_tex_retained);
@@ -1064,7 +1136,7 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
 
     // Capture old dimensions/depth for diagnostic log
     int old_width = compositor_pixel_width;
-    int old_height = (int)compositor_layer.drawableSize.height;
+    int old_height = compositor_pixel_height;
     int old_depth = compositor_depth;
 
     // --- Release old depth-dependent resources ---
@@ -1081,6 +1153,7 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
     // --- Update depth state ---
     compositor_depth = depth;
     compositor_pixel_width = width;
+    compositor_pixel_height = height;
     compositor_bits_per_pixel = bits_per_pixel_for_depth(depth);
     compositor_row_bytes = row_bytes;
     compositor_pitch = pitch;
@@ -1092,7 +1165,9 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
     }
 
     // --- Update layer drawable size ---
-    compositor_layer.drawableSize = CGSizeMake(width, height);
+    MetalCompositorDrawableSize target_size =
+        MetalCompositorCurrentDrawableSize(width, height);
+    compositor_layer.drawableSize = CGSizeMake(target_size.width, target_size.height);
     compositor_layer.contentsGravity = kCAGravityResizeAspect;  // preserve aspect ratio (letterbox)
 
     // --- Update CAMetalLayer scaling filter from user preference ---
@@ -1292,10 +1367,12 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
         compositor_sampler = nil;
     }
 
-    COMPOSITOR_LOG("MetalCompositorResize: %dx%d depth=%d → %dx%d depth=%d (%dbpp) "
+    COMPOSITOR_LOG("MetalCompositorResize: %dx%d depth=%d → framebuffer=%dx%d drawable=%dx%d depth=%d (%dbpp) "
                    "format=%s shader=%s filter=%s%s",
                    old_width, old_height, old_depth,
-                   width, height, depth, compositor_bits_per_pixel,
+                   width, height,
+                   target_size.width, target_size.height,
+                   depth, compositor_bits_per_pixel,
                    texture_format_name(texFormat),
                    [fragmentName UTF8String],
                    useNearest ? "nearest" : "linear",
@@ -1400,6 +1477,7 @@ void MetalCompositorShutdown(void)
 
     compositor_depth    = 0;
     compositor_pixel_width   = 0;
+    compositor_pixel_height  = 0;
     compositor_bits_per_pixel = 0;
     compositor_row_bytes = 0;
     compositor_pitch = 0;
@@ -1671,7 +1749,7 @@ void MetalCompositorTesting_ShutdownHeadless(void)
 
 int32_t MetalCompositorSubmitFrame(const struct FrameDescriptor *desc)
 {
-    // 1. Cheap validation first - no semaphore consumed (Pitfall 1).
+    // 1. Cheap validation first - no semaphore consumed.
     if (desc == NULL) {
         return kGfxAccelErrInvalidDescriptor;
     }
@@ -1785,8 +1863,8 @@ int32_t MetalCompositorSubmitFrame(const struct FrameDescriptor *desc)
 
         [enc endEncoding];
 
-        // 8. Signal on GPU completion (NOT CPU present per Pitfall 2).
-        //    __block capture to avoid strong-cycle retain per Pitfall 9.
+        // 8. Signal on GPU completion (NOT CPU present).
+        //    __block capture avoids a strong-cycle retain.
         __block dispatch_semaphore_t block_sem = s_inflight_semaphore;
         [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull __unused cb) {
             dispatch_semaphore_signal(block_sem);

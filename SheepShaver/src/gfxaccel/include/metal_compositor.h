@@ -291,9 +291,9 @@ void MetalCompositorSubmitFrame_SetTargetTimestamp(double target_ts);
  * SubmitFrame caches the most recent kLayerSlotOverlay CompositeLayer
  * (and retains its source MTLTexture) so that MetalCompositorPresent can
  * keep composing the last-known overlay between SubmitFrame calls --
- * e.g. during Nanosaur's QADrawContextDelete -> QADrawContextNew gap
+ * e.g. during Nanosaur's QADrawContextDelete -> QADrawContextNew interval
  * where RAVE emits no RenderEnd for ~20 log lines.  Without the cache
- * those gap frames present 2D-framebuffer-only (black for full-3D apps)
+ * those interval frames present 2D-framebuffer-only (black for full-3D apps)
  * producing a visible flicker to black.
  *
  * MetalCompositorSubmitFrame_AcquireCachedOverlay copies the cached

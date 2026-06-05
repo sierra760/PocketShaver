@@ -136,7 +136,7 @@ uint32_t DSpDispatch(uint32_t r3, uint32_t r4, uint32_t r5,
 		case kDSpShutdown:
 			return (uint32_t)DSpShutdownHandler();
 		case kDSpGetVersion:
-			return DSpGetVersionHandler();
+			return DSpGetVersionHandler(r3);
 
 		/* Context lifecycle — Reserve + Release.
 		 * dsp-sims-post-reserve-black-screen (2026-04-19): Reserve signature

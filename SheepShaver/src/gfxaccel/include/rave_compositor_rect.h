@@ -27,9 +27,11 @@ struct RaveCompositorRect {
 
 /*
  * Some DrawSprocket-era RAVE games create a fullscreen draw context whose
- * RAVE coordinates are centered around the origin, e.g.
- * (-683,-512)-(683,512) for a 1366x1024 display. That rect describes the
- * 3D coordinate system, not the guest-screen compositor destination.
+ * RAVE coordinates are offset from the current framebuffer, e.g.
+ * (-683,-512)-(683,512) for a 1366x1024 display or (192,144)-(832,624)
+ * after switching a centered 1024x768 context down to 640x480. That rect
+ * describes the 3D coordinate system, not the guest-screen compositor
+ * destination.
  */
 static inline struct RaveCompositorRect RaveCompositorRectFromDrawRect(
     int32_t left,
@@ -46,9 +48,7 @@ static inline struct RaveCompositorRect RaveCompositorRectFromDrawRect(
 	}
 
 	if ((uint32_t)width == mode_width &&
-	    (uint32_t)height == mode_height &&
-	    left == -(int32_t)(mode_width / 2) &&
-	    top == -(int32_t)(mode_height / 2)) {
+	    (uint32_t)height == mode_height) {
 		out.left = 0;
 		out.top = 0;
 	}

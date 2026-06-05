@@ -14,8 +14,7 @@
  *      pure-function transform shape: switch on viAppleMode, field-copy,
  *      no Metal dependencies)
  *    - SheepShaver/src/gfxaccel/dsp_draw_context.mm (Reserve_Core
- *      validate-populate pattern; DSpAllocFirstContextHandle reuse for
- *      metadata-only GetFirstContext handle allocation)
+ *      validate-populate pattern; metadata-only DSp context allocation)
  *
  *  Threading contract:
  *    The s_dsp_modes cache is single-writer emul-thread. Built once at
@@ -26,7 +25,7 @@
 #include "sysdeps.h"
 #include "dsp_mode_enumerate.h"
 #include "dsp_engine.h"
-#include "dsp_draw_context.h"   /* DSpAllocFirstContextHandle */
+#include "dsp_draw_context.h"   /* Metadata-only DSp context allocation */
 #include "cpu_emulation.h"       /* WriteMacInt32 */
 #include "video.h"               /* VideoInfo, VModes[], APPLE_*_BIT, DIS_INVALID */
 
@@ -80,13 +79,30 @@ std::vector<DSpContextAttributes> s_dsp_modes;
  * (video.cpp:67); 128 gives slack for future growth. */
 const int kMaxVModesScan = 128;
 
+bool DSpPublicModeAttributesEqual(const DSpContextAttributes &a,
+                                  const DSpContextAttributes &b)
+{
+	return a.frequency == b.frequency &&
+	       a.displayWidth == b.displayWidth &&
+	       a.displayHeight == b.displayHeight &&
+	       a.colorNeeds == b.colorNeeds &&
+	       a.colorTable == b.colorTable &&
+	       a.contextOptions == b.contextOptions &&
+	       a.backBufferDepthMask == b.backBufferDepthMask &&
+	       a.displayDepthMask == b.displayDepthMask &&
+	       a.backBufferBestDepth == b.backBufferBestDepth &&
+	       a.displayBestDepth == b.displayBestDepth &&
+	       a.pageCount == b.pageCount &&
+	       a.gameMustConfirmSwitch == b.gameMustConfirmSwitch;
+}
+
 }  // anonymous namespace
 
 /*
  *  DSpBuildModesFromVModes - rebuild s_dsp_modes from VModes[].
  *
  *  Walks VModes until DIS_INVALID terminator or scan cap, filtering out:
- *    - Unknown / 1 / 2 / 4 bpp modes.
+ *    - Unknown bpp modes.
  *    - Modes with zero width or height (defensive).
  *
  *  Populates a DSpContextAttributes per mode:
@@ -98,7 +114,10 @@ const int kMaxVModesScan = 128;
  *    contextOptions=kDSpContextOption_PageFlip,
  *    rest zero-init.
  *
- *  After population: stable_sort by (depth asc, width asc, height asc).
+ *  After population: stable_sort by (depth asc, width asc, height asc),
+ *  then coalesce adjacent public-equivalent modes. This keeps separate
+ *  VModes records such as window/fullscreen 640x480 from surfacing as
+ *  duplicate DSp contexts when their API-visible attributes are identical.
  */
 void DSpBuildModesFromVModes(void)
 {
@@ -160,9 +179,16 @@ void DSpBuildModesFromVModes(void)
 			return a.displayHeight < b.displayHeight;
 		});
 
+	const size_t before_coalesce = s_dsp_modes.size();
+	s_dsp_modes.erase(
+	    std::unique(s_dsp_modes.begin(), s_dsp_modes.end(),
+	                DSpPublicModeAttributesEqual),
+	    s_dsp_modes.end());
+
 	DSP_LOG("BuildModesFromVModes: %zu modes cached (scanned=%d, "
-	        "filtered_depth=%d, filtered_zero=%d)",
-	        s_dsp_modes.size(), scanned, filtered_depth, filtered_zero);
+	        "filtered_depth=%d, filtered_zero=%d, coalesced=%zu)",
+	        s_dsp_modes.size(), scanned, filtered_depth, filtered_zero,
+	        before_coalesce - s_dsp_modes.size());
 }
 
 void DSpClearModes(void)
@@ -190,7 +216,7 @@ const DSpContextAttributes *DSpModeAt(size_t i)
  *  Semantics:
  *    - s_dsp_modes empty => return kDSpContextNotFoundErr.
  *    - Allocate a metadata-only context handle via
- *      DSpAllocFirstContextHandle; copy s_dsp_modes[0] into its attr.
+	 *      DSpAllocMetadataContextHandle; copy s_dsp_modes[0] into its attr.
  *    - On allocation failure (table full) return kDSpInternalErr.
  *    - On success write the 1-based handle to *outHandle and return
  *      kDSpNoErr.
@@ -213,7 +239,8 @@ static int32_t DSpGetFirstContext_Core(uint32_t *outHandle)
 	 * (the lowest-sorted 1bpp entry) and bailed when it didn't match
 	 * their depth requirement. */
 	const DSpContextAttributes *head = &s_dsp_modes[0];
-	uint32_t handle = DSpAllocFirstContextHandle(head, /*enumeration_mode_index=*/0);
+	uint32_t handle = DSpAllocMetadataContextHandle(
+	    head, /*enumeration_mode_index=*/0);
 	if (handle == 0) {
 		DSP_LOG("GetFirstContext: table full — kDSpInternalErr");
 		return kDSpInternalErr;
@@ -297,34 +324,29 @@ extern "C" int32_t DSpTesting_GetFirstContextByStructWithDisplayID(
 /* =========================================================================
  *  DSpGetNextContext (sub-opcode 203).
  *
- *  Stub terminator per DSp 1.7 PDF p.17 iteration contract. iOS is single-
- *  display; no "next" context exists.
- *  Kicks in after DSpGetFirstContext has already vended handle #1; the
- *  guest's `while (theContext)` loop exits cleanly when we write 0 to
- *  outContextRefAddr + return kDSpContextNotFoundErr.
+ *  Advances a GetFirst/GetNext enumeration cursor through s_dsp_modes. The
+ *  same public handle is advanced in place so apps can walk more modes than
+ *  the small DSp context table can hold.
  *
  *  Validation chain (mirrors DSpGetFirstContextHandler):
  *    - outContextRefAddr == 0: return kDSpInvalidAttributesErr.
  *    - prevCtxRef != 0 && DSpGetContext(prevCtxRef) == nullptr:
  *      return kDSpInvalidContextErr.
- *    - Otherwise: WriteMacInt32(outContextRefAddr, 0) + return
+ *    - Last context writes 0 to outContextRefAddr and returns
  *      kDSpContextNotFoundErr.
- *
- *  Per the no-silent-stubs policy: kDSpContextNotFoundErr IS the behavior-
- *  exact terminator for a single-display system; this is a protocol stub,
- *  not a silent stub.
  * =========================================================================
  */
 /*
  *  Debug session `dsp-sims-enumeration-stall` fix (2026-04-19): shared core
  *  logic for DSpGetNextContextHandler + DSpTesting_GetNextContext. Walks
  *  s_dsp_modes forward from the prev context's enumeration_mode_index,
- *  allocating a fresh metadata-only handle for the successor mode.
+ *  mutating that metadata-only cursor in place.
  *
  *  Semantics per DSp 1.7 PDF p.17:
  *    - prevCtxRef resolves to a context with enumeration_mode_index = N:
- *        if N + 1 < s_dsp_modes.size(): vend handle for s_dsp_modes[N+1]
- *            with enumeration_mode_index = N + 1; return kDSpNoErr.
+ *        if N + 1 < s_dsp_modes.size(): update the same handle to
+ *            s_dsp_modes[N+1] with enumeration_mode_index = N + 1; return
+ *            kDSpNoErr.
  *        else (N is last mode): *outHandle = 0;
  *                                return kDSpContextNotFoundErr (terminator).
  *    - prevCtxRef resolves to a context with
@@ -390,8 +412,14 @@ static int32_t DSpGetNextContext_Core(uint32_t prevCtxRef, uint32_t *outHandle)
 	size_t next_idx = (size_t)prev_idx + 1;
 	if (next_idx >= s_dsp_modes.size()) {
 		*outHandle = 0;
+		int32_t release_rc = DSpReleaseMetadataContextHandle(prevCtxRef);
+		if (release_rc != kDSpNoErr) {
+			DSP_LOG("GetNextContext: terminal release of ctxRef=%u "
+			        "returned %d",
+			        prevCtxRef, (int)release_rc);
+		}
 		DSP_LOG("GetNextContext: prevCtxRef=%u at last mode (idx=%u of %zu) "
-		        "— kDSpContextNotFoundErr",
+		        "— released cursor; kDSpContextNotFoundErr",
 		        prevCtxRef, (unsigned)prev_idx, s_dsp_modes.size());
 		return kDSpContextNotFoundErr;
 	}
@@ -659,7 +687,7 @@ const DSpContextAttributes *DSpFindBestContext_Core(
 /*
  *  DSpFindBestContext_AllocAndWriteBack — shared alloc+populate helper.
  *
- *  Allocates a metadata-only DSp context via DSpAllocFirstContextHandle
+ *  Allocates a metadata-only DSp context via DSpAllocMetadataContextHandle
  *  and writes the 1-based handle to *outHandle.
  *  The underlying DSpAllocFirstContextHandle copies *best into ctx->attr
  *  and sets ctx->state = kDSpContextState_Inactive.
@@ -675,10 +703,10 @@ bool DSpFindBestContext_AllocAndWriteBack(const DSpContextAttributes *best,
 	 * enumeration. Pass DSP_ENUMERATION_INDEX_NONE so GetNextContext
 	 * treats the handle as a terminator (PDF p.17 "last context in the
 	 * list"). */
-	uint32_t handle = DSpAllocFirstContextHandle(best,
-	                                              DSP_ENUMERATION_INDEX_NONE);
+	uint32_t handle = DSpAllocMetadataContextHandle(
+	    best, DSP_ENUMERATION_INDEX_NONE);
 	if (handle == 0) {
-		DSP_LOG("FindBest: AllocFirstContextHandle failed — "
+		DSP_LOG("FindBest: AllocMetadataContextHandle failed — "
 		        "table full (kDSpInternalErr upstream)");
 		return false;
 	}

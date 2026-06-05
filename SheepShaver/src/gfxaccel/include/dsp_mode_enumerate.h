@@ -60,7 +60,7 @@ extern const DSpContextAttributes *DSpModeAt(size_t i);
  *    - outContextRefAddr == 0: return kDSpInvalidAttributesErr.
  *    - s_dsp_modes empty: return kDSpContextNotFoundErr.
  *    - Otherwise: allocate a DSpContextPrivate via the
- *      DSpAllocContextHandle helper, copy s_dsp_modes[0] into its
+ *      DSpAllocFirstContextHandle helper, copy s_dsp_modes[0] into its
  *      ctx->attr, write the 1-based handle to outContextRefAddr via
  *      WriteMacInt32, return kDSpNoErr.
  */
@@ -70,16 +70,13 @@ extern int32_t DSpGetFirstContextHandler(uint32_t displayID,
 /*
  *  DSpGetNextContext dispatch handler (sub-opcode 203).
  *
- *  iOS single-display stub terminator per DSp 1.7 PDF p.17 iteration
- *  contract. Returns kDSpContextNotFoundErr + writes 0 to
- *  outContextRefAddr on the success-path (canonical "end of list"
- *  signal). Validates outContextRefAddr != 0 (kDSpInvalidAttributesErr)
- *  and prevCtxRef-in-handle-table when non-zero (kDSpInvalidContextErr).
- *
- *  Protocol stub (NOT a silent stub): the error code IS the
- *  behavior-exact answer for a single-display system. Apps iterating
- *  modes terminate cleanly at the first context instead of looping into
- *  ROM garbage state.
+ *  Advances a GetFirst/GetNext enumeration cursor through the DSp mode
+ *  cache. The handle is reused in place so long enumerations do not exhaust
+ *  the small DSp context table. When the cursor reaches the end, writes 0
+ *  to outContextRefAddr and returns kDSpContextNotFoundErr, matching the
+ *  canonical "end of list" signal. Validates outContextRefAddr != 0
+ *  (kDSpInvalidAttributesErr) and prevCtxRef-in-handle-table when non-zero
+ *  (kDSpInvalidContextErr).
  */
 extern int32_t DSpGetNextContextHandler(uint32_t prevCtxRef,
                                          uint32_t outContextRefAddr);
@@ -91,10 +88,10 @@ extern int32_t DSpGetNextContextHandler(uint32_t prevCtxRef,
  *    - attrAddr == 0: return kDSpInvalidAttributesErr.
  *    - outContextRefAddr == 0: return kDSpInvalidAttributesErr.
  *    - Reads the requested DSpContextAttributes from guest RAM using the
- *      PDF-p.65 offsets (frequency@0, colorNeeds@12, contextOptions@20,
- *      backBufferBestDepth@24, displayBestDepth@28, backBufferDepthMask@32,
- *      displayDepthMask@36, displayHeight@44 (UInt16), displayWidth@46
- *      (UInt16), pageCount@48 (UInt8)).
+ *      PDF-p.65 offsets (frequency@0, displayWidth@4, displayHeight@8,
+ *      colorNeeds@20, colorTable@24, contextOptions@28,
+ *      backBufferDepthMask@32, displayDepthMask@36,
+ *      backBufferBestDepth@40, displayBestDepth@44, pageCount@48).
  *    - Invokes DSpFindBestContext_Core (Tier 0 = depth-mask overlap, Tier 1
  *      = bit-depth preference, Tier 2 = resolution match, Tier 3 = refresh
  *      no-op under the frequency=0 policy).

@@ -1,5 +1,7 @@
 /*
  *  dsp_front_staging_color_policy.h - color-transform policy for DSp presents.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_FRONT_STAGING_COLOR_POLICY_H
@@ -11,6 +13,18 @@
 static inline bool DSpBackBufferPresentUsesDisplayGamma(void)
 {
 	return true;
+}
+
+static inline bool DSpBackBufferWritesCompositor32Layout(void)
+{
+	return true;
+}
+
+static inline bool DSpBackBufferUnpackUsesDisplayGamma(
+	bool write_compositor32_layout)
+{
+	return !write_compositor32_layout &&
+	       DSpBackBufferPresentUsesDisplayGamma();
 }
 
 static inline bool DSpFrontStagingUsesDisplayGamma(void)

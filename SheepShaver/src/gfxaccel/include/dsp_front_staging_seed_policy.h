@@ -1,5 +1,7 @@
 /*
  *  dsp_front_staging_seed_policy.h - mixed-depth front-buffer seed helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_FRONT_STAGING_SEED_POLICY_H

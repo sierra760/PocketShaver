@@ -1,5 +1,7 @@
 /*
  *  dsp_display_id_policy.h - DrawSprocket DisplayID helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_DISPLAY_ID_POLICY_H

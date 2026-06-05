@@ -112,11 +112,18 @@ struct DSpContextPrivate {
 	bool                  dirty_empty;
 	bool                  dirty_cold_start;
 
+	/* Once a client uses DSpContext_SwapBuffers, that context is
+	 * swap-driven. VBL auto-publish is only a compatibility fallback for
+	 * clients that never swap; keeping it enabled after explicit swaps can
+	 * surface partially drawn QuickDraw menu frames between app-owned
+	 * presents. */
+	bool                  explicit_swap_observed;
+
 	/* Staging-region fallback. When Host2MacAddr cannot map the
 	 * MTLBuffer contents pointer back to a usable guest-RAM address (e.g.,
 	 * the bump allocator lives outside the vm_alloc region on arm64 iOS),
-	 * DSpGetBackBufferCGrafPtr reserves a guest-RAM region via
-	 * Mac_sysalloc(buffer_size) and stores the Mac address here. At
+	 * DSpGetBackBufferCGrafPtr reserves a guest-writable pixel-staging
+	 * region and stores the Mac address here. At
 	 * SwapBuffers time the handler memcpys staging → back_buffer.contents
 	 * before the GPU blit. Zero means Host2MacAddr produced a guest-RAM
 	 * address and no staging indirection is needed.
@@ -125,11 +132,16 @@ struct DSpContextPrivate {
 	 * strictly better than a raw (uint32)(uintptr_t) cast of the contents
 	 * pointer — the latter is undefined behaviour on arm64 iOS (64-bit
 	 * host VA truncated to 32-bit Mac address). Graceful degradation: if
-	 * Mac_sysalloc cannot vend enough, GetBackBufferHandler returns
+	 * a guest-writable staging allocation cannot be vended,
+	 * GetBackBufferHandler returns
 	 * kDSpInternalErr; no OOB write is ever attempted. */
 	uint32_t              staging_mac_addr;
-	/* True only for staging_mac_addr allocations that must be returned with
-	 * Mac_sysfree. Test scratch and direct Host2MacAddr paths leave this false. */
+	uint32_t              staging_size;
+	/* True only for staging_mac_addr allocations that came from the Mac
+	 * system heap. Exposed pixel buffers are quarantined on release instead
+	 * of Mac_sysfree'd, because CFM/code allocations may otherwise reuse
+	 * old frame bytes as executable memory during launch transitions. Test
+	 * scratch and direct Host2MacAddr paths leave this false. */
 	bool                  staging_owned_sysheap;
 
 	/* MainDevice PixMap restoration state.
@@ -145,6 +157,12 @@ struct DSpContextPrivate {
 	uint16_t  saved_pixmap_pixelSize;
 	uint16_t  saved_pixmap_cmpCount;
 	uint16_t  saved_pixmap_cmpSize;
+	uint16_t  saved_pixmap_pmVersion;
+	uint16_t  saved_pixmap_packType;
+	uint32_t  saved_pixmap_packSize;
+	uint32_t  saved_pixmap_hRes;
+	uint32_t  saved_pixmap_vRes;
+	uint32_t  saved_pixmap_planeBytes;
 	uint8_t   saved_pixmap_valid;       /* 0 = no redirect installed; 1 = redirect installed */
 	uint8_t   saved_pixmap_reserved[3]; /* alignment padding (preserves uint16 alignment of any trailing fields) */
 
@@ -340,5 +358,12 @@ struct DSpContextPrivate {
 	 * from value-init. */
 	uint32_t              queued_child;
 };
+
+extern "C" uint32_t DSpReserveGuestPixelStaging(uint32_t size);
+extern "C" void DSpQuarantineGuestPixelStaging(uint32_t mac_addr,
+                                               uint32_t size,
+                                               bool allocated_from_mac_system_heap);
+extern "C" void DSpDiscardUnusedGuestPixelStaging(uint32_t mac_addr,
+                                                  bool allocated_from_mac_system_heap);
 
 #endif /* DSP_CONTEXT_PRIVATE_H */

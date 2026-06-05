@@ -1,6 +1,8 @@
 /*
  *  gl_metal_coordinates.h - Pure coordinate helpers for GL-on-Metal rendering
  *
+ *  (C) 2026 Sierra Burkhart (sierra760)
+ *
  *  These helpers keep GL's bottom-left window coordinate semantics separate
  *  from Metal's top-left viewport/scissor coordinate system.
  */
@@ -9,6 +11,7 @@
 #define GL_METAL_COORDINATES_H
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 struct GLMetalViewportRect {
@@ -73,6 +76,27 @@ static inline GLMetalScissorRect GLMetalMakeScissorRect(
 	rect.height = (uint32_t)(y1 - y0);
 	rect.valid = true;
 	return rect;
+}
+
+static inline uint32_t GLMetalTextureYForGLRead(
+	int32_t gl_y, int32_t read_h, uint32_t target_h)
+{
+	if (read_h <= 0 || target_h == 0) return 0;
+
+	const int64_t max_y = (target_h > (uint32_t)read_h)
+		? (int64_t)target_h - read_h
+		: 0;
+	int64_t metal_y = (int64_t)target_h - ((int64_t)gl_y + read_h);
+	metal_y = std::max<int64_t>(0, std::min<int64_t>(metal_y, max_y));
+	return (uint32_t)metal_y;
+}
+
+static inline uint16_t GLMetalDepthFloatToUnsignedShort(float depth)
+{
+	if (!std::isfinite(depth)) return 0xffffu;
+	if (depth <= 0.0f) return 0x0000u;
+	if (depth >= 1.0f) return 0xffffu;
+	return (uint16_t)(depth * 65535.0f + 0.5f);
 }
 
 static inline void GLMetalBuildPixelQuadVertices(

@@ -1,5 +1,7 @@
 /*
  *  dsp_video_status_policy.h - DrawSprocket Display Manager status override.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_VIDEO_STATUS_POLICY_H

@@ -1,5 +1,7 @@
 /*
  *  dsp_back_buffer_range.h - DrawSprocket back-buffer byte span helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_BACK_BUFFER_RANGE_H

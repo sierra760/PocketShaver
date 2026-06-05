@@ -47,12 +47,15 @@
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "thunks.h"              /* SheepMem::Reserve */
+#include "dsp_back_buffer_cgraf_policy.h"
 #include "dsp_back_buffer_range.h"
+#include "dsp_cgraf_port_policy.h"
 #include "dsp_display_mode_policy.h"
 #include "dsp_engine.h"
 #include "dsp_draw_context.h"
 #include "dsp_front_staging_color_policy.h"
 #include "dsp_guest_address.h"
+#include "dsp_pixel_staging_lifetime_policy.h"
 #include "dsp_metal_renderer.h"
 #include "dsp_context_private.h"
 #include "gfxaccel_resources.h"       /* per-buffer owner tag */
@@ -63,6 +66,10 @@
 
 extern uint32 Mac_sysalloc(uint32 size);
 extern void Mac_sysfree(uint32 addr);
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentIfNotSuppressed(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits);
 
 /* Forward decl of the lowmem PixMap restore
  * helper defined in dsp_draw_context.mm. Called at the START of
@@ -88,24 +95,174 @@ static inline uint32_t DSpReserveGuestScratch(uint32_t size)
 #endif
 }
 
-static inline uint32_t DSpReserveGuestPixelStaging(uint32_t size)
+#ifndef TESTING_BUILD
+/* DSp exposes these blocks as guest PixMap.baseAddr storage. Once exposed,
+ * do not DisposePtr them: launch-time CFM/component allocations may reuse
+ * the same system-heap range and execute stale frame bytes. */
+enum {
+	kDSpPixelStagingPoolCapacity = 16
+};
+
+struct DSpPixelStagingPoolBlock {
+	uint32_t mac_addr;
+	uint32_t size;
+	bool     in_use;
+	bool     ever_exposed_to_guest;
+	bool     allocated_from_mac_system_heap;
+};
+
+static DSpPixelStagingPoolBlock
+	s_dsp_pixel_staging_pool[kDSpPixelStagingPoolCapacity];
+
+static DSpPixelStagingPoolBlock *DSpFindPixelStagingBlock(uint32_t mac_addr)
+{
+	for (uint32_t i = 0; i < kDSpPixelStagingPoolCapacity; i++) {
+		DSpPixelStagingPoolBlock *block = &s_dsp_pixel_staging_pool[i];
+		if (block->mac_addr == mac_addr) return block;
+	}
+	return nullptr;
+}
+
+static DSpPixelStagingPoolBlock *DSpFindEmptyPixelStagingBlock(void)
+{
+	for (uint32_t i = 0; i < kDSpPixelStagingPoolCapacity; i++) {
+		DSpPixelStagingPoolBlock *block = &s_dsp_pixel_staging_pool[i];
+		if (block->mac_addr == 0) return block;
+	}
+	return nullptr;
+}
+#endif
+
+extern "C" uint32_t DSpReserveGuestPixelStaging(uint32_t size)
 {
 #ifdef TESTING_BUILD
 	return dsp_testing_alloc_guest_scratch(size);
 #else
-	return Mac_sysalloc(size);
+	if (size == 0) return 0;
+
+	for (uint32_t i = 0; i < kDSpPixelStagingPoolCapacity; i++) {
+		DSpPixelStagingPoolBlock *block = &s_dsp_pixel_staging_pool[i];
+		if (block->mac_addr != 0 &&
+		    !block->in_use &&
+		    DSpPixelStagingCanReuseQuarantinedAllocation(block->size, size)) {
+			block->in_use = true;
+			DSP_LOG("DSpReserveGuestPixelStaging: reused quarantined "
+			        "staging 0x%08x size=%u need=%u",
+			        block->mac_addr, block->size, size);
+			return block->mac_addr;
+		}
+	}
+
+	uint32_t mac_addr = Mac_sysalloc(size);
+	if (mac_addr == 0) return 0;
+
+	DSpPixelStagingPoolBlock *slot = DSpFindEmptyPixelStagingBlock();
+	if (slot != nullptr) {
+		slot->mac_addr = mac_addr;
+		slot->size = size;
+		slot->in_use = true;
+		slot->ever_exposed_to_guest = false;
+		slot->allocated_from_mac_system_heap = true;
+	} else {
+		DSP_LOG("DSpReserveGuestPixelStaging: pool full; 0x%08x "
+		        "size=%u will be quarantined untracked on release",
+		        mac_addr, size);
+	}
+	return mac_addr;
+#endif
+}
+
+extern "C" void DSpQuarantineGuestPixelStaging(
+	uint32_t mac_addr,
+	uint32_t size,
+	bool allocated_from_mac_system_heap)
+{
+#ifdef TESTING_BUILD
+	(void)mac_addr;
+	(void)size;
+	(void)allocated_from_mac_system_heap;
+#else
+	if (mac_addr == 0) return;
+
+	DSpPixelStagingPoolBlock *block = DSpFindPixelStagingBlock(mac_addr);
+	if (block != nullptr) {
+		if (size > block->size) block->size = size;
+		block->in_use = false;
+		block->ever_exposed_to_guest = true;
+		block->allocated_from_mac_system_heap =
+			allocated_from_mac_system_heap;
+		DSP_LOG("DSpQuarantineGuestPixelStaging: retained exposed "
+		        "staging 0x%08x size=%u",
+		        mac_addr, block->size);
+		return;
+	}
+
+	DSpPixelStagingPoolBlock *slot = DSpFindEmptyPixelStagingBlock();
+	if (slot != nullptr) {
+		slot->mac_addr = mac_addr;
+		slot->size = size;
+		slot->in_use = false;
+		slot->ever_exposed_to_guest = true;
+		slot->allocated_from_mac_system_heap =
+			allocated_from_mac_system_heap;
+		DSP_LOG("DSpQuarantineGuestPixelStaging: retained untracked "
+		        "exposed staging 0x%08x size=%u",
+		        mac_addr, size);
+		return;
+	}
+
+	if (DSpPixelStagingShouldReturnExposedAllocationToMacHeap(
+	        allocated_from_mac_system_heap)) {
+		Mac_sysfree(mac_addr);
+		return;
+	}
+
+	DSP_LOG("DSpQuarantineGuestPixelStaging: pool full; leaving exposed "
+	        "staging 0x%08x size=%u allocated",
+	        mac_addr, size);
+#endif
+}
+
+extern "C" void DSpDiscardUnusedGuestPixelStaging(
+	uint32_t mac_addr,
+	bool allocated_from_mac_system_heap)
+{
+#ifdef TESTING_BUILD
+	(void)mac_addr;
+	(void)allocated_from_mac_system_heap;
+#else
+	if (mac_addr == 0) return;
+
+	DSpPixelStagingPoolBlock *block = DSpFindPixelStagingBlock(mac_addr);
+	if (block != nullptr) {
+		if (block->ever_exposed_to_guest) {
+			block->in_use = false;
+			DSP_LOG("DSpDiscardUnusedGuestPixelStaging: retained "
+			        "previously exposed staging 0x%08x size=%u",
+			        mac_addr, block->size);
+			return;
+		}
+		if (block->allocated_from_mac_system_heap) {
+			Mac_sysfree(mac_addr);
+		}
+		*block = {};
+		return;
+	}
+
+	if (allocated_from_mac_system_heap) {
+		Mac_sysfree(mac_addr);
+	}
 #endif
 }
 
 extern "C" void DSpReleaseBackBufferStaging(DSpContextPrivate *ctx)
 {
 	if (ctx == nullptr || ctx->staging_mac_addr == 0) return;
-#ifndef TESTING_BUILD
-	if (ctx->staging_owned_sysheap) {
-		Mac_sysfree(ctx->staging_mac_addr);
-	}
-#endif
+	DSpQuarantineGuestPixelStaging(ctx->staging_mac_addr,
+	                               ctx->staging_size,
+	                               ctx->staging_owned_sysheap);
 	ctx->staging_mac_addr = 0;
+	ctx->staging_size = 0;
 	ctx->staging_owned_sysheap = false;
 }
 
@@ -132,28 +289,6 @@ static inline MTLPixelFormat DSpPixelFormatForDepthBits(uint32_t depth_bits)
 }
 
 /*
- *  CGrafPort field byte-offsets in emulated Mac RAM. Matches the
- *  classic-Mac PixMap / CGrafPort layout used by DrawSprocketLib. The
- *  emulated app reads these offsets off the pointer we hand back from
- *  GetBackBuffer. Fixtures will validate against
- *  DrawSprocketLib captures.
- */
-#define DSP_CGP_OFF_BASEADDR     0     /* 4 bytes */
-#define DSP_CGP_OFF_ROWBYTES     4     /* 2 bytes */
-#define DSP_CGP_OFF_BOUNDS_TOP   6     /* 2 bytes */
-#define DSP_CGP_OFF_BOUNDS_LEFT  8     /* 2 bytes */
-#define DSP_CGP_OFF_BOUNDS_BOT  10     /* 2 bytes */
-#define DSP_CGP_OFF_BOUNDS_RIGHT 12    /* 2 bytes */
-#define DSP_CGP_OFF_PIXELTYPE   14     /* 2 bytes */
-#define DSP_CGP_OFF_PIXELSIZE   16     /* 2 bytes */
-#define DSP_CGP_OFF_CMPCOUNT    18     /* 2 bytes */
-#define DSP_CGP_OFF_CMPSIZE     20     /* 2 bytes */
-#define DSP_CGP_SIZE            24     /* conservative — covers every
-                                         * actively-consumed PixMap field.
-                                         * Extend when colorTable / pmTable
-                                         * references are added. */
-
-/*
  *  Row-stride alignment: 256 bytes matches the bump allocator's
  *  alignment floor and the Metal minimum bytes-per-row for buffer-backed
  *  textures on arm64. The emulated app sees rowBytes = alignedRB, so its
@@ -164,6 +299,36 @@ static inline MTLPixelFormat DSpPixelFormatForDepthBits(uint32_t depth_bits)
 static inline uint32_t DSpAlignedRowBytes(uint32_t w, uint32_t bpp)
 {
 	return DSpBackBufferAlignedRowBytes(w, bpp);
+}
+
+static inline uint32_t DSpContextBackBufferWidth(const DSpContextPrivate *ctx)
+{
+	return ctx->attr.backBufferWidth != 0
+	       ? ctx->attr.backBufferWidth
+	       : ctx->attr.displayWidth;
+}
+
+static inline uint32_t DSpContextBackBufferHeight(const DSpContextPrivate *ctx)
+{
+	return ctx->attr.backBufferHeight != 0
+	       ? ctx->attr.backBufferHeight
+	       : ctx->attr.displayHeight;
+}
+
+static uint32_t DSpCreateBackBufferRectRegion(uint32_t w, uint32_t h)
+{
+	uint32_t region_addr = DSpReserveGuestScratch(DSP_RECT_REGION_SIZE);
+	uint32_t handle_addr = DSpReserveGuestScratch(4u);
+	if (region_addr == 0 || handle_addr == 0) return 0;
+
+	Mac_memset(region_addr, 0, DSP_RECT_REGION_SIZE);
+	WriteMacInt16(region_addr + DSP_REGION_OFF_SIZE, DSP_RECT_REGION_SIZE);
+	WriteMacInt16(region_addr + DSP_REGION_OFF_BBOX + 0, 0);
+	WriteMacInt16(region_addr + DSP_REGION_OFF_BBOX + 2, 0);
+	WriteMacInt16(region_addr + DSP_REGION_OFF_BBOX + 4, (uint16_t)h);
+	WriteMacInt16(region_addr + DSP_REGION_OFF_BBOX + 6, (uint16_t)w);
+	WriteMacInt32(handle_addr, region_addr);
+	return handle_addr;
 }
 
 /* ---------------------------------------------------------------------- *
@@ -227,12 +392,7 @@ extern "C" bool DSpAllocateBackBuffer(DSpContextPrivate *ctx,
 	 * this fix, newTextureWithDescriptor fails at 1/2/4 bpp because
 	 * alignedRB (rounded packed-byte count) < w * bytes-per-texel for
 	 * R8Uint (bytesPerRow < descriptor.width * 1). */
-	NSUInteger tex_width;
-	if (bpp == 1 || bpp == 2 || bpp == 4) {
-		tex_width = (NSUInteger)((w * bpp + 7) / 8);
-	} else {
-		tex_width = (NSUInteger)w;
-	}
+	NSUInteger tex_width = (NSUInteger)DSpDisplayModeTextureWidth(w, bpp);
 
 	MTLTextureDescriptor *desc = [MTLTextureDescriptor new];
 	desc.textureType = MTLTextureType2D;
@@ -285,7 +445,7 @@ extern "C" void DSpReleaseBackBufferNow(DSpContextPrivate *ctx)
 		gfxaccel_resources_clear_buffer_owner(
 		    (__bridge void *)ctx->back_buffer);
 	}
-	/* Pitfall 2: texture FIRST (drops the view
+	/* Texture FIRST (drops the view
 	 * reference into the buffer memory), buffer SECOND. Some iOS Metal
 	 * drivers assert on "Texture references buffer memory that has been
 	 * deallocated" when the backing is released before a view. Matches
@@ -337,15 +497,14 @@ extern "C" void DSpEncodeBackBufferBlit(DSpContextPrivate *ctx,
 	if (ctx == nullptr || encoder == nil || framebuffer_texture == nil) return;
 	if (ctx->back_texture == nil) return;
 
-	uint32_t full_w = ctx->attr.displayWidth;
-	uint32_t full_h = ctx->attr.displayHeight;
+	uint32_t full_w = DSpContextBackBufferWidth(ctx);
+	uint32_t full_h = DSpContextBackBufferHeight(ctx);
 
 	/* Clamp to the smaller of back-buffer and framebuffer dimensions.
-	 * DSp back-buffer is sized from the context's own displayWidth/Height
-	 * and the compositor framebuffer is sized from video_sdl2.cpp's
-	 * current mode — normally identical, but the emul thread can
-	 * transiently see a lagging framebuffer during a mode switch. Don't
-	 * blit past the destination extent; Metal validation asserts on that. */
+	 * DSp Reserve can request a smaller/different back-buffer drawing
+	 * environment than the selected display mode (DSp 1.7 p.25), and the
+	 * compositor framebuffer is sized from the active display mode. Don't
+	 * blit past either extent; Metal validation asserts on that. */
 	NSUInteger dst_w = framebuffer_texture.width;
 	NSUInteger dst_h = framebuffer_texture.height;
 	NSUInteger back_w = ctx->back_texture.width;
@@ -433,16 +592,9 @@ extern "C" uint32_t DSpGetBackBufferCGrafPtr(DSpContextPrivate *ctx)
 	 * of the mode. Cached on first call. */
 	if (ctx->cgrafptr_mac_addr != 0) return ctx->cgrafptr_mac_addr;
 
-	uint32_t cgrafptr_addr = DSpReserveGuestScratch(DSP_CGP_SIZE);
-	if (cgrafptr_addr == 0) {
-		DSP_LOG("DSpGetBackBufferCGrafPtr: guest-scratch reserve failed (size=%u)",
-		        (uint32_t)DSP_CGP_SIZE);
-		return 0;
-	}
-
 	uint32_t bpp       = ctx->attr.backBufferBestDepth;
-	uint32_t w         = ctx->attr.displayWidth;
-	uint32_t h         = ctx->attr.displayHeight;
+	uint32_t w         = DSpContextBackBufferWidth(ctx);
+	uint32_t h         = DSpContextBackBufferHeight(ctx);
 	uint32_t alignedRB = DSpAlignedRowBytes(w, bpp);
 
 	/* baseAddr: Mac-address view of the MTLBuffer's CPU-side contents
@@ -499,16 +651,16 @@ extern "C" uint32_t DSpGetBackBufferCGrafPtr(DSpContextPrivate *ctx)
 				(uint32_t)RAMBase,
 				(uint32_t)RAMSize);
 			if (baseAddr_mac == 0) {
-				#ifndef TESTING_BUILD
-				if (staging_mac != 0) Mac_sysfree(staging_mac);
-				#endif
+				DSpDiscardUnusedGuestPixelStaging(staging_mac, true);
 				DSP_LOG("DSpGetBackBufferCGrafPtr: neither Host2MacAddr nor "
-				        "Mac_sysalloc(%u) could vend a usable guest-RAM baseAddr "
+				        "pixel staging allocation (%u) could vend a usable "
+				        "guest-RAM baseAddr "
 				        "(last=0x%08x)",
 				        buffer_size, staging_mac);
 				return 0;
 			}
 			ctx->staging_mac_addr = baseAddr_mac;
+			ctx->staging_size = buffer_size;
 			#ifndef TESTING_BUILD
 			ctx->staging_owned_sysheap = true;
 			#endif
@@ -558,20 +710,83 @@ extern "C" uint32_t DSpGetBackBufferCGrafPtr(DSpContextPrivate *ctx)
 		pixelSize = 32; cmpCount = 3;  cmpSize = 8;   /* ARGB8888 */
 	}
 
-	WriteMacInt32(cgrafptr_addr + DSP_CGP_OFF_BASEADDR,      baseAddr_mac);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_ROWBYTES,      (uint16_t)alignedRB);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_BOUNDS_TOP,    (uint16_t)bounds_top);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_BOUNDS_LEFT,   (uint16_t)bounds_left);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_BOUNDS_BOT,    (uint16_t)bounds_bottom);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_BOUNDS_RIGHT,  (uint16_t)bounds_right);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_PIXELTYPE,     pixelType);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_PIXELSIZE,     pixelSize);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_CMPCOUNT,      cmpCount);
-	WriteMacInt16(cgrafptr_addr + DSP_CGP_OFF_CMPSIZE,       cmpSize);
+	uint32_t pixmap_addr =
+	    DSpReserveGuestScratch(DSpBackBufferPixMapRecordSize());
+	uint32_t pixmap_handle_addr =
+	    DSpReserveGuestScratch(DSpBackBufferPixMapHandleSize());
+	uint32_t cgrafptr_addr =
+	    DSpReserveGuestScratch(DSpBackBufferCGrafPortSize());
+	uint32_t vis_rgn_handle = DSpCreateBackBufferRectRegion(w, h);
+	uint32_t clip_rgn_handle = DSpCreateBackBufferRectRegion(w, h);
+	if (pixmap_addr == 0 || pixmap_handle_addr == 0 ||
+	    cgrafptr_addr == 0 || vis_rgn_handle == 0 ||
+	    clip_rgn_handle == 0) {
+		DSP_LOG("DSpGetBackBufferCGrafPtr: guest-scratch reserve failed "
+		        "(pixmap=0x%08x handle=0x%08x cgraf=0x%08x "
+		        "vis=0x%08x clip=0x%08x)",
+		        pixmap_addr, pixmap_handle_addr, cgrafptr_addr,
+		        vis_rgn_handle, clip_rgn_handle);
+		return 0;
+	}
+
+	const uint16_t row_bytes_field =
+	    DSpBackBufferPixMapRowBytesField(alignedRB);
+
+	Mac_memset(pixmap_addr, 0, DSpBackBufferPixMapRecordSize());
+	WriteMacInt32(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR,     baseAddr_mac);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES,     row_bytes_field);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP,   (uint16_t)bounds_top);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT,  (uint16_t)bounds_left);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT,   (uint16_t)bounds_bottom);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT, (uint16_t)bounds_right);
+	WriteMacInt32(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_HRES,         0x00480000u);
+	WriteMacInt32(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_VRES,         0x00480000u);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE,    pixelType);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE,    pixelSize);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT,     cmpCount);
+	WriteMacInt16(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE,      cmpSize);
+	WriteMacInt32(pixmap_addr + DSP_MAINDEVICE_PIXMAP_OFF_PLANEBYTES,   0);
+
+	WriteMacInt32(pixmap_handle_addr, pixmap_addr);
+
+	Mac_memset(cgrafptr_addr, 0, DSpBackBufferCGrafPortSize());
+	WriteMacInt32(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_PIXMAP,
+	              pixmap_handle_addr);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_VERSION, 0xC000);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_RECT + 0,
+	              (uint16_t)bounds_top);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_RECT + 2,
+	              (uint16_t)bounds_left);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_RECT + 4,
+	              (uint16_t)bounds_bottom);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PORT_RECT + 6,
+	              (uint16_t)bounds_right);
+	WriteMacInt32(cgrafptr_addr + DSP_CGRAFPORT_OFF_VIS_RGN,
+	              vis_rgn_handle);
+	WriteMacInt32(cgrafptr_addr + DSP_CGRAFPORT_OFF_CLIP_RGN,
+	              clip_rgn_handle);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_FG_COLOR + 0,
+	              0xffff);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_FG_COLOR + 2,
+	              0xffff);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_FG_COLOR + 4,
+	              0xffff);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_BK_COLOR + 0, 0);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_BK_COLOR + 2, 0);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_RGB_BK_COLOR + 4, 0);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PN_SIZE + 0, 1);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PN_SIZE + 2, 1);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_PN_MODE, 8);
+	WriteMacInt16(cgrafptr_addr + DSP_CGRAFPORT_OFF_TX_SIZE, 12);
+	WriteMacInt32(cgrafptr_addr + DSP_CGRAFPORT_OFF_FG_COLOR, 0xffffffffu);
+	WriteMacInt32(cgrafptr_addr + DSP_CGRAFPORT_OFF_BK_COLOR, 0x00000000u);
 
 	ctx->cgrafptr_mac_addr = cgrafptr_addr;
-	DSP_LOG("DSpGetBackBufferCGrafPtr: ctx=%u cgrafptr=0x%08x baseAddr=0x%08x "
-	        "rb=%u bpp=%u", ctx->handle, cgrafptr_addr, baseAddr_mac,
+	DSP_LOG("DSpGetBackBufferCGrafPtr: ctx=%u cgrafptr=0x%08x pixmapH=0x%08x "
+	        "pixmap=0x%08x visRgn=0x%08x clipRgn=0x%08x baseAddr=0x%08x "
+	        "rbRaw=0x%04x rb=%u bpp=%u",
+	        ctx->handle, cgrafptr_addr, pixmap_handle_addr, pixmap_addr,
+	        vis_rgn_handle, clip_rgn_handle, baseAddr_mac, row_bytes_field,
 	        alignedRB, bpp);
 	return cgrafptr_addr;
 }
@@ -667,6 +882,47 @@ static const char *kDSpUnpackShaderSource =
     "        b = pow(b, 1.8 / 2.2);\n"
     "    }\n"
     "    return float4(r, g, b, 1.0);\n"
+    "}\n"
+    "\n"
+    "fragment float4 dsp_unpack_fragment_indexed_compositor32(\n"
+    "    DSpUnpackVertexOut in [[stage_in]],\n"
+    "    texture2d<uint, access::read> tex [[texture(0)]],\n"
+    "    constant uchar *gamma_lut [[buffer(0)]],\n"
+    "    constant uint &fade_active [[buffer(1)]],\n"
+    "    constant uchar *clut_rgb [[buffer(2)]],\n"
+    "    constant uint &bits_per_pixel [[buffer(3)]],\n"
+    "    constant uint &pixel_width [[buffer(4)]])\n"
+    "{\n"
+    "    uint px = uint(in.texCoord.x * float(pixel_width));\n"
+    "    uint py = uint(in.texCoord.y * float(tex.get_height()));\n"
+    "    px = min(px, pixel_width - 1);\n"
+    "    py = min(py, tex.get_height() - 1);\n"
+    "\n"
+    "    uint index = 0;\n"
+    "    if (bits_per_pixel == 8u) {\n"
+    "        index = tex.read(uint2(px, py)).r;\n"
+    "    } else if (bits_per_pixel == 4u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 2u, py)).r;\n"
+    "        index = ((px & 1u) == 0u) ? (byte_val >> 4u) : (byte_val & 0xFu);\n"
+    "    } else if (bits_per_pixel == 2u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 4u, py)).r;\n"
+    "        uint shift = (3u - (px & 3u)) * 2u;\n"
+    "        index = (byte_val >> shift) & 0x3u;\n"
+    "    } else if (bits_per_pixel == 1u) {\n"
+    "        uint byte_val = tex.read(uint2(px / 8u, py)).r;\n"
+    "        index = (byte_val >> (7u - (px & 7u))) & 0x1u;\n"
+    "    }\n"
+    "\n"
+    "    uint clut_offset = index * 3u;\n"
+    "    float r = float(gamma_lut[clut_rgb[clut_offset + 0u]])        / 255.0;\n"
+    "    float g = float(gamma_lut[256u + clut_rgb[clut_offset + 1u]]) / 255.0;\n"
+    "    float b = float(gamma_lut[512u + clut_rgb[clut_offset + 2u]]) / 255.0;\n"
+    "    if (fade_active == 0u) {\n"
+    "        r = pow(r, 1.8 / 2.2);\n"
+    "        g = pow(g, 1.8 / 2.2);\n"
+    "        b = pow(b, 1.8 / 2.2);\n"
+    "    }\n"
+    "    return float4(g, r, 1.0, b);\n"
     "}\n"
     "\n"
     "static inline float4 dsp_unpack_rgb555_to_rgba(\n"
@@ -786,6 +1042,7 @@ static const char *kDSpUnpackShaderSource =
  * (metal_compositor.h:69). dispatch_once gives us thread-safe lazy init
  * without introducing a new mutex / atomic. */
 static id<MTLRenderPipelineState> s_dsp_unpack_pso_indexed = nil;
+static id<MTLRenderPipelineState> s_dsp_unpack_pso_indexed_compositor32 = nil;
 static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp = nil;
 static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp_native = nil;
 static id<MTLRenderPipelineState> s_dsp_unpack_pso_16bpp_compositor32 = nil;
@@ -841,6 +1098,8 @@ static void DSpBuildUnpackPSOs(void)
 
 	id<MTLFunction> vfn = [lib newFunctionWithName:@"dsp_unpack_vertex"];
 	id<MTLFunction> indexed_ffn = [lib newFunctionWithName:@"dsp_unpack_fragment_indexed"];
+	id<MTLFunction> indexed_compositor32_ffn =
+	    [lib newFunctionWithName:@"dsp_unpack_fragment_indexed_compositor32"];
 	id<MTLFunction> ffn_16bpp = [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp"];
 	id<MTLFunction> ffn_16bpp_native = [lib newFunctionWithName:@"dsp_unpack_fragment_16bpp_native"];
 	id<MTLFunction> ffn_16bpp_compositor32 =
@@ -854,6 +1113,9 @@ static void DSpBuildUnpackPSOs(void)
 	}
 
 	s_dsp_unpack_pso_indexed = DSpBuildUnpackPSO(device, vfn, indexed_ffn, "indexed");
+	s_dsp_unpack_pso_indexed_compositor32 =
+	    DSpBuildUnpackPSO(device, vfn, indexed_compositor32_ffn,
+	                      "indexed-compositor32");
 	s_dsp_unpack_pso_16bpp   = DSpBuildUnpackPSO(device, vfn, ffn_16bpp, "16bpp");
 	s_dsp_unpack_pso_16bpp_native =
 	    DSpBuildUnpackPSO(device, vfn, ffn_16bpp_native, "16bpp-native");
@@ -866,6 +1128,8 @@ static void DSpBuildUnpackPSOs(void)
 
 	if (s_dsp_unpack_pso_indexed != nil)
 		DSP_LOG("DSpBuildUnpackPSOs: indexed R8Uint->BGRA8Unorm PSO ready");
+	if (s_dsp_unpack_pso_indexed_compositor32 != nil)
+		DSP_LOG("DSpBuildUnpackPSOs: indexed compositor32 R8Uint->BGRA8Unorm PSO ready");
 	if (s_dsp_unpack_pso_16bpp != nil)
 		DSP_LOG("DSpBuildUnpackPSOs: 16bpp R16Uint->BGRA8Unorm PSO ready");
 	if (s_dsp_unpack_pso_16bpp_native != nil)
@@ -911,7 +1175,8 @@ static bool DSpEncodeUnpackTextureRenderPass(DSpContextPrivate *ctx,
 
 	id<MTLRenderPipelineState> pso = nil;
 	if (indexed) {
-		pso = s_dsp_unpack_pso_indexed;
+		pso = write_compositor32_layout ? s_dsp_unpack_pso_indexed_compositor32
+		                                 : s_dsp_unpack_pso_indexed;
 	} else if (src_fmt == MTLPixelFormatR16Uint && dst_fmt == MTLPixelFormatBGRA8Unorm) {
 		if (write_compositor32_layout) {
 			pso = native_r16_order ? s_dsp_unpack_pso_16bpp_native_compositor32
@@ -1012,12 +1277,13 @@ static bool DSpEncodeUnpackTextureRenderPass(DSpContextPrivate *ctx,
 
 	if (indexed) {
 		DSP_LOG("DSpEncodeUnpackRenderPass: %s %lux%lu R8Uint indexed -> "
-		        "BGRA8Unorm (bpp=%u gamma=%s shaderFade=%u "
+		        "BGRA8Unorm (bpp=%u output=%s gamma=%s shaderFade=%u "
 		        "cold_start=%d empty=%d "
 		        "clut0=%u,%u,%u clut1=%u,%u,%u)",
 		        source_label ? source_label : "source",
 		        (unsigned long)vp_w, (unsigned long)vp_h,
-		        bpp, use_display_gamma ? "display" : "identity",
+		        bpp, write_compositor32_layout ? "compositor32" : "normalized",
+		        use_display_gamma ? "display" : "identity",
 		        fade_active, ctx->dirty_cold_start, ctx->dirty_empty,
 		        ctx->clut_bytes[0], ctx->clut_bytes[1], ctx->clut_bytes[2],
 		        ctx->clut_bytes[3], ctx->clut_bytes[4], ctx->clut_bytes[5]);
@@ -1040,14 +1306,17 @@ static bool DSpEncodeUnpackRenderPass(DSpContextPrivate *ctx,
                                        id<MTLTexture> framebuffer_texture)
 {
 	if (ctx == nullptr) return false;
+	const bool write_compositor32_layout =
+	    DSpBackBufferWritesCompositor32Layout();
 	return DSpEncodeUnpackTextureRenderPass(ctx,
 	                                        ctx->back_texture,
 	                                        ctx->attr.backBufferBestDepth,
-	                                        ctx->attr.displayWidth,
+	                                        DSpContextBackBufferWidth(ctx),
 	                                        "backBuffer",
 	                                        false,
-	                                        DSpBackBufferPresentUsesDisplayGamma(),
-	                                        false,
+	                                        DSpBackBufferUnpackUsesDisplayGamma(
+	                                            write_compositor32_layout),
+	                                        write_compositor32_layout,
 	                                        cb,
 	                                        framebuffer_texture);
 }
@@ -1126,7 +1395,7 @@ extern "C" bool DSpEncodeFrontBufferStagingToFramebuffer(DSpContextPrivate *ctx,
 	const uint32_t w = ctx->attr.displayWidth;
 	const uint32_t h = ctx->attr.displayHeight;
 	const uint32_t row_bytes =
-	    DSpDisplayModeRowBytes(w, front_depth);
+	    DSpDisplayModePitch(w, front_depth);
 	const uint32_t buffer_size = row_bytes * h;
 	uint32_t baseAddr_mac = DSpUsableGuestBaseOrZero(
 		ctx->front_staging_mac_addr,
@@ -1147,6 +1416,11 @@ extern "C" bool DSpEncodeFrontBufferStagingToFramebuffer(DSpContextPrivate *ctx,
 		        "failed for 0x%08x", baseAddr_mac);
 		return false;
 	}
+
+	GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentIfNotSuppressed(
+		baseAddr_mac,
+		row_bytes,
+		front_depth);
 
 	const uint32_t current_hash =
 	    DSpFrontStagingHashBytes(front_host, buffer_size);
@@ -1190,7 +1464,7 @@ extern "C" bool DSpEncodeFrontBufferStagingToFramebuffer(DSpContextPrivate *ctx,
 
 	MTLTextureDescriptor *td =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
-	                                                       width:w
+	                                                       width:DSpDisplayModeTextureWidth(w, front_depth)
 	                                                      height:h
 	                                                   mipmapped:NO];
 	td.usage       = MTLTextureUsageShaderRead;

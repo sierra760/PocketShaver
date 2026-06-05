@@ -24,6 +24,9 @@
 
 #include <cstring>
 
+// Forward declare Mac_sysalloc (from macos_util.h) to avoid UIKit header conflicts.
+extern uint32 Mac_sysalloc(uint32 size);
+
 // RAVE error codes (must match TQAError enum in RAVE.h)
 #define kQANoErr                    0
 #define kQAError                    1
@@ -182,7 +185,15 @@ static void InitStateDefaults(RaveDrawPrivate *ctx, uint32 flags)
 	// ATI state defaults (all zero from memset in RaveDrawPrivate allocation)
 	ctx->ati_fog_active = false;
 	memset(ctx->ati_state, 0, sizeof(ctx->ati_state));
-	ctx->ati_state[kRaveATIDepthWriteEnableIndex].i = 1;
+	uint32_t atiIntDefaults[RAVE_ATI_TAG_COUNT] = {};
+	RaveATIInitializeIntDefaults(atiIntDefaults, RAVE_ATI_TAG_COUNT);
+	for (uint32_t i = 0; i < RAVE_ATI_TAG_COUNT; i++) {
+		ctx->ati_state[i].i = atiIntDefaults[i];
+	}
+	RAVE_LOG("InitStateDefaults: ATI UT probe tag %u default=%u (0x%08x)",
+	         kRaveATIUnrealTournamentProbeTag,
+	         ctx->ati_state[kRaveATIUnrealTournamentProbeIndex].i,
+	         ctx->ati_state[kRaveATIUnrealTournamentProbeIndex].i);
 }
 
 /*
@@ -391,7 +402,7 @@ int32 NativeDrawPrivateDelete(uint32 drawPrivateHandle)
 	// release it on real mode changes, and RaveOnAttach will re-vend at the
 	// new resolution. Tearing down here caused visible black flashes on every
 	// Nanosaur scene transition (menu ↔ gameplay) because the host's main-
-	// thread VBL presented frames during the gap between destroy and the
+	// thread VBL presented frames during the interval between destroy and the
 	// next DrawPrivateNew → RaveCreateMetalOverlay call.
 
 	// Clamp for safety
@@ -512,6 +523,34 @@ int32 NativeSetInt(uint32 drawContextAddr, uint32 tag, uint32 value)
 	return kQANoErr;
 }
 
+static void WriteATIRaveExtFuncsTable(uint32 ptr)
+{
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotClearDrawBuffer * 4,
+	              rave_method_tvects[kRaveATIClearDrawBuffer]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotClearZBuffer * 4,
+	              rave_method_tvects[kRaveATIClearZBuffer]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotTextureUpdate * 4,
+	              rave_method_tvects[kRaveATITextureUpdate]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotBindCodeBook * 4,
+	              rave_method_tvects[kRaveATIBindCodeBook]);
+}
+
+static uint32 EnsureATIRaveExtFuncsTable(RaveDrawPrivate *ctx)
+{
+	uint32 ptr = ctx->ati_state[kRaveATIRaveExtFuncsIndex].i;
+	if (ptr == 0) {
+		ptr = Mac_sysalloc(kRaveATIRaveExtFuncsEntryCount * 4);
+		if (ptr == 0) {
+			RAVE_LOG("GetPtr: kATIRaveExtFuncs allocation failed");
+			return 0;
+		}
+		ctx->ati_state[kRaveATIRaveExtFuncsIndex].i = ptr;
+	}
+
+	WriteATIRaveExtFuncsTable(ptr);
+	return ptr;
+}
+
 
 /*
  *  NativeSetPtr - Store a pointer state value (Mac address)
@@ -528,12 +567,13 @@ int32 NativeSetPtr(uint32 drawContextAddr, uint32 tag, uint32 ptr)
 	// ATI EngineSpecific range (1000+)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
-		if (ati_idx == 21) {  // kATIRaveExtFuncs
-			// Write 4 TVECT addresses into the RaveExtFuncs struct at ptr
-			WriteMacInt32(ptr + 0, rave_method_tvects[kRaveATIClearDrawBuffer]);   // clearDrawBuffer
-			WriteMacInt32(ptr + 4, rave_method_tvects[kRaveATIClearZBuffer]);      // clearZBuffer
-			WriteMacInt32(ptr + 8, rave_method_tvects[kRaveATITextureUpdate]);     // textureUpdate
-			WriteMacInt32(ptr + 12, rave_method_tvects[kRaveATIBindCodeBook]);     // bindCodeBook
+		if (ati_idx == kRaveATIRaveExtFuncsIndex) {
+			if (ptr == 0) {
+				RAVE_LOG("SetPtr: kATIRaveExtFuncs ignored null pointer");
+				return kQAParamErr;
+			}
+			WriteATIRaveExtFuncsTable(ptr);
+			ctx->ati_state[kRaveATIRaveExtFuncsIndex].i = ptr;
 			RAVE_LOG("SetPtr: kATIRaveExtFuncs -> delivered 4 TVECT addresses to 0x%08x", ptr);
 			return kQANoErr;
 		}
@@ -603,7 +643,11 @@ uint32 NativeGetInt(uint32 drawContextAddr, uint32 tag)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
-			return ctx->ati_state[ati_idx].i;
+			uint32_t value = ctx->ati_state[ati_idx].i;
+			if (tag == kRaveATIUnrealTournamentProbeTag) {
+				RAVE_LOG("GetInt: ATI UT probe tag %u -> %u (0x%08x)", tag, value, value);
+			}
+			return value;
 		}
 		return 0;
 	}
@@ -630,6 +674,11 @@ uint32 NativeGetPtr(uint32 drawContextAddr, uint32 tag)
 	// ATI EngineSpecific range (1000+)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
+		if (ati_idx == kRaveATIRaveExtFuncsIndex) {
+			uint32 ptr = EnsureATIRaveExtFuncsTable(ctx);
+			RAVE_LOG("GetPtr: kATIRaveExtFuncs -> 0x%08x", ptr);
+			return ptr;
+		}
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
 			return ctx->ati_state[ati_idx].i;
 		}

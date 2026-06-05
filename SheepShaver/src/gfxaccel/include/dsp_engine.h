@@ -37,6 +37,7 @@
 #define DSP_ENGINE_H
 
 #include <stdint.h>
+#include "dsp_version_policy.h"
 
 /*
  *  DSp sub-opcode enum. 0..2 are lifecycle; 100..106 are context
@@ -62,9 +63,9 @@ enum {
 	kDSpFindBestContext             = 201,
 	kDSpContext_GetAttributes       = 202,
 
-	/* Sub-opcode 203 — DSpGetNextContext stub terminator per DSp 1.7 PDF
-	 * p.17; iOS is single-display so iteration after GetFirstContext always
-	 * returns kDSpContextNotFoundErr. */
+	/* Sub-opcode 203 — DSpGetNextContext. Advances the current enumeration
+	 * cursor through the DSp mode cache and terminates with
+	 * kDSpContextNotFoundErr at end-of-list per DSp 1.7 PDF p.17. */
 	kDSpGetNextContext              = 203,
 
 	/* Palette — SetCLUTEntries / GetCLUTEntries (300-399 reservation for CLUT). */
@@ -193,12 +194,6 @@ enum {
  */
 #define DSP_ALT_MAX_DIM            4032u
 #define DSP_ALT_MAX_BACKING_BYTES  (64u * 1024u * 1024u)
-
-/*
- *  DSp Gestalt version - DSp 1.7.0.0 per resources/DrawSprocket1.7.pdf.
- *  The GetVersion handler returns this constant.
- */
-#define kDSpVersion_1_7_0   0x01070000u
 
 /*
  *  DSp 1.7 PDF p.87 enumerates ALL 11 Result Codes in -30440..-30450.
@@ -613,11 +608,12 @@ extern uint32_t DSpDispatch(uint32_t r3, uint32_t r4, uint32_t r5,
  *  Lifecycle handlers:
  *   - DSpStartupHandler: idempotent init, bumps refcount, returns noErr
  *   - DSpShutdownHandler: decrements refcount, releases resources on 0
- *   - DSpGetVersionHandler: returns kDSpVersion_1_7_0
+ *   - DSpGetVersionHandler: returns kDSpVersion_Current and writes it to
+ *     outVersionAddr when r3 is a valid NumVersion return buffer
  */
 extern int32_t DSpStartupHandler(void);
 extern int32_t DSpShutdownHandler(void);
-extern uint32_t DSpGetVersionHandler(void);
+extern uint32_t DSpGetVersionHandler(uint32_t outVersionAddr);
 
 /*
  *  Testing hook — zeros the DSp lifecycle state (refcount, registered

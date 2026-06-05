@@ -30,8 +30,12 @@
 #include "metal_device_shared.h"
 #include "metal_compositor.h"
 #include "display_mode_controller.h"
+#include "rave_blend_policy.h"
 #include "rave_compositor_rect.h"
 #include "rave_overlay_clear_policy.h"
+#include "rave_mipmap_bias_policy.h"
+#include "rave_texture_alpha_policy.h"
+#include "rave_depth_policy.h"
 #include "gfxaccel_resources.h"
 #include "gfxaccel_resources_heap.h"
 
@@ -77,6 +81,7 @@ struct FragmentUniforms {
     float    env_color_g;
     float    env_color_b;
     float    env_color_a;
+    int32_t  use_vertex_alpha_for_texture_opacity;
 };
 
 static int32_t RaveNormalizeATIFogMode(const RaveDrawPrivate *priv)
@@ -148,7 +153,7 @@ static void RaveFillFogUniforms(RaveDrawPrivate *priv, FragmentUniforms *fragUni
 }
 
 // kQAContext flag bits
-#define kQAContext_NoZBuffer  (1 << 0)
+#define kQAContext_NoZBuffer RAVE_CONTEXT_NO_Z_BUFFER
 
 // RAVE.h constants used by draw-buffer CPU access.
 #define kQADeviceMemory       0
@@ -494,6 +499,43 @@ static MTLCompareFunction ZFunctionToMTL(int zfunc)
 	}
 }
 
+static void RaveSetDepthStencilStateForDraw(RaveDrawPrivate *priv,
+                                            int blendMode,
+                                            uint32_t glBlendSrc,
+                                            uint32_t glBlendDst)
+{
+	RaveMetalState *ms = priv ? priv->metal : nullptr;
+	if (!ms || !ms->currentEncoder) return;
+	if (!RaveContextUsesMetalDepthAttachment(priv->flags)) {
+		[ms->currentEncoder setDepthStencilState:nil];
+		return;
+	}
+
+	int zfunc = (int)priv->state[0].i;
+	if (zfunc < 0 || zfunc >= 9) return;
+
+	bool depthWriteEnabled = RaveDrawDepthWriteEnabledForBlendFactors(
+		priv->state[28].i,
+		priv->ati_state[kRaveATIDepthWriteEnableIndex].i,
+		blendMode,
+		glBlendSrc,
+		glBlendDst);
+	__strong id<MTLDepthStencilState> *dsArray =
+		depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
+	if (dsArray[zfunc]) {
+		[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
+	}
+}
+
+static void RaveSetDepthStencilStateForCurrentDraw(RaveDrawPrivate *priv)
+{
+	if (!priv) return;
+	RaveSetDepthStencilStateForDraw(priv,
+	                                (int)priv->state[9].i,
+	                                priv->state[109].i,
+	                                priv->state[110].i);
+}
+
 
 /*
  *  RaveChannelMaskToMTL - convert RAVE channel mask bits to Metal colorWriteMask
@@ -514,11 +556,15 @@ static MTLColorWriteMask RaveChannelMaskToMTL(uint32_t raveMask) {
  *  GetMaskedPipeline - get or lazily create a pipeline with channel mask applied
  *
  *  Clones the base pipeline configuration but overrides colorAttachments[0].writeMask.
- *  Results are cached in ms->maskedPipelines keyed by (pipeIdx << 4) | mask | (msaa << 32).
+ *  Results are cached in ms->maskedPipelines keyed by pipeline, mask,
+ *  sample count, and whether the active pass has a depth attachment.
  */
-static id<MTLRenderPipelineState> GetMaskedPipeline(RaveMetalState *ms, int pipeIdx, uint32_t channelMask, bool msaa) {
+static id<MTLRenderPipelineState> GetMaskedPipeline(RaveMetalState *ms, int pipeIdx,
+                                                    uint32_t channelMask, bool msaa,
+                                                    bool hasDepthAttachment) {
 	uint64_t key = ((uint64_t)pipeIdx << 4) | (channelMask & 0xF);
 	if (msaa) key |= (1ULL << 32);
+	if (hasDepthAttachment) key |= (1ULL << 33);
 
 	auto it = ms->maskedPipelines.find(key);
 	if (it != ms->maskedPipelines.end()) return it->second;
@@ -530,12 +576,14 @@ static id<MTLRenderPipelineState> GetMaskedPipeline(RaveMetalState *ms, int pipe
 	bool fog      = (bits & 2) != 0;
 	bool alpha    = (bits & 4) != 0;
 	bool multiTex = (bits & 8) != 0;
+	bool premultiplyOutput = RaveBlendModeUsesPremultipliedOutput(blend) != 0;
 
 	MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
 	[constants setConstantValue:&tex      type:MTLDataTypeBool atIndex:0];
 	[constants setConstantValue:&fog      type:MTLDataTypeBool atIndex:1];
 	[constants setConstantValue:&alpha    type:MTLDataTypeBool atIndex:2];
 	[constants setConstantValue:&multiTex type:MTLDataTypeBool atIndex:3];
+	[constants setConstantValue:&premultiplyOutput type:MTLDataTypeBool atIndex:4];
 
 	NSError *err = nil;
 	id<MTLFunction> vertexFunc = [ms->shaderLibrary newFunctionWithName:@"rave_vertex"
@@ -552,7 +600,7 @@ static id<MTLRenderPipelineState> GetMaskedPipeline(RaveMetalState *ms, int pipe
 	pipeDesc.fragmentFunction = fragmentFunc;
 	pipeDesc.vertexDescriptor = ms->vertexDescriptor;
 	pipeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-	pipeDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	pipeDesc.depthAttachmentPixelFormat = hasDepthAttachment ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 	pipeDesc.sampleCount = msaa ? 4 : 1;
 
 	// Blend factors (same logic as BuildPipelines)
@@ -596,7 +644,8 @@ static id<MTLRenderPipelineState> GetMaskedPipeline(RaveMetalState *ms, int pipe
 static void BuildPipelines(id<MTLDevice> device, id<MTLLibrary> lib,
                            MTLVertexDescriptor *vertDesc,
                            id<MTLRenderPipelineState> __strong *outPipelines,
-                           int sampleCount)
+                           int sampleCount,
+                           bool hasDepthAttachment)
 {
 	for (int blend = 0; blend < 3; blend++) {
 		for (int i = 0; i < 16; i++) {
@@ -605,12 +654,14 @@ static void BuildPipelines(id<MTLDevice> device, id<MTLLibrary> lib,
 			bool fog      = (i & 2) != 0;
 			bool alpha    = (i & 4) != 0;
 			bool multiTex = (i & 8) != 0;
+			bool premultiplyOutput = RaveBlendModeUsesPremultipliedOutput(blend) != 0;
 
 			MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
 			[constants setConstantValue:&tex      type:MTLDataTypeBool atIndex:0];
 			[constants setConstantValue:&fog      type:MTLDataTypeBool atIndex:1];
 			[constants setConstantValue:&alpha    type:MTLDataTypeBool atIndex:2];
 			[constants setConstantValue:&multiTex type:MTLDataTypeBool atIndex:3];
+			[constants setConstantValue:&premultiplyOutput type:MTLDataTypeBool atIndex:4];
 
 			NSError *err = nil;
 			id<MTLFunction> vertexFunc = [lib newFunctionWithName:@"rave_vertex"
@@ -634,7 +685,7 @@ static void BuildPipelines(id<MTLDevice> device, id<MTLLibrary> lib,
 			pipeDesc.fragmentFunction = fragmentFunc;
 			pipeDesc.vertexDescriptor = vertDesc;
 			pipeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-			pipeDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+			pipeDesc.depthAttachmentPixelFormat = hasDepthAttachment ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 			pipeDesc.sampleCount = sampleCount;
 
 			// Blend factors per mode
@@ -672,6 +723,7 @@ static void EnsureMSAAResources(RaveDrawPrivate *priv)
 {
 	RaveMetalState *ms = priv->metal;
 	if (ms->msaaResourcesReady) return;
+	const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 
 	// Create 4x MSAA color texture
 	MTLTextureDescriptor *colorDesc = [MTLTextureDescriptor
@@ -685,21 +737,23 @@ static void EnsureMSAAResources(RaveDrawPrivate *priv)
 	colorDesc.usage = MTLTextureUsageRenderTarget;
 	ms->msaaColorTexture = [ms->device newTextureWithDescriptor:colorDesc];
 
-	// Create 4x MSAA depth texture
-	MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor
-	    texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-	                                width:(NSUInteger)priv->width
-	                               height:(NSUInteger)priv->height
-	                            mipmapped:NO];
-	depthDesc.textureType = MTLTextureType2DMultisample;
-	depthDesc.sampleCount = 4;
-	depthDesc.storageMode = MTLStorageModePrivate;
-	depthDesc.usage = MTLTextureUsageRenderTarget;
-	ms->msaaDepthTexture = [ms->device newTextureWithDescriptor:depthDesc];
+	// Create 4x MSAA depth texture only for contexts that actually expose a z-buffer.
+	if (hasDepthAttachment) {
+		MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor
+		    texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+		                                width:(NSUInteger)priv->width
+		                               height:(NSUInteger)priv->height
+		                            mipmapped:NO];
+		depthDesc.textureType = MTLTextureType2DMultisample;
+		depthDesc.sampleCount = 4;
+		depthDesc.storageMode = MTLStorageModePrivate;
+		depthDesc.usage = MTLTextureUsageRenderTarget;
+		ms->msaaDepthTexture = [ms->device newTextureWithDescriptor:depthDesc];
+	}
 
 	// Build 48 MSAA pipeline variants
 	BuildPipelines(ms->device, ms->shaderLibrary, ms->vertexDescriptor,
-	               ms->msaaPipelines, 4);
+	               ms->msaaPipelines, 4, hasDepthAttachment);
 
 	ms->msaaResourcesReady = true;
 	RAVE_LOG("MSAA 4x resources allocated: %dx%d (~%.1f MB)",
@@ -776,6 +830,7 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	}
 #endif
 	ms->shaderLibrary = lib;
+	const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 
 	// Create vertex descriptor: position, base color, texcoord, diffuse, specular.
 	MTLVertexDescriptor *vertDesc = [[MTLVertexDescriptor alloc] init];
@@ -800,36 +855,38 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 
 	// AUDIT: M003/S04/T01 — RAVE blend state verified correct.
 	// 48 pipelines = 3 blend modes x 16 function constant combos.
-	// Blend mode 0: premultiplied alpha (src=One, dst=OneMinusSrcAlpha)
+	// Blend mode 0: premultiplied alpha (shader premultiplies, src=One, dst=OneMinusSrcAlpha)
 	// Blend mode 1: standard alpha (src=SrcAlpha, dst=OneMinusSrcAlpha)
 	// Blend mode 2 (kQABlend_OpenGL): handled separately via GetGLBlendPipeline
 	// All pipelines have blendingEnabled=YES, which is correct for RAVE
 	// (RAVE always blends; it's a compositing rasterizer, not an opaque renderer).
 	// Pre-build 48 pipeline states (sampleCount=1)
-	BuildPipelines(ms->device, lib, vertDesc, ms->pipelines, 1);
+	BuildPipelines(ms->device, lib, vertDesc, ms->pipelines, 1, hasDepthAttachment);
 	RAVE_LOG("48 pipeline states created");
 
-	// AUDIT: M003/S04/T01 — RAVE depth state configuration verified correct.
-	// 9 ZFunction values mapped to Metal compare functions (ZFunctionToMTL).
-	// kQAZFunction_None(0) maps to MTLCompareFunctionAlways with depth write disabled,
-	// which is correct (no depth buffer = always pass, never write).
-	// All other functions (1-8) have depth write enabled by default; a separate
-	// depthStatesNoWrite[9] array handles ZBufferMask=0 (depth write disabled).
-	// Create 9 depth stencil states (one per ZFunction)
-	for (int i = 0; i < 9; i++) {
-		MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-		dsDesc.depthCompareFunction = ZFunctionToMTL(i);
-		dsDesc.depthWriteEnabled = (i != 0);
-		ms->depthStates[i] = [ms->device newDepthStencilStateWithDescriptor:dsDesc];
+	if (hasDepthAttachment) {
+		// AUDIT: M003/S04/T01 — RAVE depth state configuration verified correct.
+		// 9 ZFunction values mapped to Metal compare functions (ZFunctionToMTL).
+		// kQAZFunction_None(0) maps to MTLCompareFunctionAlways with depth write disabled,
+		// which is correct (no depth buffer = always pass, never write).
+		// All other functions (1-8) have depth write enabled by default; a separate
+		// depthStatesNoWrite[9] array handles ZBufferMask=0 (depth write disabled).
+		for (int i = 0; i < 9; i++) {
+			MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+			dsDesc.depthCompareFunction = ZFunctionToMTL(i);
+			dsDesc.depthWriteEnabled = (i != 0);
+			ms->depthStates[i] = [ms->device newDepthStencilStateWithDescriptor:dsDesc];
+		}
+		for (int i = 0; i < 9; i++) {
+			MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+			dsDesc.depthCompareFunction = ZFunctionToMTL(i);
+			dsDesc.depthWriteEnabled = NO;
+			ms->depthStatesNoWrite[i] = [ms->device newDepthStencilStateWithDescriptor:dsDesc];
+		}
+		RAVE_LOG("9+9 depth stencil states created (write enabled + disabled)");
+	} else {
+		RAVE_LOG("Depth stencil states skipped (no z-buffer context)");
 	}
-	// Create 9 depth stencil states with depth writes disabled (for ZBufferMask=0)
-	for (int i = 0; i < 9; i++) {
-		MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-		dsDesc.depthCompareFunction = ZFunctionToMTL(i);
-		dsDesc.depthWriteEnabled = NO;
-		ms->depthStatesNoWrite[i] = [ms->device newDepthStencilStateWithDescriptor:dsDesc];
-	}
-	RAVE_LOG("9+9 depth stencil states created (write enabled + disabled)");
 
 	// [AUDIT-T02] Verified: 3 sampler states with MTLSamplerAddressModeRepeat (correct for
 	// UV-wrapped 3D geometry). nearest/bilinear/trilinear filter progression matches RAVE
@@ -858,8 +915,8 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	}
 	RAVE_LOG("3 sampler states created");
 
-	// Create depth buffer texture
-	if (priv->width > 0 && priv->height > 0) {
+	// Create depth buffer texture only for contexts that actually expose a z-buffer.
+	if (hasDepthAttachment && priv->width > 0 && priv->height > 0) {
 		MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor
 		    texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
 		                                width:(NSUInteger)priv->width
@@ -892,7 +949,7 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	ms->noticeDirtyRectMac = 0;
 
 	// Depth-always-write state for ClearZBuffer
-	{
+	if (hasDepthAttachment) {
 		MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
 		dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
 		dsDesc.depthWriteEnabled = YES;
@@ -1028,9 +1085,11 @@ static MTLBlendFactor GLBlendToMTL(uint32_t glFactor) {
  *  keyed by (funcConstBits, glBlendSrc, glBlendDst, msaa).
  */
 static id<MTLRenderPipelineState> GetGLBlendPipeline(RaveMetalState *ms, int funcConstBits,
-                                                       uint32_t glBlendSrc, uint32_t glBlendDst, bool msaa) {
+                                                     uint32_t glBlendSrc, uint32_t glBlendDst,
+                                                     bool msaa, bool hasDepthAttachment) {
 	uint64_t key = ((uint64_t)(funcConstBits & 0xF) << 48) | ((uint64_t)(msaa ? 1 : 0) << 32)
 	             | ((uint64_t)(glBlendSrc & 0xFFFF) << 16) | (uint64_t)(glBlendDst & 0xFFFF);
+	if (hasDepthAttachment) key |= (1ULL << 33);
 
 	auto it = ms->glBlendPipelines.find(key);
 	if (it != ms->glBlendPipelines.end()) return it->second;
@@ -1040,12 +1099,14 @@ static id<MTLRenderPipelineState> GetGLBlendPipeline(RaveMetalState *ms, int fun
 	bool fog      = (funcConstBits & 2) != 0;
 	bool alpha    = (funcConstBits & 4) != 0;
 	bool multiTex = (funcConstBits & 8) != 0;
+	bool premultiplyOutput = false;
 
 	MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
 	[constants setConstantValue:&tex      type:MTLDataTypeBool atIndex:0];
 	[constants setConstantValue:&fog      type:MTLDataTypeBool atIndex:1];
 	[constants setConstantValue:&alpha    type:MTLDataTypeBool atIndex:2];
 	[constants setConstantValue:&multiTex type:MTLDataTypeBool atIndex:3];
+	[constants setConstantValue:&premultiplyOutput type:MTLDataTypeBool atIndex:4];
 
 	NSError *err = nil;
 	id<MTLFunction> vertexFunc = [ms->shaderLibrary newFunctionWithName:@"rave_vertex"
@@ -1063,7 +1124,7 @@ static id<MTLRenderPipelineState> GetGLBlendPipeline(RaveMetalState *ms, int fun
 	pipeDesc.fragmentFunction = fragmentFunc;
 	pipeDesc.vertexDescriptor = ms->vertexDescriptor;
 	pipeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-	pipeDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	pipeDesc.depthAttachmentPixelFormat = hasDepthAttachment ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 	pipeDesc.sampleCount = msaa ? 4 : 1;
 
 	// GL blend factors
@@ -1110,12 +1171,14 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	if (priv->multiTextureActive) func_const_bits |= 8;  // bit 3: has_multi_texture
 
 	id<MTLRenderPipelineState> selectedPipeline = nil;
+	const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 
 	if (blend_mode == 2) {
 		// kQABlend_OpenGL: use GL blend factors from tags 109/110
 		uint32_t glSrc = priv->state[109].i;  // kQATagGL_BlendSrc
 		uint32_t glDst = priv->state[110].i;  // kQATagGL_BlendDst
-		selectedPipeline = GetGLBlendPipeline(ms, func_const_bits, glSrc, glDst, ms->msaaActive);
+		selectedPipeline = GetGLBlendPipeline(ms, func_const_bits, glSrc, glDst,
+		                                      ms->msaaActive, hasDepthAttachment);
 	}
 
 	int pipe_idx = (blend_mode == 2 ? 0 : (blend_mode < 0 || blend_mode > 1 ? 0 : blend_mode)) * 16 + func_const_bits;
@@ -1132,7 +1195,8 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 			// NativeDrawBitmap, NativeClearDrawBuffer.
 			uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask, default 0xF (all)
 			if (channelMask != 0xF && channelMask != 0) {
-				id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
+				id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(
+					ms, pipe_idx, channelMask, ms->msaaActive, hasDepthAttachment);
 				if (maskedPipe) {
 					[ms->currentEncoder setRenderPipelineState:maskedPipe];
 					ms->currentPipelineIdx = pipe_idx;
@@ -1147,18 +1211,8 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 		}
 	}
 
-	// Apply depth state from ZFunction tag (state[0]) and ZBufferMask (state[28])
-	if (forceAll || (priv->dirty_flags & 1)) {
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc]) {
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-			}
-		}
-	}
+	// Depth writes depend on both z-mask tags and the active blend factors.
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 
 	// Apply GL scissor rect if GL tags are set (tags 105-108)
 	if (priv->state[105].i != 0 || priv->state[106].i != 0 ||
@@ -1179,6 +1233,9 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	}
 
 	// Bind texture and sampler when rendering textured geometry
+	uint32_t texture_pixel_type = 0;
+	uint32_t texture_rgb_nonzero = 0;
+	uint32_t texture_total_pixels = 0;
 	if (textured) {
 		// Bind texture from kQATag_Texture (state[13])
 		uint32_t tex_mac_addr = priv->state[13].i;
@@ -1186,6 +1243,8 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 			uint32_t tex_handle = RaveResourceFindByAddr(tex_mac_addr);
 			RaveResourceEntry *tex_entry = RaveResourceGet(tex_handle);
 			if (tex_entry) {
+				texture_pixel_type = tex_entry->pixel_type;
+				texture_total_pixels = tex_entry->width * tex_entry->height;
 				// Deferred texture creation: if metal_texture is nil but we have
 				// a pixmap address, the texture was created with placeholder data
 				// at QATextureNew time. The game has since written the real pixels
@@ -1200,6 +1259,7 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 				else if (RaveTextureNeedsLivePixmapRefresh(tex_entry)) {
 					RaveRefreshTextureFromPixmap(tex_entry);
 				}
+				texture_rgb_nonzero = tex_entry->diag_rgb_nonzero;
 				if (tex_entry->metal_texture) {
 					id<MTLTexture> mtlTex = (__bridge id<MTLTexture>)tex_entry->metal_texture;
 					[ms->currentEncoder setFragmentTexture:mtlTex atIndex:0];
@@ -1265,13 +1325,22 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	fragUniforms.alpha_test_ref = priv->state[46].f;
 	fragUniforms.multi_texture_op = priv->state[35].i;      // kQATag_MultiTextureOp
 	fragUniforms.multi_texture_factor = priv->state[51].f;  // kQATag_MultiTextureFactor
-	fragUniforms.mipmap_bias = priv->state[41].f;           // kQATag_MipmapBias
-	fragUniforms.multi_texture_mipmap_bias = priv->state[42].f;  // kQATag_MultiTextureMipmapBias
+	fragUniforms.mipmap_bias = RaveMetalSamplerMipBias(priv->state[41].f);  // kQATag_MipmapBias
+	fragUniforms.multi_texture_mipmap_bias = RaveMetalSamplerMipBias(priv->state[42].f);  // kQATag_MultiTextureMipmapBias
 	// TextureOp Blend env color from GL texture env color tags (150-153)
 	fragUniforms.env_color_r = priv->state[151].f;  // kQATagGL_TextureEnvColor_r
 	fragUniforms.env_color_g = priv->state[152].f;  // kQATagGL_TextureEnvColor_g
 	fragUniforms.env_color_b = priv->state[153].f;  // kQATagGL_TextureEnvColor_b
 	fragUniforms.env_color_a = priv->state[150].f;  // kQATagGL_TextureEnvColor_a
+	fragUniforms.use_vertex_alpha_for_texture_opacity =
+		RaveTextureShouldApplyVertexAlphaToOpacityForDraw((int)texture_pixel_type,
+		                                                  blend_mode,
+		                                                  fragUniforms.alpha_test_func,
+		                                                  0,
+		                                                  priv->state[109].i,
+		                                                  priv->state[110].i,
+		                                                  texture_rgb_nonzero,
+		                                                  texture_total_pixels);
 	[ms->currentEncoder setFragmentBytes:&fragUniforms length:sizeof(fragUniforms) atIndex:0];
 
 	priv->dirty_flags = 0;
@@ -1389,6 +1458,7 @@ static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate
 {
 	static uint32_t sTexDiagCount = 0;
 	static uint32_t sHighAlphaTexDiagCount = 0;
+	static uint32_t sBlackRgbTexDiagCount = 0;
 	if (vertexCount == 0 || !verts) return;
 
 	uint32_t texAddr = priv->state[13].i;
@@ -1400,6 +1470,8 @@ static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate
 	uint32_t texClut = texEntry ? texEntry->bound_clut : 0;
 	uint32_t texPixels = texW * texH;
 	bool highAlphaTexture = texEntry && texPixels != 0 && texEntry->diag_alpha_zero > (texPixels / 2);
+	bool mostlyBlackRgbTexture = texEntry && texPixels != 0 &&
+		RaveTextureRgbCoverageIsMostlyBlack(texEntry->diag_rgb_nonzero, texPixels);
 	const char *diagName = "VTexDiag";
 	uint32_t diagSeq = 0;
 	if (sTexDiagCount < 192) {
@@ -1407,6 +1479,9 @@ static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate
 	} else if (highAlphaTexture && sHighAlphaTexDiagCount < 160) {
 		diagSeq = ++sHighAlphaTexDiagCount;
 		diagName = "HighAlphaTexDiag";
+	} else if (mostlyBlackRgbTexture && sBlackRgbTexDiagCount < 512) {
+		diagSeq = ++sBlackRgbTexDiagCount;
+		diagName = "BlackRgbTexDiag";
 	} else {
 		return;
 	}
@@ -1466,12 +1541,32 @@ static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate
 		minInvW = std::min(minInvW, verts[i].uv[2]);
 		maxInvW = std::max(maxInvW, verts[i].uv[2]);
 	}
+	uint32_t glSrc = priv->state[109].i;
+	uint32_t glDst = priv->state[110].i;
+	int blendMode = (int)priv->state[9].i;
+	int alphaFunc = (int)priv->state[31].i;
+	int depthWrite = RaveDrawDepthWriteEnabledForBlendFactors(
+		priv->state[28].i,
+		priv->ati_state[kRaveATIDepthWriteEnableIndex].i,
+		blendMode,
+		glSrc,
+		glDst);
+	int useVertexAlpha = RaveTextureShouldApplyVertexAlphaToOpacityForDraw(
+		(int)texType,
+		blendMode,
+		alphaFunc,
+		0,
+		glSrc,
+		glDst,
+		texEntry ? texEntry->diag_rgb_nonzero : 0,
+		texPixels);
 
 	RaveDiagLog("%s[%u] %s frame=%u mode=%u verts=%u prims=%u tex=0x%08x h=%u "
 	            "size=%ux%u fmt=%u clut=%u x=[%.1f,%.1f] y=[%.1f,%.1f] z=[%.3f,%.3f] "
 	            "uv=[%.4f,%.4f]x[%.4f,%.4f] invW=[%.6f,%.6f] a=[%.2f,%.2f] "
 	            "rgb=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] kd=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] "
 	            "ks=[%.2f-%.2f,%.2f-%.2f,%.2f-%.2f] texOp=%u filt=%u blend=%u zfunc=%u zmask=%u atizwrite=%u "
+	            "gl=%x/%x dwrite=%d vtxAlpha=%d texRgb=%u/%u alpha0=%u idx0=%u "
 	            "chan=0x%x alpha=%u/%.3f fog=%d atiFog=%d fogRange=[%.3f,%.3f] fogDensity=%.6f multi=%u/%u",
 	            diagName, diagSeq, source, priv->frameCount, vertexMode, vertexCount, primitiveCount,
 	            texAddr, texHandle, texW, texH, texType, texClut,
@@ -1482,7 +1577,12 @@ static void RaveLogTexturedDiagnostics(const char *source, const RaveDrawPrivate
 	            minKsR, maxKsR, minKsG, maxKsG, minKsB, maxKsB,
 	            priv->state[12].i, priv->state[11].i, priv->state[9].i,
 	            priv->state[0].i, priv->state[28].i,
-	            priv->ati_state[kRaveATIDepthWriteEnableIndex].i, priv->state[27].i,
+	            priv->ati_state[kRaveATIDepthWriteEnableIndex].i,
+	            glSrc, glDst, depthWrite, useVertexAlpha,
+	            texEntry ? texEntry->diag_rgb_nonzero : 0, texPixels,
+	            texEntry ? texEntry->diag_alpha_zero : 0,
+	            texEntry ? texEntry->diag_index_zero : 0,
+	            priv->state[27].i,
 	            priv->state[31].i, priv->state[46].f,
 	            RaveEffectiveFogMode(priv), priv->ati_fog_active ? 1 : 0,
 	            priv->ati_fog_active ? priv->ati_state[8].f : priv->state[22].f,
@@ -1544,6 +1644,8 @@ static void BufferZSortTriangle(RaveDrawPrivate *priv, const RaveVertex *v0, con
 	tri->textureMacAddr = priv->state[13].i;  // kQATag_Texture
 	tri->textureOp = (int32_t)priv->state[12].i;
 	tri->blendMode = (int32_t)priv->state[9].i;
+	tri->glBlendSrc = (uint32_t)priv->state[109].i;
+	tri->glBlendDst = (uint32_t)priv->state[110].i;
 	tri->filterMode = (int32_t)priv->state[11].i;
 }
 
@@ -1565,8 +1667,8 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 	RaveFillFogUniforms(priv, &fragUniforms);
 	fragUniforms.alpha_test_func = (int32_t)priv->state[31].i;
 	fragUniforms.alpha_test_ref = priv->state[46].f;
-	fragUniforms.mipmap_bias = priv->state[41].f;
-	fragUniforms.multi_texture_mipmap_bias = priv->state[42].f;
+	fragUniforms.mipmap_bias = RaveMetalSamplerMipBias(priv->state[41].f);
+	fragUniforms.multi_texture_mipmap_bias = RaveMetalSamplerMipBias(priv->state[42].f);
 	fragUniforms.env_color_r = priv->state[151].f;
 	fragUniforms.env_color_g = priv->state[152].f;
 	fragUniforms.env_color_b = priv->state[153].f;
@@ -1593,9 +1695,16 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 
 	// State of the current batch (from the first triangle)
 	int      curPipeIdx = -1;
+	bool     curUsesGLPipeline = false;
+	uint32_t curGlBlendSrc = 0;
+	uint32_t curGlBlendDst = 0;
 	uint32_t curTexAddr = 0;
 	int32_t  curTexOp   = 0;
 	int      curFilter  = 0;
+	int      curBlendMode = 0;
+	uint32_t curTexPixelType = 0;
+	uint32_t curTexRgbNonzero = 0;
+	uint32_t curTexTotalPixels = 0;
 	bool     curTextured = false;
 
 	auto flushBatch = [&]() {
@@ -1605,6 +1714,15 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 
 		// Set fragment uniforms with the current batch's textureOp
 		fragUniforms.texture_op = curTextured ? curTexOp : 0;
+		fragUniforms.use_vertex_alpha_for_texture_opacity =
+			curTextured ? RaveTextureShouldApplyVertexAlphaToOpacityForDraw((int)curTexPixelType,
+			                                                                curBlendMode,
+			                                                                fragUniforms.alpha_test_func,
+			                                                                0,
+			                                                                curGlBlendSrc,
+			                                                                curGlBlendDst,
+			                                                                curTexRgbNonzero,
+			                                                                curTexTotalPixels) : 0;
 		[ms->currentEncoder setFragmentBytes:&fragUniforms length:sizeof(fragUniforms) atIndex:0];
 
 		if (dataSize > 4096) {
@@ -1630,13 +1748,18 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 
 		int blend_mode = tri->blendMode;
 		if (blend_mode < 0 || blend_mode > 2) blend_mode = 0;
-		int pipe_idx = blend_mode * 16;
-		if (tri->textured) pipe_idx |= 1;
-		if (hasFog) pipe_idx |= 2;
-		if (hasAlphaTest) pipe_idx |= 4;
+		int func_const_bits = 0;
+		if (tri->textured) func_const_bits |= 1;
+		if (hasFog) func_const_bits |= 2;
+		if (hasAlphaTest) func_const_bits |= 4;
+		bool usesGLPipeline = RaveBlendModeUsesGLPipeline(blend_mode) != 0;
+		int pipe_idx = (usesGLPipeline ? 0 : blend_mode) * 16 + func_const_bits;
 
 		// Check if this triangle can join the current batch
 		bool stateChanged = (pipe_idx != curPipeIdx ||
+		                     usesGLPipeline != curUsesGLPipeline ||
+		                     (usesGLPipeline &&
+		                      (tri->glBlendSrc != curGlBlendSrc || tri->glBlendDst != curGlBlendDst)) ||
 		                     tri->textured != curTextured ||
 		                     tri->textureMacAddr != curTexAddr ||
 		                     tri->textureOp != curTexOp ||
@@ -1648,30 +1771,54 @@ static void FlushZSortBuffer(RaveDrawPrivate *priv)
 
 			// Set new GPU state
 			curPipeIdx = pipe_idx;
+			curUsesGLPipeline = usesGLPipeline;
+			curGlBlendSrc = tri->glBlendSrc;
+			curGlBlendDst = tri->glBlendDst;
 			curTextured = tri->textured;
 			curTexAddr = tri->textureMacAddr;
 			curTexOp = tri->textureOp;
 			curFilter = tri->filterMode;
+			curBlendMode = blend_mode;
+			curTexPixelType = 0;
+			curTexRgbNonzero = 0;
+			curTexTotalPixels = 0;
+			const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 
-			// Apply channel mask in z-sort flush path (same as ApplyDirtyState)
-			uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask
-			if (channelMask != 0xF && channelMask != 0) {
-				id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
-				if (maskedPipe)
-					[ms->currentEncoder setRenderPipelineState:maskedPipe];
+			if (usesGLPipeline) {
+				id<MTLRenderPipelineState> glPipe = GetGLBlendPipeline(
+					ms, func_const_bits, tri->glBlendSrc, tri->glBlendDst,
+					ms->msaaActive, hasDepthAttachment);
+				if (glPipe)
+					[ms->currentEncoder setRenderPipelineState:glPipe];
 			} else {
-				id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
-				if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx])
-					[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+				// Apply channel mask in z-sort flush path (same as ApplyDirtyState)
+				uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask
+				if (channelMask != 0xF && channelMask != 0) {
+					id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(
+						ms, pipe_idx, channelMask, ms->msaaActive, hasDepthAttachment);
+					if (maskedPipe)
+						[ms->currentEncoder setRenderPipelineState:maskedPipe];
+				} else {
+					id<MTLRenderPipelineState> __strong *pipeArray = ms->msaaActive ? ms->msaaPipelines : ms->pipelines;
+					if (pipe_idx >= 0 && pipe_idx < 48 && pipeArray[pipe_idx])
+						[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
+				}
 			}
+			RaveSetDepthStencilStateForDraw(priv, blend_mode, tri->glBlendSrc, tri->glBlendDst);
 
 			if (tri->textured && tri->textureMacAddr != 0) {
 				uint32_t tex_handle = RaveResourceFindByAddr(tri->textureMacAddr);
 				RaveResourceEntry *tex_entry = RaveResourceGet(tex_handle);
 				if (tex_entry) {
+					curTexPixelType = tex_entry->pixel_type;
+					curTexTotalPixels = tex_entry->width * tex_entry->height;
 					if (!tex_entry->metal_texture && tex_entry->pixmap_mac_addr != 0) {
 						RaveRealizeDeferredTexture(tex_entry);
 					}
+					else if (RaveTextureNeedsLivePixmapRefresh(tex_entry)) {
+						RaveRefreshTextureFromPixmap(tex_entry);
+					}
+					curTexRgbNonzero = tex_entry->diag_rgb_nonzero;
 					if (tex_entry->metal_texture) {
 						id<MTLTexture> mtlTex = (__bridge id<MTLTexture>)tex_entry->metal_texture;
 						[ms->currentEncoder setFragmentTexture:mtlTex atIndex:0];
@@ -2653,8 +2800,10 @@ int32 NativeDrawBitmap(uint32 drawContextAddr, uint32 vertexAddr, uint32 bitmapM
 
 	// Apply channel mask in bitmap draw path (same as ApplyDirtyState)
 	uint32_t channelMask = priv->state[27].i;  // kQATag_ChannelMask
+	const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 	if (channelMask != 0xF && channelMask != 0) {
-		id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
+		id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(
+			ms, pipe_idx, channelMask, ms->msaaActive, hasDepthAttachment);
 		if (maskedPipe)
 			[ms->currentEncoder setRenderPipelineState:maskedPipe];
 	} else {
@@ -2665,7 +2814,7 @@ int32 NativeDrawBitmap(uint32 drawContextAddr, uint32 vertexAddr, uint32 bitmapM
 	}
 
 	// Disable depth test for bitmap (ZFunction_Always = 7, no depth writes)
-	if (ms->depthStatesNoWrite[7]) {
+	if (hasDepthAttachment && ms->depthStatesNoWrite[7]) {
 		[ms->currentEncoder setDepthStencilState:ms->depthStatesNoWrite[7]];
 	}
 
@@ -2682,6 +2831,7 @@ int32 NativeDrawBitmap(uint32 drawContextAddr, uint32 vertexAddr, uint32 bitmapM
 	FragmentUniforms fragUniforms = {};
 	fragUniforms.texture_op = 0;
 	fragUniforms.fog_max_depth = 1.0f;
+	fragUniforms.use_vertex_alpha_for_texture_opacity = 1;
 	[ms->currentEncoder setFragmentBytes:&fragUniforms length:sizeof(fragUniforms) atIndex:0];
 
 	[ms->currentEncoder setVertexBytes:verts length:sizeof(verts) atIndex:0];
@@ -3379,18 +3529,8 @@ int32 NativeRenderStart(uint32 drawContextAddr, uint32 dirtyRectAddr, uint32 ini
 	if (vertUniforms.point_width < 1.0f) vertUniforms.point_width = 1.0f;
 	[ms->currentEncoder setVertexBytes:&vertUniforms length:sizeof(vertUniforms) atIndex:2];
 
-	// Set default depth stencil state based on ZFunction tag (state[0]) and ZBufferMask (state[28])
-	{
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc]) {
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-			}
-		}
-	}
+	// Set default depth stencil state for the current draw state.
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 
 	ms->renderPassActive = true;
 	ms->currentPipelineIdx = -1;  // Force pipeline selection on first draw
@@ -3532,9 +3672,10 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 			for (uint32_t handle = 1; handle <= RAVE_MAX_RESOURCES; handle++) {
 				RaveResourceEntry *entry = RaveResourceGet(handle);
 				if (!entry || entry->type != kRaveResourceTexture || entry->diag_alpha_zero == 0) continue;
-				RaveDiagLog("TexFrameTransparent frame=%u h=%u mac=0x%08x size=%ux%u alpha0=%u idx0=%u draws=%u",
+				RaveDiagLog("TexFrameTransparent frame=%u h=%u mac=0x%08x size=%ux%u alpha0=%u idx0=%u rgb=%u draws=%u",
 				            priv->frameCount, handle, entry->mac_addr, entry->width, entry->height,
 				            entry->diag_alpha_zero, entry->diag_index_zero,
+				            entry->diag_rgb_nonzero,
 				            ms->textureDrawCounts[handle]);
 			}
 		}
@@ -3555,8 +3696,8 @@ int32 NativeRenderEnd(uint32 drawContextAddr, uint32 modifiedRectAddr)
 	// Emit a CompositeLayer for the just-rendered overlay via
 	// MetalCompositorSubmitFrame. The
 	// compositor sees this as a single kLayerSlotOverlay layer with
-	// premultiplied-alpha blend (RAVE always blends — see BuildPipelines
-	// audit comment ~line 575) over whatever the framebuffer currently
+	// premultiplied-alpha blend (RAVE always blends; see BuildPipelines)
+	// over whatever the framebuffer currently
 	// shows. dmc_set_active_owner already declared RAVE in
 	// RaveCreateMetalOverlay; the idempotent fast-path handles the
 	// per-frame re-declaration.
@@ -3920,18 +4061,8 @@ int32 NativeFlush(uint32 drawContextAddr)
 	// Force pipeline re-bind on next draw after flush
 	ms->currentPipelineIdx = -1;
 
-	// Restore depth stencil state (respecting ZBufferMask)
-	{
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc]) {
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-			}
-		}
-	}
+	// Restore depth stencil state for the current draw state.
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 
 	RAVE_LOG("Flush: ctx=0x%08x mid-frame commit, new encoder started", drawContextAddr);
 
@@ -4040,16 +4171,7 @@ static int32_t RestartRenderPassWithLoad(RaveDrawPrivate *priv)
 	if (vertUniforms.point_width < 1.0f) vertUniforms.point_width = 1.0f;
 	[ms->currentEncoder setVertexBytes:&vertUniforms length:sizeof(vertUniforms) atIndex:2];
 	ms->currentPipelineIdx = -1;
-	{
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc])
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-		}
-	}
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 	return kQANoErr;
 }
 
@@ -4253,10 +4375,12 @@ int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint3
 	int pipe_idx = 0;
 	// Apply channel mask from state[27] (kQATag_ChannelMask, default 0xF = all)
 	uint32_t channelMask = priv->state[27].i;
+	const bool hasDepthAttachment = RaveContextUsesMetalDepthAttachment(priv->flags) != 0;
 	if (channelMask == 0) channelMask = 0xF;  // treat 0 as default (all channels)
 	if (channelMask != 0xF) {
 		// Use masked pipeline variant to respect per-channel write control
-		id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(ms, pipe_idx, channelMask, ms->msaaActive);
+		id<MTLRenderPipelineState> maskedPipe = GetMaskedPipeline(
+			ms, pipe_idx, channelMask, ms->msaaActive, hasDepthAttachment);
 		if (maskedPipe)
 			[ms->currentEncoder setRenderPipelineState:maskedPipe];
 	} else {
@@ -4264,7 +4388,7 @@ int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint3
 		if (pipeArray[pipe_idx])
 			[ms->currentEncoder setRenderPipelineState:pipeArray[pipe_idx]];
 	}
-	if (ms->depthAlwaysWriteState)
+	if (hasDepthAttachment && ms->depthAlwaysWriteState)
 		[ms->currentEncoder setDepthStencilState:ms->depthAlwaysWriteState];
 	float x0 = 0.0f, y0 = 0.0f;
 	float x1 = (float)priv->width, y1 = (float)priv->height;
@@ -4287,16 +4411,7 @@ int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint3
 	fullScissor.height = (NSUInteger)priv->height;
 	[ms->currentEncoder setScissorRect:fullScissor];
 	ms->currentPipelineIdx = -1;
-	{
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc])
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-		}
-	}
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 	RAVE_LOG("ClearDrawBuffer: ctx=0x%08x rect=(%d,%d,%d,%d) initialCtx=0x%08x bg=(%.2f,%.2f,%.2f,%.2f) mask=0x%x",
 	         drawContextAddr, left, top, right, bottom, initialContextAddr, r, g, b, a, channelMask);
 	return kQANoErr;
@@ -4309,6 +4424,10 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 	if (!priv || !priv->metal) return kQAError;
 	RaveMetalState *ms = priv->metal;
 	if (!ms->renderPassActive || !ms->currentEncoder) return kQAError;
+	if (!RaveContextUsesMetalDepthAttachment(priv->flags)) {
+		RAVE_LOG("ClearZBuffer: skipped (no z-buffer context)");
+		return kQANoErr;
+	}
 
 	// Disabled depth writes skip depth clear per kQAZBufferMask_Disable and ATI tag 1022.
 	// Test: RAVERenderingStateTests.testZBufferMask_skipClear
@@ -4379,16 +4498,7 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 	fullScissor.height = (NSUInteger)priv->height;
 	[ms->currentEncoder setScissorRect:fullScissor];
 	ms->currentPipelineIdx = -1;
-	{
-		int zfunc = (int)priv->state[0].i;
-		if (zfunc >= 0 && zfunc < 9) {
-			bool depthWriteEnabled = RaveEffectiveDepthWriteEnabled(
-				priv->state[28].i, priv->ati_state[kRaveATIDepthWriteEnableIndex].i);
-			__strong id<MTLDepthStencilState> *dsArray = depthWriteEnabled ? ms->depthStates : ms->depthStatesNoWrite;
-			if (dsArray[zfunc])
-				[ms->currentEncoder setDepthStencilState:dsArray[zfunc]];
-		}
-	}
+	RaveSetDepthStencilStateForCurrentDraw(priv);
 	RAVE_LOG("ClearZBuffer: ctx=0x%08x rect=(%d,%d,%d,%d) initialCtx=0x%08x depth=%.4f",
 	         drawContextAddr, left, top, right, bottom, initialContextAddr, clearDepth);
 	return kQANoErr;
@@ -4529,6 +4639,9 @@ void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry)
 	// the texture has received real data.
 	RaveBGRAImageStats sourceStats = RaveBGRAImageAnalyze(expanded, w * h);
 	bool hasData = (sourceStats.nonzero != 0);
+	entry->diag_alpha_zero = (w * h) - sourceStats.alpha;
+	entry->diag_index_zero = 0;
+	entry->diag_rgb_nonzero = sourceStats.rgb;
 
 	// Replace Metal texture contents
 	id<MTLTexture> mtlTex = (__bridge id<MTLTexture>)entry->metal_texture;

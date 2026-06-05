@@ -1,5 +1,7 @@
 /*
  *  dsp_front_staging_present_policy.h - front-staging change detection.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_FRONT_STAGING_PRESENT_POLICY_H

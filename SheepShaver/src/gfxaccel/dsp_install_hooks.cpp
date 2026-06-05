@@ -22,6 +22,7 @@
 #include "cpu_emulation.h"
 #include "macos_util.h"          // FindLibSymbol
 #include "dsp_engine.h"          // kDSp* enum + DSP_LOG
+#include "dsp_fragment_name_policy.h"
 #include "accel_logging.h"       // ACCEL_LOGGING_ENABLED gate
 
 #ifdef TESTING_BUILD
@@ -45,21 +46,6 @@ static bool dsp_hooks_installed = false;
 static bool dsp_hooks_in_progress = false;
 static int  dsp_hooks_attempts = 0;
 static const int DSP_HOOKS_MAX_ATTEMPTS = 3;
-
-/*
- *  DrawSprocketLib CFM fragment name candidates. The PEF container at
- *  resources/DrawSprocketLib does NOT embed its own fragment name (CFM format
- *  invariant — names live in cfrg resources, not PEF bytes). Probe the
- *  canonical candidate list in order; first non-zero FindLibSymbol wins.
- *  Mirrors rave_engine.cpp precedent.
- */
-static const char *dsp_lib_candidates[] = {
-	"\017DrawSprocketLib",      /* 15 chars — canonical per DSp 1.7 SDK */
-	"\022DrawSprocket 1.7.0",   /* 18 chars — with space + 3-component version */
-	"\020DrawSprocket 1.7",     /* 16 chars — with space + 2-component version */
-	"\014DrawSprocket",         /* 12 chars — bare name fallback */
-};
-static const int dsp_lib_candidate_count = sizeof(dsp_lib_candidates) / sizeof(dsp_lib_candidates[0]);
 
 /*
  *  Symbol-to-sub-opcode mapping table.
@@ -255,17 +241,17 @@ static int dsp_install_patch_one(uint32_t orig_tvect, uint32_t hook_tvect, const
  *  accRun's periodic tick invokes VideoInstallAccel; the retry-guard triplet
  *  ensures this function is idempotent + cheap on subsequent invocations.
  *
- *  Two-phase resolve-all-then-patch-all:
- *  phase 1 calls FindLibSymbol for every row (separate from WriteMacInt32)
- *  so CFM-loader re-entrancy cannot corrupt mid-patch state; phase 2 then
+ *  Two-step resolve-all-then-patch-all:
+ *  Step 1 calls FindLibSymbol for every row (separate from WriteMacInt32)
+ *  so CFM-loader re-entrancy cannot corrupt mid-patch state; step 2 then
  *  walks the cached tvect vector and does the 4-instruction overwrite.
  *
  *  Install-commit threshold: `patched_count == num_dsp_symbols` (rather than
  *  `patched_count > 0`) so partial-success runs (e.g. 20/25)
  *  do NOT lock `dsp_hooks_installed = true` after attempt #1. Later attempts
- *  fire and emit their own audit blocks, distinguishing a variant that
+ *  fire and emit their own diagnostic blocks, distinguishing a variant that
  *  doesn't export some symbols from late CFM binding (symbols
- *  resolve on later attempts). The audit-begin log line is tagged with the
+ *  resolve on later attempts). The diagnostic-begin log line is tagged with the
  *  attempt number so attempts are distinguishable in the captured log.
  *  After DSP_HOOKS_MAX_ATTEMPTS with partial success, a FINAL PARTIAL
  *  COMMIT fires (avoid permanent install-spin) — installed=true with a
@@ -286,19 +272,19 @@ void DSpInstallHooks(void)
 	        "(ATTEMPT %d / %d)",
 	        attempt_number, DSP_HOOKS_MAX_ATTEMPTS);
 
-	// ---- Pick library name (candidate list per Open Q1) ----
+	// ---- Pick library name from known candidates ----
 	// Probe each candidate with a single lightweight FindLibSymbol against the
 	// first symbol in our table; first non-zero return wins and is reused for
 	// the full resolve sweep below.
 	const char *dsp_lib = NULL;
 	uint32_t probe_tvect = 0;
-	for (int c = 0; c < dsp_lib_candidate_count; c++) {
+	for (int c = 0; c < DSpFragmentCandidateCount(); c++) {
+		const char *candidate = DSpFragmentCandidateAt(c);
 		DSP_LOG("DSpInstallHooks: trying library \"%s\" (%d chars)",
-		        dsp_lib_candidates[c] + 1,
-		        (int)((unsigned char)dsp_lib_candidates[c][0]));
-		probe_tvect = FindLibSymbol(dsp_lib_candidates[c], dsp_install_symbols[0].pascal_sym);
+		        candidate + 1, (int)((unsigned char)candidate[0]));
+		probe_tvect = FindLibSymbol(candidate, dsp_install_symbols[0].pascal_sym);
 		if (probe_tvect != 0) {
-			dsp_lib = dsp_lib_candidates[c];
+			dsp_lib = candidate;
 			DSP_LOG("DSpInstallHooks: found library \"%s\" (probe TVECT for %s = 0x%08x)",
 			        dsp_lib + 1, dsp_install_symbols[0].name, probe_tvect);
 			break;
@@ -322,18 +308,18 @@ void DSpInstallHooks(void)
 
 	// ---- First pass: resolve all symbols (CFM re-entrancy mitigation) ----
 	//
-	// Per-row audit log. Emits three data
+	// Per-row diagnostic log. Emits three data
 	// points per dsp_install_symbols[] entry — pascal_len_octal,
 	// strlen(pascal_sym+1), strlen(name) — cross-referenced against
 	// FindLibSymbol. Surfaces the true root cause of any resolve shortfall
 	// without guessing.
 	//
-	// The audit fires every install attempt (bounded to
+	// The diagnostic fires every install attempt (bounded to
 	// DSP_HOOKS_MAX_ATTEMPTS by the retry-guard triplet).
-	// The audit-begin log line carries the attempt number
-	// so per-attempt audit blocks are distinguishable in the captured log.
+	// The diagnostic-begin log line carries the attempt number
+	// so per-attempt diagnostic blocks are distinguishable in the captured log.
 	if (dsp_lib != NULL) {
-		DSP_LOG("DSpInstallHooks: unresolved-symbol-audit begin — ATTEMPT %d / %d "
+		DSP_LOG("DSpInstallHooks: unresolved-symbol-diagnostic begin — ATTEMPT %d / %d "
 		        "(candidate lib = \"%s\")",
 		        attempt_number, DSP_HOOKS_MAX_ATTEMPTS, dsp_lib + 1);
 		int length_mismatches = 0;
@@ -347,7 +333,7 @@ void DSpInstallHooks(void)
 			if (!length_match) length_mismatches++;
 
 			uint32_t tvect = FindLibSymbol(dsp_lib, psym);
-			DSP_LOG("[audit] %-32s pascal_len=%d strlen(ascii)=%d "
+			DSP_LOG("[diagnostic] %-32s pascal_len=%d strlen(ascii)=%d "
 			        "strlen(name)=%d match=%s FindLibSymbol=0x%08x",
 			        dsp_install_symbols[i].name, pascal_len_octal,
 			        ascii_len, name_len,
@@ -361,7 +347,7 @@ void DSpInstallHooks(void)
 				not_found_count++;
 			}
 		}
-		DSP_LOG("DSpInstallHooks: unresolved-symbol-audit end — ATTEMPT %d / %d "
+		DSP_LOG("DSpInstallHooks: unresolved-symbol-diagnostic end — ATTEMPT %d / %d "
 		        "(%d / %d resolved; %d length mismatches)",
 		        attempt_number, DSP_HOOKS_MAX_ATTEMPTS,
 		        found_count, num_dsp_symbols, length_mismatches);
@@ -392,7 +378,7 @@ void DSpInstallHooks(void)
 	//
 	//   (c) FINAL PARTIAL COMMIT, attempts exhausted (attempts+1 == MAX) AND
 	//       patched_count > 0:
-	//       → installed = true (avoid permanent install-spin / per-tick audit
+	//       → installed = true (avoid permanent install-spin / per-tick diagnostic
 	//         flood). Log loudly. This is the steady-state if some missing
 	//         symbols genuinely don't exist in this variant's CFM container.
 	//
@@ -414,11 +400,11 @@ void DSpInstallHooks(void)
 		dsp_hooks_attempts++;
 		if (dsp_hooks_attempts >= DSP_HOOKS_MAX_ATTEMPTS) {
 			// (c) Final partial commit — attempts exhausted but we did
-			// patch something. Stop retrying to avoid per-tick audit-log
-			// flood; document the unresolved gap loudly.
+			// patch something. Stop retrying to avoid per-tick diagnostic
+			// flood; report the unresolved symbol set loudly.
 			dsp_hooks_installed = true;
 			DSP_LOG("DSpInstallHooks: FINAL PARTIAL COMMIT after %d attempts — "
-			        "%d / %d symbols patched; %d symbols unresolved (see audit). "
+			        "%d / %d symbols patched; %d symbols unresolved (see diagnostics). "
 			        "Committing installed=true to avoid install-spin.",
 			        dsp_hooks_attempts, patched_count, num_dsp_symbols,
 			        num_dsp_symbols - patched_count);

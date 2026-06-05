@@ -21,6 +21,7 @@
 #include "nqd_accel.h"
 #include "accel_logging.h"
 #include "dsp_pixmap_offsets.h"
+#include "gl_offscreen_policy.h"
 #include "nqd_main_device_policy.h"
 #include "nqd_packed_fill_policy.h"
 #include "metal_device_shared.h"
@@ -31,7 +32,7 @@
 // ---------------------------------------------------------------------------
 
 #if ACCEL_LOGGING_ENABLED
-bool nqd_logging_enabled = true;
+bool nqd_logging_enabled = false;
 
 #define NQD_LOG(fmt, ...) \
     do { if (nqd_logging_enabled) printf("[NQD Metal] " fmt "\n", ##__VA_ARGS__); } while (0)
@@ -90,6 +91,14 @@ bool nqd_logging_enabled = true;
 // ---------------------------------------------------------------------------
 
 extern "C" int s_nqd_fb_drop_count;  /* owned by gfxaccel_resources.mm */
+extern "C" uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentDirtyRect(
+    uint32_t dstBaseaddr,
+    uint32_t dstRowbytes,
+    uint32_t dstDepthBits,
+    int32_t dirtyX,
+    int32_t dirtyY,
+    int32_t dirtyWidth,
+    int32_t dirtyHeight);
 
 // ---------------------------------------------------------------------------
 // Metal state (file-static)
@@ -534,6 +543,55 @@ static inline uint32_t nqd_effective_main_device_pixel_size(NQDMainDevicePixMapS
                                            pixel_size);
 }
 
+static inline bool nqd_should_bridge_gl_offscreen_after_bitblt(
+    NQDMainDevicePixMapSnapshot main_device,
+    uint32_t src_base,
+    int32_t src_row_bytes,
+    uint32_t src_pixel_size,
+    uint32_t dest_base,
+    int32_t dest_row_bytes,
+    uint32_t dest_pixel_size,
+    uint32_t transfer_mode)
+{
+    return GLShouldBridgeOffscreenAfterNQDFrontBlt(
+        main_device.valid,
+        main_device.baseAddr,
+        (int32_t)main_device.rowBytes,
+        src_base,
+        src_row_bytes,
+        src_pixel_size,
+        dest_base,
+        dest_row_bytes,
+        dest_pixel_size,
+        transfer_mode);
+}
+
+static inline void nqd_bridge_gl_offscreen_after_bitblt(uint32_t dest_base,
+                                                        int32_t dest_row_bytes,
+                                                        uint32_t dest_pixel_size,
+                                                        int16_t dest_X,
+                                                        int16_t dest_Y,
+                                                        int16_t width,
+                                                        int16_t height)
+{
+    if (dest_row_bytes <= 0) return;
+
+    const uint64_t gl_composited =
+        GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentDirtyRect(
+            dest_base,
+            (uint32_t)dest_row_bytes,
+            dest_pixel_size,
+            dest_X,
+            dest_Y,
+            width,
+            height);
+    if (gl_composited != 0) {
+        NQD_LOG("NQDMetalBitblt: composited %llu GL offscreen pixels "
+                "after world blit into 0x%08x",
+                (unsigned long long)gl_composited, dest_base);
+    }
+}
+
 static inline uint32_t nqd_read_blend_weight()
 {
     // OpColor at Mac low-memory 0x0DA0 is actually HiliteRGB.
@@ -548,11 +606,11 @@ static inline uint32_t nqd_read_blend_weight()
 // which Color QuickDraw stores per-channel as an RGBColor in the port's
 // GrafVars handle (Imaging With QuickDraw 4-40 / 4-62 / 4-78 / 4-110). The
 // legacy nqd_read_blend_weight() reads ONE big-endian uint16 from the
-// non-canonical lowmem 0x0A28 scalar and applies it to all three channels —
-// the audit-confirmed structural defect. This helper reads the per-channel
+// non-canonical lowmem 0x0A28 scalar and applies it to all three channels.
+// This helper reads the per-channel
 // R/G/B rgbOpColor from the canonical source.
 //
-// SECURITY (threat T-22.7-01, ASVS-V5): the GrafVars pointer chain is
+// SECURITY: the GrafVars pointer chain is
 // guest-controlled (an emulated app sets thePort and the GrafVars Handle to
 // arbitrary values). EVERY ReadMacInt* in the walk is preceded by an
 // NQD_INRANGE OOB gate so a garbage pointer cannot trigger a host OOB read.
@@ -1813,6 +1871,16 @@ void NQDMetalBitblt(uint32 p)
         }
     }
 
+    const bool bridge_gl_after_bitblt =
+        nqd_should_bridge_gl_offscreen_after_bitblt(main_device,
+                                                    src_base,
+                                                    src_row_bytes,
+                                                    src_pixel_size,
+                                                    dest_base,
+                                                    dest_row_bytes,
+                                                    dest_pixel_size,
+                                                    transfer_mode);
+
     // -----------------------------------------------------------------------
     // CPU fast path for small operations and simple modes
     //
@@ -1840,6 +1908,15 @@ void NQDMetalBitblt(uint32 p)
             memmove(dst_start, src_start, width_bytes);
             src_start -= abs_src_rb;
             dst_start -= abs_dst_rb;
+        }
+        if (bridge_gl_after_bitblt) {
+            nqd_bridge_gl_offscreen_after_bitblt(dest_base,
+                                                 dest_row_bytes,
+                                                 dest_pixel_size,
+                                                 dest_X,
+                                                 dest_Y,
+                                                 width,
+                                                 height);
         }
         return;
     }
@@ -1876,6 +1953,15 @@ void NQDMetalBitblt(uint32 p)
                 src_ptr += src_row_bytes;
                 dst_ptr += dest_row_bytes;
             }
+        }
+        if (bridge_gl_after_bitblt) {
+            nqd_bridge_gl_offscreen_after_bitblt(dest_base,
+                                                 dest_row_bytes,
+                                                 dest_pixel_size,
+                                                 dest_X,
+                                                 dest_Y,
+                                                 width,
+                                                 height);
         }
         return;
     }
@@ -1944,6 +2030,16 @@ void NQDMetalBitblt(uint32 p)
     [encoder dispatchThreads:grid threadsPerThreadgroup:group];
 
     nqd_batch_did_dispatch();
+    if (bridge_gl_after_bitblt) {
+        NQDMetalFlush();
+        nqd_bridge_gl_offscreen_after_bitblt(dest_base,
+                                             dest_row_bytes,
+                                             dest_pixel_size,
+                                             dest_X,
+                                             dest_Y,
+                                             width,
+                                             height);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,7 +2049,7 @@ void NQDMetalBitblt(uint32 p)
 // copy (srcRect == dstRect, no scaling). It REUSES the proven nqd_bitblt kernel
 // (UNCHANGED) by filling NQDBitbltUniforms directly from the DSp blit handler's
 // resolved geometry + a CGrafPtr->RAM-offset shim (the same Mac2HostAddr-
-// relative subtraction NQDMetalBitblt uses — Pitfall 4). transfer_mode is
+// relative subtraction NQDMetalBitblt uses). transfer_mode is
 // srcCopy (0) by default, or transparent (36) when SrcKey is set (the existing
 // kernel's mode-36 "skip if src == back_pen" branch with back_pen = src_key).
 // Encodes into the EXISTING NQD batch on the single shared MTLCommandQueue.
@@ -1996,7 +2092,7 @@ bool NQDMetalBitblt1to1(uint32 src_base, int32 src_row_bytes,
     if (dst_span > nqd_ram_size || dst_off > nqd_ram_size - dst_span) return false;
 
     NQDBitbltUniforms uniforms;
-    uniforms.src_offset     = (uint32_t)(src_ptr - ram_base);   // Mac2HostAddr-relative (Pitfall 4)
+    uniforms.src_offset     = (uint32_t)(src_ptr - ram_base);   // Mac2HostAddr-relative
     uniforms.dst_offset     = (uint32_t)(dst_ptr - ram_base);
     uniforms.src_row_bytes  = src_row_bytes;
     uniforms.dst_row_bytes  = dst_row_bytes;
@@ -2051,7 +2147,7 @@ bool NQDMetalBitblt1to1(uint32 src_base, int32 src_row_bytes,
 // The DSp blit handler reads the DSpBlitInfo,
 // resolves the src/dst CGrafPtr baseAddr to Mac addresses + row bytes + rects,
 // then calls this entry. We compute the Mac2HostAddr-relative byte offset of
-// each rect origin (NEVER a raw (uint32)(uintptr_t) cast — Pitfall 4 >4GiB UB
+// each rect origin (NEVER a raw (uint32)(uintptr_t) cast — arm64 >4GiB UB
 // on the arm64 simulator), fill NQDBitbltScaledUniforms, and encode into the
 // EXISTING NQD batch on the SINGLE shared MTLCommandQueue (no
 // DSp-specific path, no new concurrency primitive). One thread per dst pixel.
@@ -2103,7 +2199,7 @@ bool NQDMetalBitbltScaled(uint32 src_base, int32 src_row_bytes,
     if (dst_span > nqd_ram_size || dst_off > nqd_ram_size - dst_span) return false;
 
     NQDBitbltScaledUniforms uniforms;
-    uniforms.src_offset     = (uint32_t)(src_ptr - ram_base);   // Mac2HostAddr-relative (Pitfall 4)
+    uniforms.src_offset     = (uint32_t)(src_ptr - ram_base);   // Mac2HostAddr-relative
     uniforms.dst_offset     = (uint32_t)(dst_ptr - ram_base);
     uniforms.src_row_bytes  = src_row_bytes;
     uniforms.dst_row_bytes  = dst_row_bytes;

@@ -22,9 +22,9 @@
 #include "gl_engine.h"
 #include "accel_logging.h"
 
-// Logging state -- enabled while GL acceleration is under active debug.
+// Logging state -- disabled by default to reduce production log noise.
 #if ACCEL_LOGGING_ENABLED
-bool gl_logging_enabled = true;
+bool gl_logging_enabled = false;
 #endif
 
 // PPC stack pointer, saved by glue code before dispatch for 9+ arg access
@@ -270,7 +270,7 @@ extern void NativeGLTexCoord2sv(GLContext *ctx, uint32_t mac_ptr);
 extern void NativeGLTexCoord3sv(GLContext *ctx, uint32_t mac_ptr);
 extern void NativeGLTexCoord4sv(GLContext *ctx, uint32_t mac_ptr);
 
-// ---- Plan 08 remaining core GL externs (gl_state.cpp) ----
+// ---- Remaining core GL externs (gl_state.cpp) ----
 extern void NativeGLAccum(GLContext *ctx, uint32_t op, float value);
 extern void NativeGLClearAccum(GLContext *ctx, float r, float g, float b, float a);
 extern void NativeGLClearIndex(GLContext *ctx, float c);

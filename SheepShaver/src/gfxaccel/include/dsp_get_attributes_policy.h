@@ -1,5 +1,7 @@
 /*
  *  dsp_get_attributes_policy.h - DrawSprocket GetAttributes compatibility.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_GET_ATTRIBUTES_POLICY_H

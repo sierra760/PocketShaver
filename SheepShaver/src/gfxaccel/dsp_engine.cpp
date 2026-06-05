@@ -13,8 +13,8 @@
  *      gfxaccel_resources attach/detach handlers on the first call.
  *    - DSpShutdownHandler: refcount-decrement + resource release on the
  *      final matching call; safe when refcount is already 0.
- *    - DSpGetVersionHandler: returns kDSpVersion_1_7_0 (0x01070000) per
- *      DSp 1.7 API docs.
+ *    - DSpGetVersionHandler: returns kDSpVersion_Current for app version
+ *      probes.
  *
  *  Engine-peer registration mirrors RAVE's RaveRegisterResourceHandlers
  *  pattern (rave_engine.cpp): a one-shot
@@ -26,6 +26,9 @@
  */
 
 #include "sysdeps.h"
+#include "cpu_emulation.h"
+#include "macos_util.h"
+#include "thunks.h"
 #include "dsp_engine.h"
 #include "dsp_draw_context.h"
 #include "dsp_mode_enumerate.h"        /* mode cache lifecycle */
@@ -74,12 +77,8 @@ static struct DSpLogInit {
 } dsp_log_init;
 #endif
 
-/*
- *  Diagnostic logging is on by default during development. The ship gate
- *  flips this to false to reduce production log noise, matching the
- *  NQD_LOG / RAVE_LOG / GL_LOG cadence.
- */
-bool dsp_logging_enabled = true;
+/* Diagnostic logging is disabled by default to reduce production log noise. */
+bool dsp_logging_enabled = false;
 #endif /* ACCEL_LOGGING_ENABLED */
 
 /*
@@ -100,6 +99,12 @@ bool dsp_logging_enabled = true;
 static bool     dsp_registered                    = false;
 static uint32_t dsp_startup_refcount              = 0;
 static bool     dsp_resource_handlers_registered  = false;
+static bool     dsp_gestalt_registered            = false;
+static uint32_t dsp_gestalt_callback              = 0;
+static uint32_t dsp_gestalt_old_callback_slot     = 0;
+
+typedef int16 (*DSpNewGestaltProc)(uint32, uint32);
+typedef int16 (*DSpReplaceGestaltProc)(uint32, uint32, uint32);
 
 /*
  *  Main-thread flag-and-drain pending state.
@@ -205,6 +210,88 @@ static void DSpRegisterResourceHandlers(void)
 	DSP_LOG("DSpRegisterResourceHandlers: registered kGfxEngineDSp with gfxaccel_resources");
 }
 
+static uint32_t DSpAllocateGestaltCallback(uint32_t value)
+{
+	/* 28 bytes: 8-byte TVECT header + 5 PPC instructions. */
+	uint32_t base = SheepMem::ReserveProc(28);
+	if (base == 0) return 0;
+	uint32_t code = base + 8;
+
+	WriteMacInt32(base, code);
+	WriteMacInt32(base + 4, 0);
+
+	const uint32_t r3 = 3, r4 = 4, r5 = 5;
+	WriteMacInt32(code + 0, 0x3C000000 | (r5 << 21) |
+	                         ((value >> 16) & 0xFFFF));
+	WriteMacInt32(code + 4, 0x60000000 | (r5 << 21) |
+	                         (r5 << 16) | (value & 0xFFFF));
+	WriteMacInt32(code + 8, 0x90000000 | (r5 << 21) | (r4 << 16));
+	WriteMacInt32(code + 12, 0x38000000 | (r3 << 21));
+	WriteMacInt32(code + 16, 0x4E800020);
+
+	return base;
+}
+
+static bool DSpVersionResultAddressIsWritable(uint32_t addr)
+{
+	if (addr == 0 || (addr & 3u) != 0) return false;
+
+	const uint64_t ram_lo = (uint64_t)(uint32_t)RAMBase;
+	const uint64_t ram_hi = ram_lo + (uint64_t)(uint32_t)RAMSize;
+	const uint64_t write_hi = (uint64_t)addr + 4u;
+	if (RAMSize != 0 && (uint64_t)addr >= ram_lo && write_hi <= ram_hi)
+		return true;
+
+	return write_hi <= 0x3000u;
+}
+
+static void DSpRegisterGestaltVersion(void)
+{
+	if (dsp_gestalt_registered) return;
+
+	const uint32_t new_gestalt_tvect =
+		FindLibSymbol("\014InterfaceLib", "\012NewGestalt");
+	const uint32_t replace_gestalt_tvect =
+		FindLibSymbol("\014InterfaceLib", "\016ReplaceGestalt");
+	if (new_gestalt_tvect == 0 && replace_gestalt_tvect == 0) {
+		return;
+	}
+
+	if (dsp_gestalt_callback == 0) {
+		dsp_gestalt_callback =
+			DSpAllocateGestaltCallback(kDSpVersion_Current);
+	}
+	if (dsp_gestalt_callback == 0) {
+		return;
+	}
+
+	if (new_gestalt_tvect != 0) {
+		const int16 gerr = (int16)CallMacOS2(DSpNewGestaltProc,
+		                                     new_gestalt_tvect,
+		                                     kDSpGestaltSelector,
+		                                     dsp_gestalt_callback);
+		if (gerr == 0) {
+			dsp_gestalt_registered = true;
+			return;
+		}
+	}
+
+	if (replace_gestalt_tvect != 0) {
+		if (dsp_gestalt_old_callback_slot == 0) {
+			dsp_gestalt_old_callback_slot = Mac_sysalloc(4);
+		}
+		if (dsp_gestalt_old_callback_slot == 0) {
+			return;
+		}
+		const int16 rerr = (int16)CallMacOS3(DSpReplaceGestaltProc,
+		                                     replace_gestalt_tvect,
+		                                     kDSpGestaltSelector,
+		                                     dsp_gestalt_callback,
+		                                     dsp_gestalt_old_callback_slot);
+		dsp_gestalt_registered = (rerr == 0);
+	}
+}
+
 /* --- Public lifecycle --- */
 
 bool DSpIsRegistered(void)
@@ -215,6 +302,7 @@ bool DSpIsRegistered(void)
 void DSpInit(void)
 {
 	if (dsp_registered) {
+		DSpRegisterGestaltVersion();
 		DSP_LOG("DSpInit: already initialized, no-op");
 		return;
 	}
@@ -232,6 +320,7 @@ void DSpInit(void)
 	 *  DrawSprocket1.7.pdf p.15).
 	 */
 	dsp_registered = true;
+	DSpRegisterGestaltVersion();
 
 	/* Populate DSp mode cache from VModes[]. Runs
 	 * once per DSpInit (which is idempotent via the dsp_registered
@@ -383,15 +472,16 @@ int32_t DSpShutdownHandler(void)
 	return kDSpNoErr;
 }
 
-uint32_t DSpGetVersionHandler(void)
+uint32_t DSpGetVersionHandler(uint32_t outVersionAddr)
 {
 	/*
-	 *  Gestalt('dspv'): returns DSp 1.7.0.0 =
-	 *  0x01070000 per resources/DrawSprocket1.7.pdf. Literal constant —
-	 *  games probe this value directly; any drift would let apps detect
-	 *  the emulator.
+	 *  Direct DSpGetVersion probes and Gestalt('dspv') share the same
+	 *  app-visible version policy.
 	 */
-	return kDSpVersion_1_7_0;
+	if (DSpVersionResultAddressIsWritable(outVersionAddr)) {
+		WriteMacInt32(outVersionAddr, kDSpVersion_Current);
+	}
+	return kDSpVersion_Current;
 }
 
 /*

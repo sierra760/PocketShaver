@@ -1,5 +1,7 @@
 /*
  *  gl_drawable_owner_policy.h - AGL drawable display-owner restore helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef GL_DRAWABLE_OWNER_POLICY_H

@@ -25,6 +25,7 @@
 #include "rave_device_summary.h"
 #include "rave_engine_enable_policy.h"
 #include "rave_engine_identity.h"
+#include "rave_texture_snapshot_policy.h"
 #include "rave_metal_renderer.h"
 #include "dsp_pixmap_offsets.h"
 #include "gfxaccel_resources.h"
@@ -118,6 +119,31 @@ extern "C" int RaveTesting_IsTestBuild(void)
 // apps that create/destroy contexts every frame (e.g. RAVE Bench) exhaust
 // the 512KB SheepMem region and corrupt PPC memory, causing hangs.
 static std::vector<uint32> rave_ctx_free_list;
+
+static uint8_t rave_last_cl8_color_table_rgb[768];
+static bool rave_last_cl8_color_table_valid = false;
+
+static void RaveRememberCL8ColorTableSnapshot(const uint32_t *clut, uint32_t count)
+{
+	if (clut == nullptr || count != 256)
+		return;
+
+	for (uint32_t i = 0; i < 256; i++) {
+		const uint32_t bgra = clut[i];
+		rave_last_cl8_color_table_rgb[i * 3 + 0] = (uint8_t)((bgra >> 16) & 0xffu);
+		rave_last_cl8_color_table_rgb[i * 3 + 1] = (uint8_t)((bgra >> 8) & 0xffu);
+		rave_last_cl8_color_table_rgb[i * 3 + 2] = (uint8_t)(bgra & 0xffu);
+	}
+	rave_last_cl8_color_table_valid = true;
+}
+
+bool RaveGetLastCL8ColorTableRGBSnapshot(uint8_t outRGB[768])
+{
+	if (!rave_last_cl8_color_table_valid || outRGB == nullptr)
+		return false;
+	memcpy(outRGB, rave_last_cl8_color_table_rgb, sizeof(rave_last_cl8_color_table_rgb));
+	return true;
+}
 
 // kQAPixel_* constants already defined in enum below (line ~155)
 
@@ -1168,28 +1194,68 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 		RAVE_LOG("TextureNew indexed (pixelType=%d) %dx%d mips=%d rowBytes=%d pixmap=0x%08x",
 		       pixelType, w, h, mipLevels, rowBytes, pixmap);
 	} else {
-		// Direct format -- defer Metal texture creation until first draw.
-		// Some textures (QD3D menu backgrounds) start with empty pixmap data
-		// that gets filled later. Others have valid data immediately. Deferred
-		// creation handles both while still honoring normal QATextureNew copy
-		// semantics once non-empty data has been observed.
+		// Direct format. Snapshot immediately when level 0 already contains
+		// converted data; otherwise keep the existing deferred path for clients
+		// that hand RAVE an empty buffer and fill it shortly after TextureNew.
 		entry->pixmap_mac_addr = pixmap;
 		entry->metal_texture = nullptr;
 		entry->pixels_copied = false;
 
-		// For mipmapped textures, cache the TQAImage array (it may be on
-		// the caller's stack and won't survive past this call).
-		if (hasMipmaps && mipLevels > 1) {
-			uint32_t imagesSize = mipLevels * 16;
-			entry->original_pixels = new uint8_t[imagesSize];
-			entry->original_size = imagesSize;
-			for (uint32_t b = 0; b < imagesSize; b++) {
-				entry->original_pixels[b] = ReadMacInt8(imagesAddr + b);
-			}
-		}
+		uint8_t *expanded = new uint8_t[w * h * 4];
+		const bool converted = ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
+		const bool whitenedAlphaMask =
+			(pixelType == kQAPixel_ARGB32) && RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
+		RaveBGRAImageStats sourceStats = converted
+			? RaveBGRAImageAnalyze(expanded, w * h)
+			: RaveBGRAImageStats{0, 0, 0, 0, w * h, w * h, w * h};
+		entry->diag_alpha_zero = (w * h) - sourceStats.alpha;
+		entry->diag_index_zero = 0;
+		entry->diag_rgb_nonzero = sourceStats.rgb;
+		const bool snapshotNow =
+			converted && RaveDirectTextureShouldSnapshotConvertedSource(sourceStats.nonzero);
 
-		RAVE_LOG("TextureNew deferred (pixelType=%d) %dx%d mips=%d pixmap=0x%08x",
-		       pixelType, w, h, mipLevels, pixmap);
+		if (snapshotNow) {
+			entry->metal_texture = RaveCreateMetalTexture(w, h, mipLevels, expanded, w * 4);
+			if (mipLevels > 1 && entry->metal_texture) {
+				uint32_t mw = (w > 1) ? w / 2 : 1;
+				uint32_t mh = (h > 1) ? h / 2 : 1;
+				for (uint32_t level = 1; level < mipLevels; level++) {
+					uint32_t mRowBytes = ReadMacInt32(imagesAddr + level * 16 + 8);
+					uint32_t mPixmap   = ReadMacInt32(imagesAddr + level * 16 + 12);
+					uint8_t *mipData = new uint8_t[mw * mh * 4];
+					ConvertPixels(pixelType, mPixmap, mipData, mw, mh, mRowBytes);
+					if (pixelType == kQAPixel_ARGB32) {
+						RaveBGRAWhitenAlphaOnlyMask(mipData, mw * mh);
+					}
+					RaveUploadMipLevel(entry->metal_texture, level, mw, mh, mipData, mw * 4);
+					delete[] mipData;
+					mw = (mw > 1) ? mw / 2 : 1;
+					mh = (mh > 1) ? mh / 2 : 1;
+				}
+			}
+			entry->pixels_copied = (entry->metal_texture != nullptr);
+			RAVE_LOG("TextureNew direct snapshot (pixelType=%d) %dx%d mips=%d pixmap=0x%08x -> metal=%p nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u alphaMaskWhite=%d",
+			         pixelType, w, h, mipLevels, pixmap, entry->metal_texture,
+			         sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
+			         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb,
+			         whitenedAlphaMask);
+		} else {
+			// For deferred mipmapped textures, cache the TQAImage array (it
+			// may be on the caller's stack and won't survive past this call).
+			if (hasMipmaps && mipLevels > 1) {
+				uint32_t imagesSize = mipLevels * 16;
+				entry->original_pixels = new uint8_t[imagesSize];
+				entry->original_size = imagesSize;
+				for (uint32_t b = 0; b < imagesSize; b++) {
+					entry->original_pixels[b] = ReadMacInt8(imagesAddr + b);
+				}
+			}
+			RAVE_LOG("TextureNew deferred (pixelType=%d) %dx%d mips=%d pixmap=0x%08x empty=%d converted=%d",
+			         pixelType, w, h, mipLevels, pixmap,
+			         RaveDirectTextureShouldSnapshotConvertedSource(sourceStats.nonzero) ? 0 : 1,
+			         converted ? 1 : 0);
+		}
+		delete[] expanded;
 	}
 
 	// Allocate CPU pixel buffer in Mac address space for AccessTexture support.
@@ -1264,6 +1330,9 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 	// real texture data as empty.
 	RaveBGRAImageStats sourceStats = RaveBGRAImageAnalyze(expanded, w * h);
 	bool sourceWasEmpty = (sourceStats.nonzero == 0);
+	entry->diag_alpha_zero = (w * h) - sourceStats.alpha;
+	entry->diag_index_zero = 0;
+	entry->diag_rgb_nonzero = sourceStats.rgb;
 
 	entry->metal_texture = RaveCreateMetalTexture(w, h, mipLevels, expanded, w * 4);
 
@@ -1412,6 +1481,7 @@ static void RaveCreateColorTableData(uint32_t tableType, uint32 pixelDataAddr,
 	entry->clut_data = clut;
 	entry->clut_count = count;
 	entry->transparent_index = (transparentIndex != 0) ? 0 : -1;
+	RaveRememberCL8ColorTableSnapshot(clut, count);
 
 	RAVE_LOG("ColorTableNew tableType=%d count=%d transparentFlag=%d (idx0 %s)",
 	       tableType, count, transparentIndex,
@@ -1474,19 +1544,10 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 		               texEntry->row_bytes, clutEntry->clut_data, clutEntry->clut_count);
 	}
 
-	// [DIAG-T03] Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
-	if (rave_logging_enabled && w > 0 && h > 0) {
-		static uint32_t sClutDumpCount = 0;
-		uint32_t px[4] = {0, 0, 0, 0};
-		uint32_t numPx = w * h;
-		uint32_t alphaZero = 0;
-		uint32_t indexZero = 0;
-		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
-			memcpy(&px[i], &expanded[i * 4], 4);
-		}
-		for (uint32_t i = 0; i < numPx; i++) {
-			if (expanded[i * 4 + 3] == 0) alphaZero++;
-		}
+	uint32_t numPx = w * h;
+	uint32_t indexZero = 0;
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(expanded, numPx);
+	if (numPx > 0) {
 		if (texEntry->pixel_type == kQAPixel_CL8) {
 			for (uint32_t y = 0; y < h; y++) {
 				for (uint32_t x = 0; x < w; x++) {
@@ -1502,14 +1563,24 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 				}
 			}
 		}
-		texEntry->diag_alpha_zero = alphaZero;
+		texEntry->diag_alpha_zero = numPx - stats.alpha;
 		texEntry->diag_index_zero = indexZero;
+		texEntry->diag_rgb_nonzero = stats.rgb;
+	}
+
+	// [DIAG-T03] Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
+	if (rave_logging_enabled && numPx > 0) {
+		static uint32_t sClutDumpCount = 0;
+		uint32_t px[4] = {0, 0, 0, 0};
+		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
+			memcpy(&px[i], &expanded[i * 4], 4);
+		}
 		RaveDiagLog("CLUTExpand fmt=%s(%d) %dx%d clut=%d px[0-3]=%08X %08X %08X %08X alpha0=%u idx0=%u transIdx=%d",
 		            RavePixelFormatName(texEntry->pixel_type), texEntry->pixel_type, w, h,
 		            clutEntry->clut_count, px[0], px[1], px[2], px[3],
-		            alphaZero, indexZero, clutEntry->transparent_index);
+		            texEntry->diag_alpha_zero, indexZero, clutEntry->transparent_index);
 
-		if (alphaZero > 0 && sClutDumpCount < 8) {
+		if (texEntry->diag_alpha_zero > 0 && sClutDumpCount < 8) {
 			sClutDumpCount++;
 			const char *dumpDir = getenv("TMPDIR");
 			if (dumpDir == nullptr || dumpDir[0] == '\0') dumpDir = "/tmp";
@@ -1518,7 +1589,8 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 			char path[192];
 			snprintf(path, sizeof(path),
 			         "%s%srave_clut_%02u_mac%08x_%ux%u_a0%u.ppm",
-			         dumpDir, slash, sClutDumpCount, texEntry->mac_addr, w, h, alphaZero);
+			         dumpDir, slash, sClutDumpCount, texEntry->mac_addr, w, h,
+			         texEntry->diag_alpha_zero);
 			FILE *f = fopen(path, "wb");
 			if (f != nullptr) {
 				fprintf(f, "P6\n%u %u\n255\n", w, h);
@@ -1555,7 +1627,8 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 				const uint32_t rows = 64;
 				const char ramp[] = " .:-=+*#%@";
 				RaveDiagLog("CLUTAscii[%u] mac=0x%08x %ux%u alpha0=%u begin",
-				            sClutDumpCount, texEntry->mac_addr, w, h, alphaZero);
+				            sClutDumpCount, texEntry->mac_addr, w, h,
+				            texEntry->diag_alpha_zero);
 				for (uint32_t row = 0; row < rows; row++) {
 					char line[cols + 1];
 					uint32_t y0 = (row * h) / rows;
@@ -1833,6 +1906,13 @@ int32_t NativeEngineAccessTextureEnd(uint32_t textureAddr, uint32_t dirtyRectAdd
 		}
 	}
 
+	if (entry->type == kRaveResourceTexture) {
+		RaveBGRAImageStats stats = RaveBGRAImageAnalyze(expanded, w * h);
+		entry->diag_alpha_zero = (w * h) - stats.alpha;
+		entry->diag_index_zero = 0;
+		entry->diag_rgb_nonzero = stats.rgb;
+	}
+
 	// Re-upload level 0
 	if (entry->metal_texture) {
 		RaveUploadMipLevel(entry->metal_texture, 0, w, h, expanded, w * 4);
@@ -2033,7 +2113,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 
 	case kQAGestalt_EngineID:
 		WriteMacInt32(responsePtr, kRaveAdvertisedEngineID);
-		RAVE_LOG("EngineGestalt: %s -> 0x%08x ('PSHR')", gestalt_selector_names[selector],
+		RAVE_LOG("EngineGestalt: %s -> 0x%08x (ATI Rage 128)", gestalt_selector_names[selector],
 		         kRaveAdvertisedEngineID);
 		break;
 
@@ -3052,7 +3132,7 @@ void RaveRegisterEngine(void)
 	// handlers; for other engines, they chain to the original implementations.
 	RaveInstallHooks();
 
-	// Mark permanently registered only after all phases succeed
+	// Mark permanently registered only after all registration steps succeed.
 	rave_registered = true;
 	rave_reg_in_progress = false;
 
@@ -3077,8 +3157,8 @@ void RaveInstallHooks(void)
 {
 	RAVE_LOG("installing enumeration hooks");
 
-	// Find the RAVE library fragment name we already determined works
-	// Try all known library names (same as registration phase)
+	// Find the RAVE library fragment name we already determined works.
+	// Try all known library names used during registration.
 	static const char *rave_lib_names[] = {
 		"\031QuickDraw\xAA 3D Accelerator",  // 25 chars: CFM fragment name
 		"\022QuickDraw\xAA 3D RAVE",          // 18 chars: file name
@@ -3321,6 +3401,10 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
 	if (effectivePixelType == kQAPixel_ARGB32) {
 		whitenedAlphaMask = RaveBGRAWhitenAlphaOnlyMask(bgra_data, width * height);
 	}
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(bgra_data, width * height);
+	entry->diag_alpha_zero = (width * height) - stats.alpha;
+	entry->diag_index_zero = 0;
+	entry->diag_rgb_nonzero = stats.rgb;
 
 	// Re-upload to existing Metal texture at level 0
 	if (entry->metal_texture) {

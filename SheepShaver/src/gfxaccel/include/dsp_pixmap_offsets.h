@@ -11,8 +11,8 @@
  *  Field offsets and Mac OS lowmem globals used by the
  *  DSpRedirectMainDevicePixMap / DSpRestoreMainDevicePixMap helpers.
  *  DSP_PIXMAP_OFF_* values are the compact PixMap subset used by DSp's
- *  synthetic CGrafPort shims. DSP_MAINDEVICE_PIXMAP_OFF_* values are the
- *  real QuickDraw PixMap offsets used by the emulated MainDevice.
+ *  alt-buffer shim. DSP_MAINDEVICE_PIXMAP_OFF_* values are the real QuickDraw
+ *  PixMap offsets used by the emulated MainDevice and real DSp CGrafPorts.
  */
 #ifndef DSP_PIXMAP_OFFSETS_H
 #define DSP_PIXMAP_OFFSETS_H

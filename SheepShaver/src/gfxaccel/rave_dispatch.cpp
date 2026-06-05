@@ -71,10 +71,9 @@ extern void NativeEngineColorTableDelete(uint32_t colorTableAddr);
 extern int32_t NativeEngineTextureBindColorTable(uint32_t textureAddr, uint32_t colorTableAddr);
 extern int32_t NativeEngineBitmapBindColorTable(uint32_t bitmapAddr, uint32_t colorTableAddr);
 
-// Logging state -- enabled by default for diagnostics during development.
-// Set to false in production to reduce log noise.
+// Logging state -- disabled by default to reduce production log noise.
 #if ACCEL_LOGGING_ENABLED
-bool rave_logging_enabled = true;
+bool rave_logging_enabled = false;
 
 #ifdef __APPLE__
 os_log_t rave_log = OS_LOG_DEFAULT;

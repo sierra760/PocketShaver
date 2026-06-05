@@ -1,6 +1,8 @@
 /*
  *  dsp_guest_address.h - DSp guest-address validation helpers.
  *
+ *  (C) 2026 Sierra Burkhart (sierra760)
+ *
  *  DSp can receive a nonzero Host2MacAddr() result for host-owned Metal
  *  buffers. That value is only safe to publish into guest PixMaps when the
  *  whole byte range lies inside the guest RAM aperture.

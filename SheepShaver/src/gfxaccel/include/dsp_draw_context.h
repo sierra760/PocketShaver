@@ -100,6 +100,19 @@ extern uint32_t DSpAllocFirstContextHandle(
     uint32_t enumeration_mode_index);
 
 /*
+ *  Allocate a transient metadata-only DSp context handle.
+ *
+ *  This wraps DSpAllocFirstContextHandle with one compatibility fallback:
+ *  if the small context table is full, it may recycle an inactive
+ *  non-enumeration metadata-only handle left behind by probing code that
+ *  called DSpFindBestContext but never reserved or released the result.
+ *  Reserved contexts and live enumeration cursors are never reclaimed.
+ */
+extern uint32_t DSpAllocMetadataContextHandle(
+    const struct DSpContextAttributes *attr,
+    uint32_t enumeration_mode_index);
+
+/*
  *  Debug session `dsp-sims-enumeration-stall` fix (2026-04-19) — read the
  *  enumeration_mode_index stored on a metadata-only context handle. Used
  *  by dsp_mode_enumerate.cpp's DSpGetNextContext_Core to advance the
@@ -146,6 +159,17 @@ extern int32_t DSpAdvanceEnumerationContext(
     uint32_t ctxRef,
     const struct DSpContextAttributes *new_attr,
     uint32_t new_idx);
+
+/*
+ *  Release an inactive metadata-only DSp context handle.
+ *
+ *  Used by DSpGetNextContext when an enumeration cursor reaches the
+ *  end-of-list terminator. The cursor has no Metal back-buffer and no
+ *  game-owned resources; keeping it allocated after returning a NULL next
+ *  context leaks one of the small DSp context-table slots during mode
+ *  probing. Reserved/full contexts are rejected.
+ */
+extern int32_t DSpReleaseMetadataContextHandle(uint32_t ctxRef);
 
 /*
  *  Public sub-opcode handlers.
@@ -371,6 +395,7 @@ extern int32_t  DSpContext_GetCLUTEntriesHandler(uint32_t ctxRef,
                                                  uint32_t entriesOutAddr,
                                                  uint32_t inStartingEntry,
                                                  uint32_t inEntryCount);
+extern int32_t  DSpGetActiveCLUTSnapshot(uint8_t out_clut_bytes[768]);
 
 /*
  *  Gamma + Fade handlers.

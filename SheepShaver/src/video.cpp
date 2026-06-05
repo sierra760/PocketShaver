@@ -77,6 +77,37 @@ VidLocals *private_data = NULL;	// Pointer to driver local variables (there is o
 static long save_conf_id = APPLE_W_640x480;
 static long save_conf_mode = APPLE_8_BIT;
 
+static void video_log_palette_summary(const char *op, uint32 start, uint32 count)
+{
+	static int s_palette_log_count = 0;
+	if (s_palette_log_count >= 32) return;
+	s_palette_log_count++;
+
+	const rgb_color first = mac_pal[0];
+	int non_black = 0;
+	int different_from_first = 0;
+	int non_gray = 0;
+	for (int i = 0; i < 256; i++) {
+		const rgb_color c = mac_pal[i];
+		if (c.red != 0 || c.green != 0 || c.blue != 0)
+			non_black++;
+		if (c.red != first.red || c.green != first.green || c.blue != first.blue)
+			different_from_first++;
+		if (c.red != c.green || c.green != c.blue)
+			non_gray++;
+	}
+
+	const int depth =
+		(cur_mode >= 0 && cur_mode < 64) ? VModes[cur_mode].viAppleMode : -1;
+	fprintf(stderr,
+	        "VIDEO: palette %s start=%u count=%u curMode=%d depth=%d "
+	        "nonBlack=%d diff0=%d nonGray=%d idx0=(%u,%u,%u)\n",
+	        op, start, count, cur_mode, depth, non_black,
+	        different_from_first, non_gray,
+	        first.red, first.green, first.blue);
+	fflush(stderr);
+}
+
 
 // Function pointers of imported functions
 typedef int16 (*iocic_ptr)(void *, int16);
@@ -417,6 +448,7 @@ static int16 VideoControl(uint32 pb, VidLocals *csSave)
 					s_pal += 8;
 				}
 			}
+			video_log_palette_summary("SetEntries", start, count);
 			video_set_palette();
 			return noErr;
 		}
@@ -467,6 +499,7 @@ static int16 VideoControl(uint32 pb, VidLocals *csSave)
 
 		case cscDirectSetEntries:					// DirectSetEntries
 			D(bug("DirectSetEntries\n"));
+			video_log_palette_summary("DirectSetEntries-unimplemented", 0, 0);
 			return controlErr;
 
 		case cscSetDefaultMode:						// SetDefaultMode

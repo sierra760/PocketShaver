@@ -1,5 +1,7 @@
 /*
  *  dsp_default_clut.h - default DrawSprocket indexed CLUT initialization.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_DEFAULT_CLUT_H

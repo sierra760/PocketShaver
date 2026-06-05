@@ -577,104 +577,6 @@ void * PF_CONVENTION powerpc_cpu::compile_chain_block(block_info *sbi)
 }
 #endif
 
-// ------------------------------------------------------------------------
-// Forensic instrumentation: CFM cross-fragment glue-stub intercept.
-//
-// The Sims crashes after `bctr`-ing through a TVECT whose {code,toc} both
-// equal 0x50010000 (an address inside the Mac OS ROM image). Earlier traces
-// confirmed the crash path is via the canonical 5-instruction CFM
-// cross-fragment glue stub. The trace evidence showed both observed call
-// sites (bl at 0x28855e14 and bl at 0x287577cc) resolve to the SAME glue
-// stub address 0x289efc2c. By the time the SIGILL fires, r12 has already
-// been clobbered by the post-bctr code, so we can't reconstruct the TVECT
-// pointer in the illegal-instr handler alone.
-//
-// This hook fires every time the PPC interpreter is about to execute the
-// FIRST instruction of a watched glue stub. At that moment r12 still holds
-// the TVECT pointer (set by the caller before the bl). We log r12 plus the
-// 8 bytes at *r12 ONCE for each unique TVECT address whose contents are
-// {0x50010000, 0x50010000}. A small bounded seen-set suppresses duplicates
-// so the host log doesn't flood when Sims hammers the same stub at gameplay
-// rate (the glue stub gets called many times per frame for every cross-
-// fragment C++ virtual call).
-//
-// Once a hit is logged we know the exact TVECT address in guest memory.
-// The next step is to grep-trace who writes to that address (likely the PEF
-// import resolver / CFM lazy-binding handler in PocketShaver).
-// ------------------------------------------------------------------------
-#ifdef SHEEPSHAVER
-static inline void cycle11_glue_hook(powerpc_cpu *cpu, uint32 cur_pc)
-{
-	// Watchlist of known CFM cross-fragment glue-stub entry PCs.
-	// Observed in the trace: frame 0's bl_target=0x289efc2c. Frame 1's bl at
-	// 0x287577cc with instr 0x48298461 resolves to bl_target = 0x287577cc +
-	// 0x00298460 = 0x289efc2c (same stub). One entry covers both known
-	// call sites; add more here if other crash traces surface different
-	// glue stub addresses.
-	static const uint32 kStubPCs[] = {
-		0x289efc2cu,
-	};
-	const int kNumStubs = (int)(sizeof(kStubPCs) / sizeof(kStubPCs[0]));
-
-	// Fast reject: PC not in our watchlist.
-	bool matched = false;
-	for (int i = 0; i < kNumStubs; i++) {
-		if (cur_pc == kStubPCs[i]) { matched = true; break; }
-	}
-	if (!matched) return;
-
-	// in-guest-range guard before any vm_read.
-	auto in_guest_range = [](uint32 addr) -> bool {
-		if (RAMBase != 0 && addr >= RAMBase && addr < (RAMBase + RAMSize)) return true;
-		if (ROMBase != 0 && addr >= ROMBase && addr < (ROMBase + ROM_SIZE)) return true;
-		return false;
-	};
-
-	uint32 r12 = cpu->gpr(12);
-	if (!in_guest_range(r12)) {
-		// r12 outside guest memory — log once for diagnostics, then bail.
-		static bool warned_bad_r12 = false;
-		if (!warned_bad_r12) {
-			warned_bad_r12 = true;
-			fprintf(stderr, "  [CFM glue intercept] PC=0x%08x r12=0x%08x OUT_OF_RANGE LR=0x%08x\n",
-					cur_pc, r12, cpu->get_register(powerpc_registers::LR).i);
-		}
-		return;
-	}
-	uint32 w0 = vm_read_memory_4(r12);
-	uint32 w1 = in_guest_range(r12 + 4) ? vm_read_memory_4(r12 + 4) : 0;
-
-	// Only emit the smoking-gun line. Anything else just wastes log space:
-	// thousands of healthy cross-fragment calls pass through this stub per
-	// gameplay frame. We only care about the ones that point at 0x50010000.
-	if (w0 != 0x50010000u || w1 != 0x50010000u) return;
-
-	// Bounded LRU-ish dedup: small fixed-size set of recently-seen TVECT
-	// addresses. If we've already logged this TVECT, suppress.
-	static const int kSeenCapacity = 32;
-	static uint32 seen[kSeenCapacity] = {0};
-	static int    seen_count = 0;
-	for (int i = 0; i < seen_count; i++) {
-		if (seen[i] == r12) return;  // already logged
-	}
-	if (seen_count < kSeenCapacity) {
-		seen[seen_count++] = r12;
-	} else {
-		// Capacity exhausted — overwrite slot 0 in FIFO style.
-		// (We expect at most a handful of unique TVECTs; if we see
-		// more than 32 distinct bogus TVECTs the symptom is broader than
-		// hypothesised and we'd want to widen capacity anyway.)
-		for (int i = 0; i < kSeenCapacity - 1; i++) seen[i] = seen[i + 1];
-		seen[kSeenCapacity - 1] = r12;
-	}
-
-	fprintf(stderr,
-			"  [CFM glue intercept] PC=0x%08x r12=0x%08x *r12=[code=0x%08x toc=0x%08x] from LR=0x%08x  <-- SMOKING GUN TVECT\n",
-			cur_pc, r12, w0, w1, cpu->get_register(powerpc_registers::LR).i);
-	fflush(stderr);
-}
-#endif
-
 void powerpc_cpu::execute(uint32 entry)
 {
 	bool invalidated_cache = false;
@@ -693,9 +595,6 @@ void powerpc_cpu::execute(uint32 entry)
 			for (;;) {
 				// Execute all cached blocks
 				for (;;) {
-#ifdef SHEEPSHAVER
-					cycle11_glue_hook(this, pc());
-#endif
 					codegen.execute(bi->entry_point);
 
 					if (!spcflags().empty()) {
@@ -791,13 +690,6 @@ void powerpc_cpu::execute(uint32 entry)
 			// Execute all cached blocks
 		  pdi_execute:
 			for (;;) {
-#ifdef SHEEPSHAVER
-				// Block-entry hook. pc() here equals the block's
-				// entry PC (either freshly-compiled or freshly-found in the
-				// cache). If pc matches a watched glue stub, r12 still holds
-				// the TVECT pointer set by the bl-caller.
-				cycle11_glue_hook(this, pc());
-#endif
 				const int r = bi->size % 4;
 				di = bi->di + r;
 				int n = (bi->size + 3) / 4;
@@ -834,12 +726,6 @@ void powerpc_cpu::execute(uint32 entry)
 #endif
   do_interpret:
 	for (;;) {
-#ifdef SHEEPSHAVER
-		// Interpret-mode hook. Fires per-instruction in the
-		// non-decode-cache path; the watchlist comparison is a single
-		// inlined int compare so the overhead is negligible.
-		cycle11_glue_hook(this, pc());
-#endif
 		uint32 opcode = vm_read_memory_4(pc());
 		const instr_info_t *ii = decode(opcode);
 #if PPC_EXECUTE_DUMP_STATE

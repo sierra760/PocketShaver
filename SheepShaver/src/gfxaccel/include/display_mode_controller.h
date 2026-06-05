@@ -125,7 +125,7 @@ struct DMCModeSnapshot {
 	uint32_t       palette_gen;             /* bumped on every CLUT change */
 	uint32_t       gamma_gen;               /* bumped on every gamma change */
 	uint8_t        gamma_lut[768];          /* Planar: 256 R + 256 G + 256 B */
-	uint32_t       fade_active;             /* 1 while a DSp gamma fade is in progress; gates the shader pow(1.8/2.2) so the LUT marches linearly (DSp-1.7). Published atomically WITH gamma_lut (Pitfall 3). */
+	uint32_t       fade_active;             /* 1 while a DSp gamma fade is in progress; gates the shader pow(1.8/2.2) so the LUT marches linearly (DSp-1.7). Published atomically WITH gamma_lut. */
 	uint32_t       vbl_usec;
 	uint32_t       active_owner;            /* DMCOwner value */
 	uint8_t        blanking_rgba[4];        /* RGBA; only meaningful in Blanking state */
@@ -319,7 +319,7 @@ int32_t dmc_record_gamma_change_with_lut(const uint8_t *lut);
 /*
  * Companion to
  * dmc_record_gamma_change_with_lut that ALSO publishes a fade_active flag
- * in the SAME snapshot bump (Pitfall 3 — avoids a transient frame where the
+ * in the SAME snapshot bump (avoids a transient frame where the
  * LUT is mid-fade but fade_active is stale). The DSp fade-driver
  * (DSpVBLGammaFadeCallback) calls this with fade_active=1 on each mid-fade
  * push and fade_active=0 on the final-frame push; a plain SetGamma stays on

@@ -1,5 +1,7 @@
 /*
  *  dsp_quickdraw_restore_policy.h - DrawSprocket QuickDraw mode restore helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef DSP_QUICKDRAW_RESTORE_POLICY_H

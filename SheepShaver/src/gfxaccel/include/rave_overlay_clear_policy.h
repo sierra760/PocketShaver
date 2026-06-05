@@ -1,3 +1,9 @@
+/*
+ *  rave_overlay_clear_policy.h - RAVE overlay clear alpha helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
+ */
+
 #ifndef RAVE_OVERLAY_CLEAR_POLICY_H
 #define RAVE_OVERLAY_CLEAR_POLICY_H
 

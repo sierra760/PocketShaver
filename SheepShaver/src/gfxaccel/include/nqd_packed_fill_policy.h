@@ -1,5 +1,7 @@
 /*
  *  nqd_packed_fill_policy.h - CPU packed-pixel FillRect mode helpers.
+ *
+ *  (C) 2026 Sierra Burkhart (sierra760)
  */
 
 #ifndef NQD_PACKED_FILL_POLICY_H

@@ -3,7 +3,7 @@
 Host-side, **offline**, reproducible-in-CI tooling for extracting the
 DrawSprocket 1.7 export-surface ground truth from the committed
 `resources/DrawSprocketLib` PEF/CFM PowerPC binary. **No ROM, no device, no
-emulator runtime** is required (Phase 22.5 decisions D-01 / D-02 / D-03).
+emulator runtime** is required.
 
 These tools are dev/CI-only. They are **not** compiled into the PocketShaver
 app and **never** sit on a runtime guest-input path. They parse a fixed,
@@ -82,7 +82,7 @@ stwu	r1,$ffffffb0(r1)
 A third argument sets the word count (default 16):
 `./ppcdis resources/DrawSprocketLib 160 32`.
 
-## Why these tools exist (D-02 rationale)
+## Why these tools exist
 
 `FindLibSymbol` (the runtime symbol resolver) delegates to the Mac OS ROM's
 CFM and parses **nothing** host-side, so there was no existing host PEF
