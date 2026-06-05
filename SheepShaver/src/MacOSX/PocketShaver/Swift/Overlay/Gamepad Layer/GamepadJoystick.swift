@@ -58,6 +58,7 @@ class GamepadJoystick: UIControl {
 
 	private let mode: Mode
 	private var isRelativeMouseModeEnabled: Bool
+	private let hideLabels: Bool
 	private var isEditing: Bool
 	private let didRequestAssignment: (() -> Void)
 
@@ -100,12 +101,14 @@ class GamepadJoystick: UIControl {
 
 	init(
 		mode: Mode,
-		inputInteractionModel: InputInteractionModel,
+		inputInteractionModel: InputInteractionModel?,
+		hideLabels: Bool,
 		isEditing: Bool,
 		didRequestAssignment: @escaping (() -> Void)
 	) {
 		self.mode = mode
-		self.isRelativeMouseModeEnabled = inputInteractionModel.isRelativeMouseModeEnabled
+		self.isRelativeMouseModeEnabled = inputInteractionModel?.isRelativeMouseModeEnabled ?? true
+		self.hideLabels = hideLabels
 		self.isEditing = isEditing
 		self.didRequestAssignment = didRequestAssignment
 
@@ -143,9 +146,11 @@ class GamepadJoystick: UIControl {
 
 		set(isEditing: isEditing)
 
-		listenToChanges(from: inputInteractionModel)
-		
-		configure(isRelativeMouseModeEnabled: inputInteractionModel.isRelativeMouseModeEnabled)
+		if let inputInteractionModel {
+			listenToChanges(from: inputInteractionModel)
+
+			configure(isRelativeMouseModeEnabled: inputInteractionModel.isRelativeMouseModeEnabled)
+		}
 	}
 
 	required init?(coder: NSCoder) { fatalError() }
@@ -353,6 +358,11 @@ class GamepadJoystick: UIControl {
 	}
 
 	private func updateRelativeMouseOffWarningLabelVisiblity() {
+		if hideLabels {
+			relativeMouseOffWarningLabel.isHidden = true
+			return
+		}
+
 		guard case Mode.mouse = mode else {
 			relativeMouseOffWarningLabel.isHidden = true
 			return

@@ -162,8 +162,8 @@
 
 #if TARGET_OS_IPHONE
 #import "OverlayViewControllerObjC.h"
-#import "RamAllocFailedAlertViewControllerObjC.h"
-#import "PreferencesViewControllerObjC.h"
+#import "FatalErrorAlertViewControllerObjCCppHeader.h"
+#import "PreferencesViewControllerObjCCppHeader.h"
 #import "RomPathObjC.h"
 #import "MiscellaneousSettingsObjCCppHeader.h"
 #endif
@@ -182,16 +182,12 @@
 // Interrupts in native mode?
 #define INTERRUPTS_IN_NATIVE_MODE 1
 
-// Debugging:
-#define SHOW_WARNING_BEFORE_LOADING_ROM (TARGET_OS_IPHONE && 0)
-
 // Constants
 const char ROM_FILE_NAME[] = "ROM";
 const char ROM_FILE_NAME2[] = ".rom";
 
 #if !REAL_ADDRESSING
-// FIXME: needs to be >= 0x04000000
-const uintptr RAM_BASE = 0x10000000;		// Base address of RAM
+const uintptr RAM_BASE = 0x00000000;		// Base address of RAM
 #endif
 const uintptr ROM_BASE = 0x50000000;		// Base address of ROM
 #if REAL_ADDRESSING
@@ -622,13 +618,13 @@ static bool load_mac_rom(void)
 	uint32 rom_size, actual;
 	uint8 *rom_tmp;
 	const char *rom_path = PrefsFindString("rom");
-	
+
 	if (rom_path) {
 		printf ("%s rom_path: %s\n", __PRETTY_FUNCTION__, rom_path);
 	}
 	printf ("%s ROM_FILE_NAME: %s\n", __PRETTY_FUNCTION__, ROM_FILE_NAME);
 	printf ("%s ROM_FILE_NAME2: %s\n", __PRETTY_FUNCTION__, ROM_FILE_NAME2);
-	
+
 #if TARGET_OS_IPHONE
 	rom_path = objc_romPath();
 #endif
@@ -640,35 +636,14 @@ static bool load_mac_rom(void)
 			return false;
 		}
 	}
-	
-#if SHOW_WARNING_BEFORE_LOADING_ROM
-	// This works.
-	SDL_MessageBoxButtonData aButtonData;
-	aButtonData.buttonid = 0;
-	aButtonData.text = "OK";
-	aButtonData.flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
 
-	SDL_MessageBoxData aMessageBoxData;
-	aMessageBoxData.message = "About to load Mac ROM...";
-	aMessageBoxData.title = "Loading ROM";
-	aMessageBoxData.numbuttons = 1;
-	aMessageBoxData.flags = SDL_MESSAGEBOX_INFORMATION;
-	aMessageBoxData.window = NULL;
-	aMessageBoxData.colorScheme = NULL;
-	aMessageBoxData.buttons = &aButtonData;
-		
-	int aButtonID = -1;
-//	UIKit_ShowMessageBox(&aMessageBoxData, &aButtonID);
-	SDL_ShowMessageBox(&aMessageBoxData, &aButtonID);
-#endif
-	
 	printf("%s", GetString(STR_READING_ROM_FILE));
 	rom_size = lseek(rom_fd, 0, SEEK_END);
 	lseek(rom_fd, 0, SEEK_SET);
 	rom_tmp = new uint8[ROM_SIZE];
 	actual = read(rom_fd, (void *)rom_tmp, ROM_SIZE);
 	close(rom_fd);
-	
+
 	// Decode Mac ROM
 	if (!DecodeROM(rom_tmp, actual)) {
 		if (rom_size != 4*1024*1024) {
@@ -687,7 +662,7 @@ static bool load_mac_rom(void)
 static bool check_prefs(void)
 {
 #if SHOW_IOS_PREFS_ON_LAUNCH
-	objc_displayPreferences();
+	objc_displayPreferencesStartup();
 #endif
 	return true;
 }
@@ -855,15 +830,15 @@ int main(int argc, char *argv[])
 	char str[256];
 	bool memory_mapped_from_zero, ram_rom_areas_contiguous;
 	const char *vmdir = NULL;
-	
+
 	// Initialize variables
 	RAMBase = 0;
 	tzset();
-	
+
 	// Print some info
 	printf(GetString(STR_ABOUT_TEXT1), VERSION_MAJOR, VERSION_MINOR);
 	printf(" %s\n", GetString(STR_ABOUT_TEXT2));
-	
+
 #if !EMULATED_PPC
 #ifdef SYSTEM_CLOBBERS_R2
 	// Get TOC pointer
@@ -874,11 +849,11 @@ int main(int argc, char *argv[])
 	R13 = get_r13();
 #endif
 #endif
-	
+
 #if SDL_PLATFORM_MACOS
 	set_current_directory();
 #endif
-	
+
 #ifdef USE_SDL
 	// Initialize SDL system
 	if (!init_sdl())
@@ -894,7 +869,7 @@ int main(int argc, char *argv[])
 	}
 #endif
 #endif
-	
+
 	// Parse command line arguments
 	for (int i=1; i<argc; i++) {
 		if (strcmp(argv[i], "-NSDocumentRevisionsDebugMode") == 0 || strncmp(argv[i], "-psn_", 5) == 0) {
@@ -951,7 +926,7 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
-	
+
 	// Remove processed arguments
 	for (int i=1; i<argc; i++) {
 		int k;
@@ -965,7 +940,7 @@ int main(int argc, char *argv[])
 			argc -= k;
 		}
 	}
-	
+
 	// Connect to the external GUI
 	if (gui_connection_path) {
 		if ((gui_connection = rpc_init_client(gui_connection_path)) == NULL) {
@@ -973,13 +948,13 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-	
+
 	// Read preferences
 	PrefsInit(vmdir, argc, argv);
 	// Only use nogui preference if not passed as command line argument
 	if (use_gui == -1)
 		use_gui = !PrefsFindBool("nogui");
-	
+
 #if SDL_PLATFORM_MACOS && SDL_VERSION_ATLEAST(2,0,0)
 	// On Mac OS X hosts, SDL2 will create its own menu bar.  This is mostly OK,
 	// except that it will also install keyboard shortcuts, such as Command + Q,
@@ -989,7 +964,7 @@ int main(int argc, char *argv[])
 	// menu bar in-place.
 	disable_SDL2_macosx_menu_bar_keyboard_shortcuts();
 #endif
-	
+
 	// Any command line arguments left?
 	for (int i=1; i<argc; i++) {
 		if (argv[i][0] == '-') {
@@ -997,7 +972,7 @@ int main(int argc, char *argv[])
 			usage(argv[0]);
 		}
 	}
-	
+
 #ifndef USE_SDL_VIDEO
 	// Open display
 	x_display = XOpenDisplay(x_display_name);
@@ -1007,35 +982,36 @@ int main(int argc, char *argv[])
 		ErrorAlert(str);
 		goto quit;
 	}
-	
+
 #if defined(ENABLE_XF86_DGA) && !defined(ENABLE_MON)
 	// Fork out, so we can return from fullscreen mode when things get ugly
 	XF86DGAForkApp(DefaultScreen(x_display));
 #endif
 #endif
-	
+
 #ifdef ENABLE_MON
 	// Initialize mon
 	mon_init();
 #endif
-	
+
 	// Install signal handlers
 	if (!install_signal_handlers())
 		goto quit;
-	
+
 	// Initialize VM system
 	if (vm_init() < 0) {
 		sprintf(str, "Could not initialize virtual memory system.\n");
 		ErrorAlert(str);
+		objc_displayRamAllocFailedAlert();
 		goto quit;
 	}
-	
+
 	// Get system info
 	get_system_info();
-	
+
 	// Init system routines
 	SysInit();
-	
+
 #ifdef ENABLE_GTK3
 	if (!gui_connection) {
 		// Init GTK
@@ -1054,12 +1030,12 @@ int main(int argc, char *argv[])
 		gui_startup();
 	}
 #endif
-	
+
 #if !EMULATED_PPC
 	// Check some things
 	paranoia_check();
 #endif
-	
+
 	// Open /dev/zero
 	zero_fd = open("/dev/zero", O_RDWR);
 	if (zero_fd < 0) {
@@ -1067,7 +1043,7 @@ int main(int argc, char *argv[])
 		ErrorAlert(str);
 		goto quit;
 	}
-	
+
 #if !(defined(__APPLE__) && defined(__x86_64__) || defined(MEM_BULK)) && !defined(TARGET_OS_IPHONE)
 	// Create areas for Kernel Data
 	if (!kernel_data_init())
@@ -1102,12 +1078,20 @@ int main(int argc, char *argv[])
 	DRCacheAddr = DR_CACHE_BASE;
 	D(bug("DR Cache at %p\n", DRCacheAddr));
 #endif
-	
+
 	// Create area for Mac RAM
+#ifdef TARGET_OS_IPHONE
+	if (!check_prefs())
+		goto quit;
+
+	RAMSize = objc_getRamInMb() * 1024 * 1024;
+#else
 	RAMSize = PrefsFindInt32("ramsize");
 	if (RAMSize <= 1000) {
 		RAMSize *= 1024 * 1024;
 	}
+#endif
+
 	if (RAMSize < 16 * 1024 * 1024) {
 		WarningAlert(GetString(STR_SMALL_RAM_WARN));
 		RAMSize = 16 * 1024 * 1024;
@@ -1145,7 +1129,7 @@ int main(int argc, char *argv[])
 		ROMBase = (RAMBase + RAMSize + ROM_ALIGNMENT -1) & -ROM_ALIGNMENT;
 		ROMBaseHost = RAMBaseHost + ROMBase - RAMBase;
 		ROMEnd = RAMBase + RAMSize + ROM_AREA_SIZE + ROM_ALIGNMENT;
-		
+
 		ram_rom_areas_contiguous = true;
 #else
 		if (vm_mac_acquire_fixed(RAM_BASE, RAMSize) < 0) {
@@ -1167,12 +1151,12 @@ int main(int argc, char *argv[])
 #endif
 	ram_area_mapped = true;
 	D(bug("RAM area at %p (%08x)\n", RAMBaseHost, RAMBase));
-	
+
 	if (RAMBase > KernelDataAddr) {
 		ErrorAlert(GetString(STR_RAM_AREA_TOO_HIGH_ERR));
 		goto quit;
 	}
-	
+
 	// Create area for Mac ROM
 	if (!ram_rom_areas_contiguous) {
 		if (vm_mac_acquire_fixed(ROM_BASE, ROM_AREA_SIZE + SIG_STACK_SIZE) < 0) {
@@ -1193,37 +1177,32 @@ int main(int argc, char *argv[])
 #endif
 	rom_area_mapped = true;
 	D(bug("ROM area at %p (%08x)\n", ROMBaseHost, ROMBase));
-	
+
 	if (RAMBase > ROMBase) {
 		ErrorAlert(GetString(STR_RAM_HIGHER_THAN_ROM_ERR));
 		goto quit;
 	}
-	
+
 	// Create area for SheepShaver data
 	if (!SheepMem::Init()) {
 		sprintf(str, GetString(STR_SHEEP_MEM_MMAP_ERR), strerror(errno));
 		ErrorAlert(str);
 		goto quit;
 	}
-	
-#if TARGET_OS_IPHONE
-	if (!check_prefs())
-		goto quit;
-#endif
-	
+
 	// Load Mac ROM
 	if (!load_mac_rom())
 		goto quit;
-	
+
 	// Initialize everything
 	if (!InitAll(vmdir))
 		goto quit;
 	D(bug("Initialization complete\n"));
-	
+
 #if TARGET_OS_IPHONE
 	objc_initOverlayViewController();
 #endif
-	
+
 	// Clear caches (as we loaded and patched code) and write protect ROM
 #if !EMULATED_PPC
 	flush_icache_range(ROMBase, ROMBase + ROM_AREA_SIZE);
@@ -1237,13 +1216,13 @@ int main(int argc, char *argv[])
 	tick_thread_cancel = false;
 	tick_thread_active = (pthread_create(&tick_thread, NULL, tick_func, NULL) == 0);
 	D(bug("Tick thread installed (%ld)\n", tick_thread));
-	
+
 	// Start NVRAM watchdog thread
 	memcpy(last_xpram, XPRAM, XPRAM_SIZE);
 	nvram_thread_cancel = false;
 	nvram_thread_active = (pthread_create(&nvram_thread, NULL, nvram_func, NULL) == 0);
 	D(bug("NVRAM thread installed (%ld)\n", nvram_thread));
-	
+
 #if !EMULATED_PPC
 	// Install SIGILL handler
 	sigemptyset(&sigill_action.sa_mask);	// Block interrupts during ILL handling
@@ -1259,7 +1238,7 @@ int main(int argc, char *argv[])
 		goto quit;
 	}
 #endif
-	
+
 #if !EMULATED_PPC
 	// Install interrupt signal handler
 	sigemptyset(&sigusr2_action.sa_mask);
@@ -1274,12 +1253,12 @@ int main(int argc, char *argv[])
 		goto quit;
 	}
 #endif
-	
+
 	// Get my thread ID and execute MacOS thread function
 	emul_thread = pthread_self();
 	D(bug("MacOS thread is %ld\n", emul_thread));
 	emul_func(NULL);
-	
+
 quit:
 	Quit();
 	return 0;
@@ -1682,7 +1661,7 @@ void Set_pthread_attr(pthread_attr_t *attr, int priority)
 		pthread_attr_setinheritsched(attr, PTHREAD_EXPLICIT_SCHED);
 		pthread_attr_setschedpolicy(attr, SCHED_FIFO);
 		struct sched_param fifo_param;
-		fifo_param.sched_priority = ((sched_get_priority_min(SCHED_FIFO) + 
+		fifo_param.sched_priority = ((sched_get_priority_min(SCHED_FIFO) +
 					      sched_get_priority_max(SCHED_FIFO)) / 2 +
 					     priority);
 		pthread_attr_setschedparam(attr, &fifo_param);
@@ -1708,7 +1687,7 @@ void Set_pthread_attr(pthread_attr_t *attr, int priority)
 #ifdef HAVE_PTHREADS
 
 struct B2_mutex {
-	B2_mutex() { 
+	B2_mutex() {
 	    pthread_mutexattr_t attr;
 	    pthread_mutexattr_init(&attr);
 	    // Initialize the mutex for priority inheritance --
@@ -1725,7 +1704,7 @@ struct B2_mutex {
 	    pthread_mutex_init(&m, &attr);
 	    pthread_mutexattr_destroy(&attr);
 	}
-	~B2_mutex() { 
+	~B2_mutex() {
 	    pthread_mutex_trylock(&m); // Make sure it's locked before
 	    pthread_mutex_unlock(&m);  // unlocking it.
 	    pthread_mutex_destroy(&m);
@@ -1885,7 +1864,7 @@ void sigusr2_handler(int sig, siginfo_t *sip, void *scp)
 
 				// Set extra stack for SIGSEGV handler
 				sigaltstack(&extra_stack, NULL);
-				
+
 				// Prepare for 68k interrupt level 1
 				WriteMacInt16(ReadMacInt32(0x67c), 1);
 				WriteMacInt32(ReadMacInt32(0x658) + 0xdc, ReadMacInt32(ReadMacInt32(0x658) + 0xdc) | ReadMacInt32(0x674));
@@ -1956,7 +1935,7 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 
 	// Get effective address
 	uint32 addr = r->dar();
-	
+
 #ifdef SYSTEM_CLOBBERS_R2
 	// Restore pointer to Thread Local Storage
 	set_r2(TOC);
@@ -1987,19 +1966,19 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 			r->pc() += 4;
 			r->gpr(8) = 0;
 			return;
-	
+
 		// MacOS 8.5 installation
 		} else if (r->pc() == ROMBase + 0x488140 && r->gpr(16) == 0xf8000000) {
 			r->pc() += 4;
 			r->gpr(8) = 0;
 			return;
-	
+
 		// MacOS 8 serial drivers on startup
 		} else if (r->pc() == ROMBase + 0x48e080 && (r->gpr(8) == 0xf3012002 || r->gpr(8) == 0xf3012000)) {
 			r->pc() += 4;
 			r->gpr(8) = 0;
 			return;
-	
+
 		// MacOS 8.1 serial drivers on startup
 		} else if (r->pc() == ROMBase + 0x48c5e0 && (r->gpr(20) == 0xf3012002 || r->gpr(20) == 0xf3012000)) {
 			r->pc() += 4;
@@ -2007,7 +1986,7 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 		} else if (r->pc() == ROMBase + 0x4a10a0 && (r->gpr(20) == 0xf3012002 || r->gpr(20) == 0xf3012000)) {
 			r->pc() += 4;
 			return;
-	
+
 		// MacOS 8.6 serial drivers on startup (with DR Cache and OldWorld ROM)
 		} else if ((r->pc() - DR_CACHE_BASE) < DR_CACHE_SIZE && (r->gpr(16) == 0xf3012002 || r->gpr(16) == 0xf3012000)) {
 			r->pc() += 4;
@@ -2078,7 +2057,7 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 						transfer_type = TYPE_STORE; transfer_size = SIZE_HALFWORD; addr_mode = MODE_UX; break;
 				}
 				break;
-	
+
 			case 32:	// lwz
 				transfer_type = TYPE_LOAD; transfer_size = SIZE_WORD; addr_mode = MODE_NORM; break;
 			case 33:	// lwzu
@@ -2134,7 +2113,7 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 				break;
 #endif
 		}
-	
+
 		// Ignore ROM writes (including to the zero page, which is read-only)
 		if (transfer_type == TYPE_STORE &&
 			((addr >= ROMBase && addr < ROMBase + ROM_SIZE) ||

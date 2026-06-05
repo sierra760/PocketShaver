@@ -12,6 +12,7 @@ class GamepadButton: UIButton {
 	enum Label {
 		case text(String)
 		case icon(ImageResource)
+		case thinIcon(ImageResource)
 		case twoIcons(ImageResource, ImageResource)
 	}
 
@@ -39,7 +40,7 @@ class GamepadButton: UIButton {
 		label: Label,
 		buttonSize: GamepadButtonSize,
 		specialButtonConfig: SpecialButton? = nil,
-		inputInteractionModel: InputInteractionModel,
+		inputInteractionModel: InputInteractionModel?,
 		isEditing: Bool,
 		pushKey: @escaping (() -> Void),
 		releaseKey: @escaping (() -> Void),
@@ -49,8 +50,8 @@ class GamepadButton: UIButton {
 		self.didPush = pushKey
 		self.didRelease = releaseKey
 		self.didRequestAssignment = didRequestAssignment
-		self.isRelativeMouseModeEnabled = inputInteractionModel.isRelativeMouseModeEnabled
-		self.isIPadMousePassthroughOn = inputInteractionModel.iPadMousePassthrough
+		self.isRelativeMouseModeEnabled = inputInteractionModel?.isRelativeMouseModeEnabled ?? true
+		self.isIPadMousePassthroughOn = inputInteractionModel?.iPadMousePassthrough ?? false
 
 		super.init(frame: .zero)
 
@@ -71,6 +72,8 @@ class GamepadButton: UIButton {
 			setTitle(text, for: .normal)
 		case .icon(let icon):
 			setImage(.init(resource: icon), for: .normal)
+		case .thinIcon(let icon):
+			setImage(.init(resource: icon).withUltraLightConfiguration(), for: .normal)
 		case .twoIcons(let icon1, let icon2):
 			iconStackView.addArrangedSubview(createImageView(forIcon: icon1))
 			iconStackView.addArrangedSubview(createImageView(forIcon: icon2))
@@ -99,15 +102,17 @@ class GamepadButton: UIButton {
 
 		set(isEditing: isEditing)
 
-		listenToChanges(from: inputInteractionModel)
+		if let inputInteractionModel {
+			listenToChanges(from: inputInteractionModel)
 
-		configure(isRelativeMouseModeEnabled: inputInteractionModel.isRelativeMouseModeEnabled)
-		configure(isIPadMousePassthroughOn: inputInteractionModel.iPadMousePassthrough)
-		configure(hoverOffsetMode: inputInteractionModel.hoverOffsetMode)
-		configure(
-			audioEnabled: inputInteractionModel.isAudioEnabled,
-			hostAudioVolume: inputInteractionModel.hostAudioVolume
-		)
+			configure(isRelativeMouseModeEnabled: inputInteractionModel.isRelativeMouseModeEnabled)
+			configure(isIPadMousePassthroughOn: inputInteractionModel.iPadMousePassthrough)
+			configure(hoverOffsetMode: inputInteractionModel.hoverOffsetMode)
+			configure(
+				audioEnabled: inputInteractionModel.isAudioEnabled,
+				hostAudioVolume: inputInteractionModel.hostAudioVolume
+			)
+		}
 	}
 	
 	required init?(coder: NSCoder) { fatalError() }
@@ -136,6 +141,9 @@ class GamepadButton: UIButton {
 
 	private func configure(isRelativeMouseModeEnabled: Bool) {
 		self.isRelativeMouseModeEnabled = isRelativeMouseModeEnabled
+		if specialButtonConfig == .relativeMouseModeEnabled {
+			isToggledOn = isRelativeMouseModeEnabled
+		}
 		updateColor()
 	}
 
@@ -154,18 +162,21 @@ class GamepadButton: UIButton {
 			return
 		}
 
+		let imageResource: ImageResource
 		if audioEnabled {
 			switch hostAudioVolume {
 			case .low:
-				setImage(.init(resource: .speakerWave1), for: .normal)
+				imageResource = .speakerWave1
 			case .mid:
-				setImage(.init(resource: .speakerWave2), for: .normal)
+				imageResource = .speakerWave2
 			case .high:
-				setImage(.init(resource: .speakerWave3), for: .normal)
+				imageResource = .speakerWave3
 			}
 		} else {
-			setImage(.init(resource: .speakerSlash), for: .normal)
+			imageResource = .speakerSlash
 		}
+		let symbolConfiguration = UIImage.SymbolConfiguration(weight: .ultraLight)
+		setImage(.init(resource: imageResource).withUltraLightConfiguration(), for: .normal)
 	}
 
 	override func point(inside point: CGPoint, with _: UIEvent?) -> Bool {
@@ -266,7 +277,8 @@ extension SpecialButton {
 		case .hoverDiagonallyToggle: return .twoIcons(.handRaised, .crossArrow)
 		case .cmdW: return .text("⌘-W")
 		case .rightClick: return .icon(.rightclick)
-		case .audioEnabled: return .icon(.speakerSlash) // will be reconfigured
+		case .audioEnabled: return .icon(.speakerSlash) // placeholder
+		case .relativeMouseModeEnabled: return .thinIcon(.arrowUpAndDownAndArrowLeftAndRight)
 		}
 	}
 }

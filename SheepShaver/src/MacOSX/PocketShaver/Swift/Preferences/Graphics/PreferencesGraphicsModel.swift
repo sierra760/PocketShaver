@@ -6,30 +6,41 @@
 import Foundation
 import Combine
 
-/// Rendering filter mode: controls how the emulated display is scaled.
-/// Nearest-neighbor produces a sharp, retro pixelated look;
-/// bilinear produces a smooth, interpolated image.
 enum RenderingFilterMode: String, Codable, CaseIterable {
-	case nearestNeighbor
 	case bilinear
+	case nearestNeighbor
 }
 
 class PreferencesGraphicsModel {
+
+	struct FrameRateState: Hashable {
+		let setting: FrameRateSetting
+		let hasChanged: Bool
+	}
+
+	struct MonitorResolutionsState: Hashable {
+		let enabledResolutions: [MonitorResolutionOption]
+		let willBootFromCD: Bool
+	}
+
 	private let changeSubject: PassthroughSubject<PreferencesChange, Never>
 
-	// MARK: - Monitor Resolutions (moved from General)
+	let mode: PreferencesLaunchMode
+
+	// MARK: - Monitor Resolutions
 
 	@MainActor
-	var monitorResolutions: [MonitorResolutionOption] {
-		MonitorResolutionManager.shared.enabledResolutions
+	var monitorResolutionsState: MonitorResolutionsState {
+		return .init(
+			enabledResolutions: MonitorResolutionManager.shared.enabledResolutions,
+			willBootFromCD: DiskManager.shared.willBootFromCD
+		)
 	}
+
+	// MARK: - Frame Rate Setting
 
 	@MainActor
-	var willBootFromCD: Bool {
-		DiskManager.shared.willBootFromCD
-	}
-
-	// MARK: - Frame Rate Setting (moved from Advanced)
+	private let originalFrameRateSetting = MiscellaneousSettings.current.frameRateSetting
 
 	@MainActor
 	var frameRateSetting: FrameRateSetting {
@@ -38,11 +49,25 @@ class PreferencesGraphicsModel {
 		}
 		set {
 			MiscellaneousSettings.current.set(frameRateSetting: newValue)
-			changeSubject.send(.changeRequiringRestartBeforeBootMade)
+
+			if mode == .startup {
+				cpp_updateFrameRateHz()
+			}
+
+			changeSubject.send(.frameRateSettingChanged)
+			changeSubject.send(.changeRequiringRestartAfterBootMade)
 		}
 	}
 
-	// MARK: - Gamma Ramp Setting (moved from Advanced)
+	@MainActor
+	var frameRateState: FrameRateState {
+		.init(
+			setting: frameRateSetting,
+			hasChanged: frameRateSetting != originalFrameRateSetting
+		)
+	}
+
+	// MARK: - Gamma Ramp Setting
 
 	@MainActor
 	var gammaRampSetting: GammaRampSetting {
@@ -54,7 +79,7 @@ class PreferencesGraphicsModel {
 		}
 	}
 
-	// MARK: - Graphics Acceleration (moved from Advanced)
+	// MARK: - Graphics Acceleration
 
 	var nqdAccelEnabled: Bool {
 		get {
@@ -96,7 +121,7 @@ class PreferencesGraphicsModel {
 		}
 	}
 
-	// MARK: - Rendering Filter Mode (new)
+	// MARK: - Rendering Filter Mode
 
 	var renderingFilterMode: RenderingFilterMode {
 		get {
@@ -109,9 +134,13 @@ class PreferencesGraphicsModel {
 		}
 	}
 
-	// MARK: - Init
+	// MARK: - Initialization
 
-	init(changeSubject: PassthroughSubject<PreferencesChange, Never>) {
+	init(
+		mode: PreferencesLaunchMode,
+		changeSubject: PassthroughSubject<PreferencesChange, Never>
+	) {
+		self.mode = mode
 		self.changeSubject = changeSubject
 	}
 }

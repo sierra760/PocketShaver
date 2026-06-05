@@ -853,7 +853,7 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	vertDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
 	ms->vertexDescriptor = vertDesc;
 
-	// AUDIT: M003/S04/T01 — RAVE blend state verified correct.
+	// RAVE blend state configuration.
 	// 48 pipelines = 3 blend modes x 16 function constant combos.
 	// Blend mode 0: premultiplied alpha (shader premultiplies, src=One, dst=OneMinusSrcAlpha)
 	// Blend mode 1: standard alpha (src=SrcAlpha, dst=OneMinusSrcAlpha)
@@ -865,7 +865,7 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	RAVE_LOG("48 pipeline states created");
 
 	if (hasDepthAttachment) {
-		// AUDIT: M003/S04/T01 — RAVE depth state configuration verified correct.
+		// RAVE depth state configuration.
 		// 9 ZFunction values mapped to Metal compare functions (ZFunctionToMTL).
 		// kQAZFunction_None(0) maps to MTLCompareFunctionAlways with depth write disabled,
 		// which is correct (no depth buffer = always pass, never write).
@@ -888,7 +888,7 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 		RAVE_LOG("Depth stencil states skipped (no z-buffer context)");
 	}
 
-	// [AUDIT-T02] Verified: 3 sampler states with MTLSamplerAddressModeRepeat (correct for
+	// 3 sampler states with MTLSamplerAddressModeRepeat (correct for
 	// UV-wrapped 3D geometry). nearest/bilinear/trilinear filter progression matches RAVE
 	// kQATextureFilter_Fast(0)/Mid(1)/Best(2). GL tags override sampler in ApplyDirtyState.
 	// Create 3 sampler states (nearest, bilinear, trilinear)
@@ -968,7 +968,7 @@ void RaveReleaseMetalResources(RaveDrawPrivate *priv)
 	// Release RAVE ring buffer.
 	gfxaccel_rave_ring_shutdown();
 
-	// LIFECYCLE AUDIT (M003/S04/T02): All Metal resource types verified:
+	// Metal resource cleanup:
 	// (1) RTT texture handles: freed from resource table (created by this context)
 	// (2) 48+48 pipeline states: nil'd (ARC releases)
 	// (3) 9+9 depth-stencil states: nil'd (ARC releases)
@@ -4505,7 +4505,7 @@ int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t
 }
 
 
-// [AUDIT-T02] Verified: MTLPixelFormatBGRA8Unorm matches converter output. bytesPerRow = width*4
+// MTLPixelFormatBGRA8Unorm matches converter output. bytesPerRow = width*4
 // for BGRA8. replaceRegion origin (0,0) and size (width,height) correct. mipLevels > 1 sets
 // mipmapLevelCount. Usage includes ShaderWrite when mipmapped (for generateMipmapsForTexture:).
 void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels,
@@ -4517,7 +4517,7 @@ void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels
 		return nullptr;
 	}
 
-	// [DIAG-T03] Metal texture creation diagnostic
+	// Metal texture creation diagnostic.
 	if (rave_logging_enabled) {
 		RaveDiagLog("MetalTexCreate %dx%d mips=%d bytesPerRow=%d shaderWrite=%d",
 		            width, height, mipLevels, bytesPerRow, (mipLevels > 1) ? 1 : 0);
@@ -4549,14 +4549,14 @@ void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels
 }
 
 
-// [AUDIT-T02] Verified: replaceRegion origin (0,0), size (width,height) at specified mip level.
+// replaceRegion origin (0,0), size (width,height) at specified mip level.
 // bytesPerRow must be width*4 for BGRA8 at that mip level (caller responsible).
 void RaveUploadMipLevel(void *metalTexture, uint32_t level, uint32_t width, uint32_t height,
                          const uint8_t *pixelData, uint32_t bytesPerRow)
 {
 	if (!metalTexture) return;
 
-	// [DIAG-T03] Upload diagnostic: log bytesPerRow, region, and mip level
+	// Upload diagnostic: log bytesPerRow, region, and mip level.
 	if (rave_logging_enabled) {
 		RaveDiagLog("UploadMip level=%d %dx%d bytesPerRow=%d origin=(0,0)",
 		            level, width, height, bytesPerRow);
@@ -4570,7 +4570,7 @@ void RaveUploadMipLevel(void *metalTexture, uint32_t level, uint32_t width, uint
 }
 
 
-// [AUDIT-T02] Verified: generateMipmapsForTexture: generates full mip chain from level 0.
+// generateMipmapsForTexture: generates full mip chain from level 0.
 // Requires MTLTextureUsageShaderWrite on the texture (fixed in RaveCreateMetalTexture).
 void RaveGenerateMipmaps(void *metalTexture)
 {

@@ -664,14 +664,14 @@ static GLContext *GLContextNew(int width, int height)
 	ctx->depth_range_far = 1.0f;
 
 	// ---- Depth ----
-	// AUDIT: M003/S04/T01 — GL spec defaults verified:
+	// GL spec depth defaults:
 	//   depth_test = disabled, depth_func = GL_LESS, depth_mask = true (write enabled)
 	//   These match the GL 1.2 spec §2.11.1 initial values.
 	ctx->depth_func = GL_LESS;
 	ctx->depth_mask = true;  // depth writing enabled by default
 
 	// ---- Blend ----
-	// AUDIT: M003/S04/T01 — GL spec defaults verified:
+	// GL spec blend defaults:
 	//   blend = disabled, blend_src = GL_ONE, blend_dst = GL_ZERO
 	//   These match the GL 1.2 spec §4.1.7 initial values.
 	ctx->blend_src = GL_ONE;
@@ -733,7 +733,7 @@ static GLContext *GLContextNew(int width, int height)
 	ctx->name_stack_depth = 0;
 
 	// ---- Clear values ----
-	// AUDIT: M003/S04/T01 — GL spec clear defaults verified:
+	// GL spec clear defaults:
 	//   clear_color = (0,0,0,0), clear_depth = 1.0, clear_stencil = 0
 	//   These match the GL 1.2 spec initial values.
 	ctx->clear_color[0] = 0.0f;
@@ -756,7 +756,7 @@ static GLContext *GLContextNew(int width, int height)
 	ctx->logic_op_mode = GL_COPY;
 
 	// ---- Color mask ----
-	// AUDIT: M003/S04/T01 — GL spec default verified: all channels writable.
+	// GL spec default: all channels writable.
 	ctx->color_mask[0] = true;
 	ctx->color_mask[1] = true;
 	ctx->color_mask[2] = true;
@@ -1209,7 +1209,7 @@ uint32_t NativeAGLSwapBuffers(uint32_t ctx)
  *
  *  Clean up GLContext, free resources, remove from table.
  *
- *  LIFECYCLE AUDIT (M003/S04/T02): Destroy path verified:
+ *  Destroy path cleanup:
  *  (1) GLMetalRelease: commits pending GPU work, releases Metal textures (CFRelease),
  *      clears pipeline/depth-stencil/sampler caches, deletes GLMetalState
  *  (2) Shared-overlay refcount release deleted; GL uses the per-engine

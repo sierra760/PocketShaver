@@ -10,7 +10,9 @@ import UIKit
 class GamepadButtonStackView: UIStackView {
 	private let side: GamepadSide
 	private let row: Int
-	private let inputInteractionModel: InputInteractionModel
+
+	private let mode: GamepadLayerView.Mode
+	private let inputInteractionModel: InputInteractionModel?
 	private let didRequestAssignmentAtIndex: ((Int) -> Void)
 
 	private var isEditing: Bool = false
@@ -19,11 +21,13 @@ class GamepadButtonStackView: UIStackView {
 		side: GamepadSide,
 		row: Int,
 		isSettingsButtonRow: Bool,
-		inputInteractionModel: InputInteractionModel,
+		mode: GamepadLayerView.Mode,
+		inputInteractionModel: InputInteractionModel?,
 		didRequestAssignmentAtIndex: @escaping ((Int) -> Void)
 	) {
 		self.side = side
 		self.row = row
+		self.mode = mode
 		self.inputInteractionModel = inputInteractionModel
 		self.didRequestAssignmentAtIndex = didRequestAssignmentAtIndex
 
@@ -33,7 +37,9 @@ class GamepadButtonStackView: UIStackView {
 		axis = .horizontal
 		spacing = 4
 
-		setupButtons(isSettingsButtonRow: isSettingsButtonRow)
+		setupButtons(
+			isSettingsButtonRow: isSettingsButtonRow
+		)
 	}
 	
 	required init(coder: NSCoder) { fatalError() }
@@ -41,7 +47,16 @@ class GamepadButtonStackView: UIStackView {
 	private func setupButtons(
 		isSettingsButtonRow: Bool
 	) {
-		let screenWidth = UIScreen.main.bounds.width - UIApplication.safeAreaInsets.left - UIApplication.safeAreaInsets.right
+		let screenWidth: CGFloat
+		switch mode {
+		case .default:
+			screenWidth = UIScreen.main.bounds.width - UIApplication.safeAreaInsets.left - UIApplication.safeAreaInsets.right
+		case .thumbnail:
+			// Still render full size for correct number of button columns etc
+			// Force to landscape since device might be held in portrait
+			let safeAreaInsets: CGFloat = GamepadSideButtonLayout.isSupported ? 124 : 0
+			screenWidth = UIScreen.landscapeModeSize.width - safeAreaInsets
+		}
 		let sideMargin: CGFloat = UIScreen.sideMarginForButtons
 
 		let settingsButtonLength = GamepadSettingsButton.length
@@ -75,14 +90,14 @@ class GamepadButtonStackView: UIStackView {
 			pushKey: { [weak self] in
 				// TODO: Which value is dependent on keyboard layout is chosen in simlated OS.
 				// Should not assume EN layout, specifically
-				self?.inputInteractionModel.handle(
+				self?.inputInteractionModel?.handle(
 					key,
 					isDown: true,
 					hapticAllowed: true
 				)
 			},
 			releaseKey: { [weak self] in
-				self?.inputInteractionModel.handle(
+				self?.inputInteractionModel?.handle(
 					key,
 					isDown: false,
 					hapticAllowed: true
@@ -113,13 +128,13 @@ class GamepadButtonStackView: UIStackView {
 			inputInteractionModel: inputInteractionModel,
 			isEditing: isEditing,
 			pushKey: { [weak self] in
-				self?.inputInteractionModel.handle(
+				self?.inputInteractionModel?.handle(
 					specialButton,
 					isDown: true
 				)
 			},
 			releaseKey: { [weak self] in
-				self?.inputInteractionModel.handle(
+				self?.inputInteractionModel?.handle(
 					specialButton,
 					isDown: false
 				)
@@ -146,13 +161,13 @@ class GamepadButtonStackView: UIStackView {
 		switch joystickType {
 		case .mouse:
 			mode = .mouse({ [weak self] delta in
-				self?.inputInteractionModel.handleFireMouseJoystick(with: delta)
+				self?.inputInteractionModel?.handleFireMouseJoystick(with: delta)
 			})
 		case .wasd4way:
 			mode = .wasd(
 				.fourWay,
 				{ [weak self] sdlKey, isDown in
-					self?.inputInteractionModel.handle(
+					self?.inputInteractionModel?.handle(
 						sdlKey,
 						isDown: isDown,
 						hapticAllowed: false
@@ -163,7 +178,7 @@ class GamepadButtonStackView: UIStackView {
 			mode = .wasd(
 				.eightWay,
 				{ [weak self] sdlKey, isDown in
-					self?.inputInteractionModel.handle(
+					self?.inputInteractionModel?.handle(
 						sdlKey,
 						isDown: isDown,
 						hapticAllowed: false
@@ -175,6 +190,7 @@ class GamepadButtonStackView: UIStackView {
 		let joystick = GamepadJoystick(
 			mode: mode,
 			inputInteractionModel: inputInteractionModel,
+			hideLabels: self.mode == .thumbnail,
 			isEditing: isEditing,
 			didRequestAssignment: { [weak self] in
 				self?.didRequestAssignmentAtIndex(index)

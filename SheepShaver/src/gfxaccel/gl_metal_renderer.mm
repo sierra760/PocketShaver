@@ -2053,7 +2053,7 @@ static MTLStencilOperation GLStencilOpToMetal(uint32_t gl_op) {
 
 
 // ---- Pipeline state key ----
-// AUDIT: M003/S04/T01 — Verified that MakePipelineKey includes all Metal render pipeline
+// MakePipelineKey includes all Metal render pipeline
 // state: blend_enabled, blend_src, blend_dst, blend_equation, depth_write, color_mask_bits,
 // has_texture. blend_equation sets rgb/alphaBlendOperation on the MTLRenderPipelineDescriptor,
 // so it MUST be in the key — otherwise a non-Add equation would silently
@@ -3741,7 +3741,7 @@ void NativeGLFlush(GLContext *ctx)
 /*
  *  GLMetalRelease - release all Metal resources for a GL context
  *
- *  LIFECYCLE AUDIT (M003/S04/T02): Verified cleanup of all resource types:
+ *  Metal resource cleanup:
  *  - Pending command buffers: committed + waited before teardown
  *  - GL texture objects: CFRelease on each metal_texture (CFBridgingRetain'd)
  *  - Pipeline state cache: cleared (ARC releases id<MTLRenderPipelineState>)

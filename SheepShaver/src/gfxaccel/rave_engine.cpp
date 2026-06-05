@@ -512,7 +512,7 @@ uint32_t RaveResourceAlloc(RaveResourceType type) {
 	return 0;
 }
 
-// LIFECYCLE AUDIT (M003/S04/T02): RaveResourceFree verified — releases:
+// RaveResourceFree releases:
 // (1) Metal texture via RaveReleaseTexture (CFRelease of id<MTLTexture>)
 // (2) CPU pixel buffer via Mac_sysfree
 // (3) Original indexed pixel data via delete[]
@@ -658,7 +658,7 @@ void NativeHookQ3PixmapSetImage(uint32_t pixmapAddr,
  *  to a native heap buffer.
  */
 
-// [AUDIT-T02] Verified: ReadMacInt32 returns host-endian from big-endian PPC memory.
+// ReadMacInt32 returns host-endian from big-endian PPC memory.
 // Extracts A(31:24) R(23:16) G(15:8) B(7:0) → writes BGRA8 (B=byte0, G=byte1, R=byte2, A=byte3).
 // Row stride: rowBytes from Mac source, dst stride = width*4. Correct.
 static void ConvertARGB32(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
@@ -680,7 +680,7 @@ static void ConvertARGB32(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t
 	}
 }
 
-// [AUDIT-T02] Verified: Same as ARGB32 but top byte (X) ignored, alpha forced to 0xFF. Correct.
+// Same as ARGB32 but top byte (X) ignored, alpha forced to 0xFF. Correct.
 static void ConvertRGB32(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
 	for (uint32_t y = 0; y < height; y++) {
@@ -699,7 +699,7 @@ static void ConvertRGB32(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t 
 	}
 }
 
-// [AUDIT-T02] Verified: ReadMacInt16 returns host-endian. 1-bit A(15), 5-bit R(14:10) G(9:5) B(4:0).
+// ReadMacInt16 returns host-endian. 1-bit A(15), 5-bit R(14:10) G(9:5) B(4:0).
 // 5→8 expansion via (x<<3)|(x>>2) correct. 1-bit alpha: 0→0x00, 1→0xFF. BGRA8 output correct.
 static void ConvertARGB16(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
@@ -724,7 +724,7 @@ static void ConvertARGB16(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t
 	}
 }
 
-// [AUDIT-T02] Verified: Same 5-5-5 layout as ARGB16 but top bit ignored, alpha forced to 0xFF. Correct.
+// Same 5-5-5 layout as ARGB16 but top bit ignored, alpha forced to 0xFF. Correct.
 static void ConvertRGB16(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
 	for (uint32_t y = 0; y < height; y++) {
@@ -746,7 +746,7 @@ static void ConvertRGB16(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t 
 	}
 }
 
-// [AUDIT-T02] Verified: 8-bit index → CLUT lookup. CLUT stores native BGRA uint32 (see
+// 8-bit index → CLUT lookup. CLUT stores native BGRA uint32 (see
 // RaveCreateColorTableData). memcpy preserves native byte order → BGRA8 output. Bounds-checked.
 static void ExpandCL8(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height,
                       uint32_t rowBytes, const uint32_t *clut, uint32_t clutCount)
@@ -763,7 +763,7 @@ static void ExpandCL8(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t hei
 	}
 }
 
-// [AUDIT-T02] Verified: 4-bit index from nibbles (high=left, low=right). Same CLUT lookup as CL8.
+// 4-bit index from nibbles (high=left, low=right). Same CLUT lookup as CL8.
 // Bounds-checked. Correct.
 static void ExpandCL4(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height,
                       uint32_t rowBytes, const uint32_t *clut, uint32_t clutCount)
@@ -785,7 +785,7 @@ static void ExpandCL4(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t hei
 	}
 }
 
-// [AUDIT-T02] Verified: R(7:5)=3 bits, G(4:2)=3 bits, B(1:0)=2 bits.
+// R(7:5)=3 bits, G(4:2)=3 bits, B(1:0)=2 bits.
 // 3→8 expansion: (r3<<5)|(r3<<2)|(r3>>1). 2→8 expansion: (b2<<6)|(b2<<4)|(b2<<2)|b2. Alpha 0xFF. Correct.
 // ConvertRGB8_332: 8bpp, R=7:5, G=4:2, B=1:0
 static void ConvertRGB8_332(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
@@ -810,7 +810,7 @@ static void ConvertRGB8_332(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32
 	}
 }
 
-// [AUDIT-T02] Verified: ReadMacInt16 → A(15:12) R(11:8) G(7:4) B(3:0), 4→8 expansion via (n<<4)|n. Correct.
+// ReadMacInt16 → A(15:12) R(11:8) G(7:4) B(3:0), 4→8 expansion via (n<<4)|n. Correct.
 // ConvertARGB16_4444: 16bpp, A=15:12, R=11:8, G=7:4, B=3:0
 static void ConvertARGB16_4444(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
@@ -832,7 +832,7 @@ static void ConvertARGB16_4444(uint32 srcAddr, uint8_t *dst, uint32_t width, uin
 	}
 }
 
-// [AUDIT-T02] Verified: 8-bit intensity → B=G=R=i, A=0xFF. Correct.
+// 8-bit intensity → B=G=R=i, A=0xFF. Correct.
 // ConvertI8: 8bpp grayscale, I=7:0
 static void ConvertI8(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
@@ -849,7 +849,7 @@ static void ConvertI8(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t hei
 	}
 }
 
-// [AUDIT-T02] Verified: ReadMacInt16 → A(15:8) I(7:0). B=G=R=intensity, A from high byte. Correct.
+// ReadMacInt16 → A(15:8) I(7:0). B=G=R=intensity, A from high byte. Correct.
 // ConvertAI16_88: 16bpp, A=15:8, I=7:0
 static void ConvertAI16_88(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
@@ -869,7 +869,7 @@ static void ConvertAI16_88(uint32 srcAddr, uint8_t *dst, uint32_t width, uint32_
 }
 
 
-// [AUDIT-T02] Verified: srcBuf is native heap copy of big-endian Mac data. High byte (srcBuf[off])
+// srcBuf is native heap copy of big-endian Mac data. High byte (srcBuf[off])
 // = alpha, low byte (srcBuf[off+1]) = CLUT index. CLUT color extracted as B/G/R from native uint32,
 // alpha overridden from per-pixel value. Bounds-checked. Correct.
 // ExpandACL16_88: 16bpp, A=15:8, CL=7:0 -- alpha + color lookup
@@ -1067,7 +1067,7 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 			break;
 	}
 
-	// [DIAG-T03] Log first 4 output BGRA pixel values and full-image coverage
+	// Log first 4 output BGRA pixel values and full-image coverage.
 	// for texture diagnostics.
 	if (converted && rave_logging_enabled && width > 0 && height > 0) {
 		uint32_t px[4] = {0, 0, 0, 0};
@@ -1146,7 +1146,7 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 
 	bool isIndexed = (pixelType == kQAPixel_CL8 || pixelType == kQAPixel_CL4 || pixelType == kQAPixel_ACL16_88);
 
-	// [DIAG-T03] Texture creation diagnostic: format, dimensions, flags
+	// Texture creation diagnostic: format, dimensions, flags.
 	if (rave_logging_enabled) {
 		RaveDiagLog("TextureCreate fmt=%s(%d) %dx%d mips=%d indexed=%d flags=0x%08X rowBytes=%d",
 		            RavePixelFormatName(pixelType), pixelType, w, h, mipLevels,
@@ -1407,7 +1407,7 @@ static void RaveCreateBitmapFromImage(uint32_t pixelType, uint32 imageAddr,
 
 	bool isIndexed = (pixelType == kQAPixel_CL8 || pixelType == kQAPixel_CL4 || pixelType == kQAPixel_ACL16_88);
 
-	// [DIAG-T03] Bitmap creation diagnostic: format, dimensions, flags
+	// Bitmap creation diagnostic: format, dimensions, flags.
 	if (rave_logging_enabled) {
 		RaveDiagLog("BitmapCreate fmt=%s(%d) %dx%d indexed=%d rowBytes=%d",
 		            RavePixelFormatName(pixelType), pixelType, w, h,
@@ -1568,7 +1568,7 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 		texEntry->diag_rgb_nonzero = stats.rgb;
 	}
 
-	// [DIAG-T03] Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
+	// Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
 	if (rave_logging_enabled && numPx > 0) {
 		static uint32_t sClutDumpCount = 0;
 		uint32_t px[4] = {0, 0, 0, 0};

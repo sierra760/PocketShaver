@@ -115,7 +115,7 @@ static id<MTLTexture>               compositor_texture  = nil;
 static id<MTLRenderPipelineState>   compositor_pipeline = nil;
 static id<MTLSamplerState>          compositor_sampler  = nil;
 
-// Lifecycle flag (added in S04)
+// Lifecycle flag for Metal compositor state.
 static bool                         compositor_initialized = false;
 
 // Double-buffered palette. Two 256x4-byte MTLBuffers allocated from
