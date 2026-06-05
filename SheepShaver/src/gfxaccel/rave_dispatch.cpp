@@ -16,9 +16,13 @@
 #include "rave_engine.h"
 #include "rave_metal_renderer.h"
 
-// RAVE error codes
-#define kQANoErr           0
-#define kQANotSupported   -1
+// RAVE error codes (must match TQAError enum in RAVE.h)
+#define kQANoErr                    0
+#define kQAError                    1
+#define kQAOutOfMemory              2
+#define kQANotSupported             3
+#define kQAParamErr                 5
+#define kQAGestaltUnknown           6
 
 // Engine callback declarations (implemented in rave_engine.cpp)
 // Return TQAError (int32), take explicit PPC register values as args
@@ -52,6 +56,8 @@ extern uint32 NativeHookAccessTexture(uint32 engine, uint32 texture, uint32 mipm
 extern uint32 NativeHookAccessTextureEnd(uint32 engine, uint32 texture, uint32 dirtyRect);
 extern uint32 NativeHookAccessBitmap(uint32 engine, uint32 bitmap, uint32 flags, uint32 buffer);
 extern uint32 NativeHookAccessBitmapEnd(uint32 engine, uint32 bitmap, uint32 dirtyRect);
+extern uint32 NativeHookEngineEnable(uint32 vendorID, uint32 engineID);
+extern uint32 NativeHookEngineDisable(uint32 vendorID, uint32 engineID);
 
 // Engine method dispatch functions (implemented in rave_engine.cpp)
 extern int32_t NativeEngineTextureNew(uint32_t flags, uint32_t pixelType, uint32_t imagesAddr, uint32_t newTexturePtr);
@@ -65,10 +71,9 @@ extern void NativeEngineColorTableDelete(uint32_t colorTableAddr);
 extern int32_t NativeEngineTextureBindColorTable(uint32_t textureAddr, uint32_t colorTableAddr);
 extern int32_t NativeEngineBitmapBindColorTable(uint32_t bitmapAddr, uint32_t colorTableAddr);
 
-// Logging state -- enabled by default for diagnostics during development.
-// Set to false in production to reduce log noise.
+// Logging state -- disabled by default to reduce production log noise.
 #if ACCEL_LOGGING_ENABLED
-bool rave_logging_enabled = true;
+bool rave_logging_enabled = false;
 
 #ifdef __APPLE__
 os_log_t rave_log = OS_LOG_DEFAULT;
@@ -224,11 +229,13 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 			return (uint32)NativeSubmitMultiTextureParams(r3, r4, r5);
 		// RAVE 1.6 buffer access and mid-frame clear
 		case kRaveDrawAccessDrawBuffer:     // 25
-			return (uint32)NativeAccessDrawBuffer(r3, r4, r5, r6);
+			// SDK: AccessDrawBuffer(ctx, TQAPixelBuffer*)
+			return (uint32)NativeAccessDrawBuffer(r3, r4);
 		case kRaveDrawAccessDrawBufferEnd:  // 26
 			return (uint32)NativeAccessDrawBufferEnd(r3, r4);
 		case kRaveDrawAccessZBuffer:        // 27
-			return (uint32)NativeAccessZBuffer(r3, r4, r5, r6);
+			// SDK: AccessZBuffer(ctx, TQAZBuffer*)
+			return (uint32)NativeAccessZBuffer(r3, r4);
 		case kRaveDrawAccessZBufferEnd:     // 28
 			return (uint32)NativeAccessZBufferEnd(r3, r4);
 		case kRaveDrawClearDrawBuffer:      // 29
@@ -236,17 +243,17 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 		case kRaveDrawClearZBuffer:         // 30
 			return (uint32)NativeClearZBuffer(r3, r4, r5);
 		case kRaveDrawTextureFromContext:   // 31
-			return (uint32)NativeTextureNewFromDrawContext(r3);
+			return (uint32)NativeTextureNewFromDrawContext(r3, r4, r5);
 		case kRaveDrawBitmapFromContext:    // 32
-			return (uint32)NativeBitmapNewFromDrawContext(r3);
+			return (uint32)NativeBitmapNewFromDrawContext(r3, r4, r5);
 		case kRaveDrawBusy:                // 33
 			return (uint32)NativeBusy(r3);
 		case kRaveDrawSwapBuffers:         // 34
-			return (uint32)NativeSwapBuffers(r3);
+			return (uint32)NativeSwapBuffers(r3, r4);
 
 		default:
-			// Remaining draw methods are stubs
-			RAVE_LOG("RAVE draw stub: %s (tag %d)", draw_method_names[method_id], method_id);
+			// All 35 draw methods (0-34) have explicit case handlers. This default arm is unreachable dead code. Test: RAVEABITests.testStubLogLines_drawMethods_deadCode
+			__builtin_unreachable();
 			return kQANoErr;
 		}
 	}
@@ -306,16 +313,19 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 			return (uint32)NativeEngineBitmapBindColorTable(r3, r4);
 
 		case kRaveEngineAccessTexture:        // 114
+			// SDK: AccessTexture(texture, mipmapLevel, flags, TQAPixelBuffer*)
 			return (uint32)NativeEngineAccessTexture(r3, r4, r5, r6);
 		case kRaveEngineAccessTextureEnd:     // 115
 			return (uint32)NativeEngineAccessTextureEnd(r3, r4);
 		case kRaveEngineAccessBitmap:         // 116
-			return (uint32)NativeEngineAccessBitmap(r3, r4, r5, r6);
+			// SDK: AccessBitmap(bitmap, flags, TQAPixelBuffer*)
+			return (uint32)NativeEngineAccessBitmap(r3, r4, r5);
 		case kRaveEngineAccessBitmapEnd:      // 117
 			return (uint32)NativeEngineAccessBitmapEnd(r3, r4);
 
 		default:
-			RAVE_LOG("RAVE engine stub: %s (tag %d)", engine_method_names[engine_index], method_id);
+			// All 18 engine methods (100-117) have explicit case handlers. This default arm is unreachable dead code. Test: RAVEABITests.testStubLogLines_engineMethods_deadCode
+			__builtin_unreachable();
 			return kQANoErr;
 		}
 	}
@@ -402,6 +412,25 @@ uint32 RaveDispatch(uint32 r3, uint32 r4, uint32 r5,
 		case kRaveHookAccessBitmapEnd:
 			// QAAccessBitmapEnd(engine, bitmap, dirtyRect)
 			return NativeHookAccessBitmapEnd(r3, r4, r5);
+
+		case kRaveHookQ3PixmapSetImage:
+			// Q3Pixmap_Set_Image intercept.
+			// Sub-opcode 220. Dispatch entry wired in; the FindLibSymbol
+			// activation path (hook on the QuickDraw 3D library
+			// fragment) is deferred. Tests call NativeHookQ3PixmapSetImage
+			// directly (no dispatch round-trip), so this arm is reached
+			// only once the activation path lands.
+			// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount
+			NativeHookQ3PixmapSetImage(r3, r4, r5);
+			return kQANoErr;
+
+		case kRaveHookEngineEnable:
+			// QAEngineEnable(vendorID, engineID)
+			return NativeHookEngineEnable(r3, r4);
+
+		case kRaveHookEngineDisable:
+			// QAEngineDisable(vendorID, engineID)
+			return NativeHookEngineDisable(r3, r4);
 
 		default:
 			RAVE_LOG("RAVE: unknown hook sub-opcode %d", method_id);

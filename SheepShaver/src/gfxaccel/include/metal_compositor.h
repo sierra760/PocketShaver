@@ -18,6 +18,109 @@
 
 #include <stdint.h>
 
+#include "display_mode_controller.h"   /* struct DMCModeSnapshot forward */
+
+/*
+ * SubmitFrame API vocabulary.
+ *
+ * The compositor exposes a single engine-to-compositor submission entry
+ * point — MetalCompositorSubmitFrame(const FrameDescriptor *desc) — that
+ * takes an ordered list of CompositeLayer entries. Slot ordering is
+ * strict (Underlay -> Framebuffer -> Overlay); same-
+ * slot entries composite in submission order. The compositor is engine-
+ * blind by construction: it sees only CompositeLayer PODs with opaque
+ * source texture handles, never engine identifiers.
+ *
+ * All types below are POD and safe to include from plain .cpp files.
+ * The `source` field is declared as void* so engines can cast from
+ * id<MTLTexture> at use site without pulling ObjC into cpp translation
+ * units.
+ */
+
+/*
+ * DMCLayerSlot - strict z-order slots.
+ * Arbitrary z-indices are out of scope; named slots make the compositor
+ * inspectable (`grep kLayerSlot*` returns the full z-vocabulary).
+ */
+typedef enum {
+	kLayerSlotUnderlay    = 0,
+	kLayerSlotFramebuffer = 1,
+	kLayerSlotOverlay     = 2,
+	kLayerSlotCount       = 3
+} DMCLayerSlot;
+
+/*
+ * CompositeBlendMode - per-layer blend mode.
+ * Covers every composite mode classic 2D and 3D engines can emit today;
+ * additional modes stay deferred until an app-level need surfaces.
+ */
+typedef enum {
+	kBlendOpaque        = 0,
+	kBlendPremultiplied = 1,
+	kBlendStraight      = 2
+} CompositeBlendMode;
+
+/*
+ * CompositeLayer - POD layer record.
+ *
+ * `source` is an id<MTLTexture> cast to void* so this header compiles in
+ * plain .cpp files. Engines bridge-cast at their use site. The
+ * source texture MUST be BGRA8Unorm for the SubmitFrame encode path.
+ *
+ * Destination rectangle fields use floats so the compositor can express
+ * fractional positioning when the drawable size doesn't match the
+ * framebuffer at integer multiples.
+ */
+struct CompositeLayer {
+	void              *source;          /* id<MTLTexture> as void* - BGRA8Unorm */
+	uint32_t           src_origin_x;
+	uint32_t           src_origin_y;
+	uint32_t           src_size_w;
+	uint32_t           src_size_h;
+	float              dst_origin_x;
+	float              dst_origin_y;
+	float              dst_size_w;
+	float              dst_size_h;
+	DMCLayerSlot       slot;
+	CompositeBlendMode blend;
+	float              alpha;           /* 0.0..1.0; consulted only for non-Opaque blend modes */
+};
+
+/*
+ * FrameDescriptor - POD frame record.
+ *
+ * Borrowed `layers` array is valid for the SubmitFrame call only;
+ * compositor never holds the pointer beyond the call. `generation` must
+ * match dmc_current_snapshot()->generation at SubmitFrame entry, else
+ * the descriptor is rejected with kGfxAccelErrStaleGeneration and the
+ * caller must rebuild (closes the UAF that made this
+ * safe under concurrent rollback).
+ *
+ * `vbl_tick_target_usec` is currently advisory; a later revision will honor it
+ * via present(at:) once CAMetalDisplayLink pacing lands.
+ */
+struct FrameDescriptor {
+	const struct CompositeLayer *layers;
+	uint32_t                     layer_count;           /* 0..kMaxLayers (internal = 16) */
+	uint32_t                     generation;            /* DMC snapshot generation */
+	uint64_t                     vbl_tick_target_usec;  /* advisory */
+};
+
+/*
+ * GfxAccelError - error block. Starts at -4000 to avoid overlap
+ * with DMC's -3000..-3099 range.
+ */
+enum GfxAccelError {
+	kGfxAccelNoErr                       =     0,
+	kGfxAccelErrInvalidDescriptor        = -4001,   /* NULL desc or layer_count > kMaxLayers or layers==NULL */
+	kGfxAccelErrStaleGeneration          = -4002,   /* desc->generation != current snapshot gen */
+	kGfxAccelErrInvalidSlot              = -4003,   /* slot enum out of range */
+	kGfxAccelErrDrawableUnavailable      = -4004,   /* nextDrawable returned nil */
+	kGfxAccelErrPipelineUnavailable      = -4005,   /* PSO build failed */
+	kGfxAccelErrEngineNotRegistered      = -4006,   /* vend called for unregistered engine */
+	kGfxAccelErrTextureFormatUnsupported = -4007    /* non-BGRA8Unorm source texture */
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -76,6 +179,21 @@ void MetalCompositorUpdatePalette(const uint8_t *pal, int num_colors);
 void MetalCompositorPresent(void);
 
 /*
+ * Consume the VBL-delivered drawable.
+ *
+ * In production this ALWAYS returns NULL. The compositor
+ * paces on `CADisplayLink` for all iOS versions (13.4+) and acquires drawables
+ * via `[CAMetalLayer nextDrawable]` in the present path; the VBL callback never
+ * delivers a drawable. This function is retained as a no-op for the deliberately
+ * -unrevived `CAMetalDisplayLink` path (it forbids `nextDrawable` and would
+ * require routing all rendering through the delegate callback — incompatible
+ * with the emul-thread-presents / main-thread-callback model). It is NOT
+ * deleted because it is part of the documented API shape. See
+ * `vbl_source_uses_metal_display_link()` (== 0).
+ */
+void *MetalCompositorConsumeVBLDrawable(void);
+
+/*
  * Tear down all Metal compositor resources.
  *
  * Removes the CompositorMetalView from the UIWindow and releases
@@ -87,12 +205,11 @@ void MetalCompositorShutdown(void);
  * Resize the Metal compositor for a resolution/depth mode switch.
  *
  * Rebuilds only the depth-dependent resources — buffer, texture, pipeline,
- * palette, and sampler — while keeping the view, layer, device, queue,
- * overlay_pipeline, and overlay_sampler alive. This avoids the visual flash
- * and UIView lifecycle overhead from a full Shutdown→Init cycle.
- *
- * The overlay_texture is nilled so RAVE/GL will recreate it on the next
- * frame via MetalCompositorCreateOverlayTexture().
+ * palette, and sampler — while keeping the view, layer, device, and queue
+ * alive. This avoids the visual flash and UIView lifecycle overhead from a
+ * full Shutdown→Init cycle. Per-engine overlay textures are managed by
+ * gfxaccel_resources and are re-vended by each engine in its own
+ * on_mode_enter / on_mode_exit handlers.
  *
  * Threading: called from the PPC emulation thread with interrupts disabled —
  * no MetalCompositorPresent() calls can fire during resize. UIView operations
@@ -120,75 +237,251 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
 int MetalCompositorIsInitialized(void);
 
 /*
- * Create (or resize) the offscreen overlay texture for 3D compositing.
+ * MetalCompositorSubmitFrame.
  *
- * The texture is BGRA8Unorm, GPU-private, with RenderTarget|ShaderRead
- * usage — suitable as a render target for RAVE/GL and as a shader-read
- * source for the compositor's alpha-blending pass.
+ * Synchronous from the caller's perspective. The compositor:
+ *   1. Validates the descriptor (null / layer_count bound / slot bound /
+ *      source non-null) BEFORE consuming any semaphore slot - cheap
+ *      failures return immediately without blocking on an in-flight
+ *      drawable.
+ *   2. Rejects stale descriptors whose `generation` does not match
+ *      dmc_current_snapshot()->generation with kGfxAccelErrStaleGeneration;
+ *      engines drop the frame and rebuild.
+ *   3. Waits on the hidden dispatch_semaphore(3) inflight gate. Depth 3
+ *      matches CAMetalLayer.maximumDrawableCount=3 for Apple's canonical
+ *      triple-buffer pacing.
+ *   4. Acquires nextDrawable after the semaphore wait (late acquisition
+ *      per Apple Best Practice).
+ *   5. Encodes all layers into a single MTLRenderCommandEncoder in strict
+ *      slot order (Underlay -> Framebuffer -> Overlay); same-slot entries
+ *      in submission order.
+ *   6. Signals the semaphore from addCompletedHandler - GPU completion,
+ *      NOT CPU present.
+ *   7. Presents + commits.
  *
- * If the texture already exists at the requested size, returns immediately.
- * If dimensions differ, releases the old texture and creates a new one.
- * Also creates the overlay compositing pipeline (with alpha blending) if
- * it doesn't exist yet.
+ * Returns kGfxAccelNoErr or one of the kGfxAccelErr* codes defined in
+ * the GfxAccelError enum above. On any error after semaphore wait but
+ * before commit, signals the semaphore back to avoid deadlock.
+ */
+int32_t MetalCompositorSubmitFrame(const struct FrameDescriptor *desc);
+
+/*
+ * MetalCompositorSync3DFramePacing.
+ *
+ * Block the calling thread until the next VBL tick.  Used by RAVE/GL
+ * engines to pace 3D frame submission.  Returns kGfxAccelNoErr on
+ * success, kGfxAccelErrVBLTimeout on timeout (~33 ms), or
+ * kGfxAccelErrVBLNotInitialized if VBLSource is not running.
+ * Replaces the legacy sleep-based pacing.
+ */
+int32_t MetalCompositorSync3DFramePacing(void);
+
+/*
+ * Set the target presentation timestamp for the next SubmitFrame call.
+ * Called from the VBL callback (vbl_source.mm) to deliver the display
+ * link's targetPresentationTimestamp to the present(at:) path.
+ *
+ * present(at:) replaces presentDrawable:.
+ */
+void MetalCompositorSubmitFrame_SetTargetTimestamp(double target_ts);
+
+/*
+ * rave-overlay-flicker-black fix (2026-04-16): overlay cache API.
+ *
+ * SubmitFrame caches the most recent kLayerSlotOverlay CompositeLayer
+ * (and retains its source MTLTexture) so that MetalCompositorPresent can
+ * keep composing the last-known overlay between SubmitFrame calls --
+ * e.g. during Nanosaur's QADrawContextDelete -> QADrawContextNew interval
+ * where RAVE emits no RenderEnd for ~20 log lines.  Without the cache
+ * those interval frames present 2D-framebuffer-only (black for full-3D apps)
+ * producing a visible flicker to black.
+ *
+ * MetalCompositorSubmitFrame_AcquireCachedOverlay copies the cached
+ * CompositeLayer into *out_layer and returns a retained MTLTexture
+ * reference in *out_tex_retained; the caller MUST release via
+ * MetalCompositorSubmitFrame_ReleaseCachedOverlay after the frame is
+ * committed.  Returns 1 if a cached overlay is available, 0 otherwise.
+ *
+ * MetalCompositorSubmitFrame_EncodeCachedOverlay encodes the supplied
+ * CompositeLayer into an existing MTLRenderCommandEncoder using the
+ * SubmitFrame module's blend-mode PSO cache -- used by Present after
+ * drawing the 2D framebuffer underlay.
+ *
+ * MetalCompositorSubmitFrame_ClearCachedOverlay invalidates the cache
+ * (called on mode-exit / compositor shutdown).
+ */
+int  MetalCompositorSubmitFrame_AcquireCachedOverlay(struct CompositeLayer *out_layer,
+                                                     void **out_tex_retained);
+void MetalCompositorSubmitFrame_ReleaseCachedOverlay(void *tex_retained);
+void MetalCompositorSubmitFrame_EncodeCachedOverlay(void *render_encoder,
+                                                    const struct CompositeLayer *layer);
+void MetalCompositorSubmitFrame_ClearCachedOverlay(void);
+
+
+/*
+ * MetalCompositorGetLayer.
+ *
+ * Returns the compositor's CAMetalLayer as void* (bridge-cast in the
+ * caller). Used by gfxaccel_handle_background_enter to set drawableSize
+ * to CGSizeZero and by gfxaccel_handle_foreground_enter to restore it.
+ * Returns NULL if the compositor is not initialized.
+ */
+void *MetalCompositorGetLayer(void);
+
+/*
+ * MetalCompositorGetFramebufferTexture.
+ *
+ * Returns the compositor-owned 2D framebuffer texture as void*
+ * (id<MTLTexture>; caller bridge-casts). This is the MTLTexture view over
+ * the_buffer that MetalCompositorPresent samples as fragment input — DSp
+ * SwapBuffers blits its private back_texture into this texture before
+ * submitting its CompositeLayer at slot=kLayerSlotFramebuffer.
+ * Returns NULL if the compositor has not been
+ * successfully initialized. The caller must NOT retain/release the
+ * returned handle — it is owned by the compositor for the lifetime of
+ * the current video mode.
+ *
+ * The compositor-blindness invariant is unchanged: this accessor
+ * does not reference DSp — it is the same framebuffer texture handle
+ * the compositor already uses internally, exposed for zero-copy blit
+ * encoding from outside the .mm. NQD already writes into the backing
+ * MTLBuffer via the shared-memory path; DSp instead writes into the
+ * texture directly via MTLBlitCommandEncoder.copyFromTexture: so the
+ * path is symmetric.
+ */
+void *MetalCompositorGetFramebufferTexture(void);
+
+/*
+ * MetalCompositorPaletteLatch.
+ *
+ * VBL-latched swap: atomically promotes the back palette buffer to front.
+ * Must be called from the VBL callback BEFORE any command encoding for
+ * the frame begins.  The writer (emul thread) never touches the front
+ * buffer; the compositor reads s_palette_front_idx once at encode start
+ * and binds that buffer.
+ */
+void MetalCompositorPaletteLatch(void);
+
+/*
+ * MetalCompositorUpdateGammaLUT.
+ *
+ * Copy 768 bytes of gamma LUT data (planar: 256 R + 256 G + 256 B) from
+ * the DMC snapshot into the compositor's gamma_lut_buffer MTLBuffer.
+ * Called when the DMC gamma generation counter changes. No-op if
+ * gamma_lut_buffer is nil or lut is NULL.
+ */
+void MetalCompositorUpdateGammaLUT(const uint8_t *lut);
+
+/*
+ * MetalCompositorGetGammaLUTBuffer.
+ *
+ * Return the compositor's gamma_lut_buffer as void* (id<MTLBuffer>), or NULL
+ * if uninitialized. Production accessor (not TESTING_BUILD-gated) used by the
+ * DSp 16bpp unpack render pass (dsp_metal_renderer.mm) to bind the same gamma
+ * LUT the compositor present path samples — keeps the four shaders consistent.
+ * The unpack path is the rare non-visible twin (DSp force-resize to
+ * 32bpp routes visible pixels through compositor_fragment_32bpp).
+ */
+void *MetalCompositorGetGammaLUTBuffer(void);
+
+/*
+ * MetalCompositorGetGammaIdentityBuffer.
+ *
+ * Return the compositor's permanently-allocated identity-LUT fallback buffer
+ * as void* (id<MTLBuffer>), or NULL if the compositor is uninitialized. The
+ * DSp 16bpp unpack twin binds this when MetalCompositorGetGammaLUTBuffer() is
+ * nil so its gamma-sampling shader never reads an unbound buffer index (UB).
+ */
+void *MetalCompositorGetGammaIdentityBuffer(void);
+
+#ifdef TESTING_BUILD
+/*
+ * Test-only headless init. Initializes ONLY the SubmitFrame dependencies
+ * (device reference, command queue, inflight semaphore, blend-mode PSOs)
+ * without creating a CAMetalLayer or UIWindow. Intended for XCTestCase
+ * contract tests that exercise MetalCompositorSubmitFrame without a
+ * presentation layer - they must pair this with
+ * MetalCompositorTesting_SetNextRenderTarget before each SubmitFrame
+ * invocation (no drawable path is available).
  *
  * Parameters:
- *   w - overlay texture width in pixels
- *   h - overlay texture height in pixels
+ *   device - id<MTLDevice> as void* (e.g. PSCreateTestMetalDevice()).
+ *   queue  - id<MTLCommandQueue> as void* (e.g. PSCreateTestMetalCommandQueue()).
  *
- * Returns 0 on success, -1 on failure (with diagnostic log messages).
+ * Returns 0 on success. On failure, partial state is released and -1 is
+ * returned. Safe to call multiple times (idempotent on the semaphore;
+ * rebuilds PSOs against the provided device).
+ *
+ * Pair with MetalCompositorTesting_ShutdownHeadless() in tearDown to
+ * drain the semaphore and release PSOs before the test's device goes
+ * out of scope.
  */
-int MetalCompositorCreateOverlayTexture(int w, int h);
+int  MetalCompositorTesting_InitHeadless(void *device, void *queue);
 
 /*
- * Get the offscreen overlay texture as a void* for use from .cpp files.
- *
- * Returns the id<MTLTexture> cast to void*, or NULL if no overlay texture
- * has been created. The caller must bridge-cast back to id<MTLTexture>
- * in ObjC++ code that needs to use it as a render target.
+ * Test-only headless teardown. Drains the inflight semaphore (3 waits),
+ * releases the blend-mode PSOs, and clears the device/queue references.
+ * Does NOT touch compositor_view / compositor_layer (those are nil in
+ * headless mode anyway).
  */
-void *MetalCompositorGetOverlayTexture(void);
+void MetalCompositorTesting_ShutdownHeadless(void);
 
 /*
- * Enable or disable 3D overlay compositing in the present pass.
+ * Test-only render-target redirect seam.
  *
- * When active=1 (and an overlay texture exists), MetalCompositorPresent
- * draws the 2D framebuffer first, then alpha-blends the 3D overlay on
- * top. When active=0, only the 2D framebuffer is rendered (default).
+ * When non-NULL, the next MetalCompositorSubmitFrame invocation renders
+ * into the supplied offscreen id<MTLTexture> instead of the CAMetalLayer
+ * drawable, and skips presentDrawable (commits only). Redirection clears
+ * after one SubmitFrame call. Enables CompositorZOrderTests to perform
+ * byte-level readback of the composited output.
+ *
+ * Usage:
+ *   MetalCompositorTesting_SetNextRenderTarget(offscreen_tex);
+ *   MetalCompositorSubmitFrame(&desc);     // renders to offscreen_tex
+ *   MetalCompositorSubmitFrame(&desc);     // renders to next drawable (cleared)
+ *
+ * Pass NULL to clear an armed target without invoking SubmitFrame.
+ * Thread-safety: compositor is single-threaded from the emul thread;
+ * tests that call this must run on the test runner thread.
+ */
+void MetalCompositorTesting_SetNextRenderTarget(void *offscreen_texture);
+
+/*
+ * Palette double-buffer introspection hooks.
+ *
+ * MetalCompositorTesting_GetPaletteFrontIdx: returns the current front
+ * buffer index (0 or 1).  Uses memory_order_acquire.
+ *
+ * MetalCompositorTesting_GetPaletteBuffer: returns id<MTLBuffer> as void*
+ * for the given index (0 or 1).  Returns NULL for out-of-range idx.
+ */
+uint8_t MetalCompositorTesting_GetPaletteFrontIdx(void);
+void   *MetalCompositorTesting_GetPaletteBuffer(int idx);
+
+/*
+ * Palette-only test init/shutdown.
+ *
+ * Creates/destroys the double-buffered palette MTLBuffers without needing
+ * a full compositor Init (which requires SDL/UIWindow).  Tests call
+ * MetalCompositorTesting_InitPaletteBuffers in setUp and
+ * MetalCompositorTesting_ShutdownPaletteBuffers in tearDown.
  *
  * Parameters:
- *   active - 1 to enable overlay compositing, 0 to disable
+ *   device - id<MTLDevice> as void* (e.g. PSCreateTestMetalDevice()).
+ *
+ * Returns 0 on success, -1 on failure.
  */
-void MetalCompositorSetOverlayActive(int active);
+int  MetalCompositorTesting_InitPaletteBuffers(void *device);
+void MetalCompositorTesting_ShutdownPaletteBuffers(void);
 
 /*
- * Throttle 3D rendering to match the compositor's VBL cadence.
+ * Gamma LUT buffer introspection hook.
  *
- * Call after committing a 3D frame (RAVE RenderEnd, GL SwapBuffers).
- * Sleeps the calling thread until the next VBL tick boundary so the
- * 3D renderer doesn't outrun the compositor's present rate. This
- * prevents wasted GPU frames and potential visual tearing on the
- * shared offscreen texture.
- *
- * Safe to call when the compositor is not initialized (returns immediately).
+ * Returns the gamma_lut_buffer as void* (id<MTLBuffer>). Returns NULL
+ * if the buffer has not been allocated (non-indexed depth or not initialized).
  */
-void MetalCompositorSync3DFramePacing(void);
-
-/*
- * Set the overlay's position and visible size within the Mac framebuffer.
- *
- * RAVE/GL 3D contexts have a specific rect within the Mac screen.
- * The overlay texture may be larger than the actual render viewport
- * (e.g. texture=640x480 but render=510x361). The compositor uses
- * (x, y, w, h) to draw only the rendered portion, so 2D content
- * outside the 3D viewport remains visible.
- *
- * Parameters:
- *   x - left edge in Mac framebuffer pixels
- *   y - top edge in Mac framebuffer pixels
- *   w - visible width (render viewport width, may be < texture width)
- *   h - visible height (render viewport height, may be < texture height)
- */
-void MetalCompositorSetOverlayRect(int x, int y, int w, int h);
+void *MetalCompositorTesting_GetGammaLUTBuffer(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#include <string.h>
 #ifdef __MINGW64__
 #include <fenv.h>
 #endif
@@ -32,6 +33,7 @@
 #include "cpu/ppc/ppc-operands.hpp"
 #include "cpu/ppc/ppc-operations.hpp"
 #include "cpu/ppc/ppc-execute.hpp"
+#include "cpu/ppc/ppc-stfiwx.hpp"
 
 #ifndef SHEEPSHAVER
 #include "basic-kernel.hpp"
@@ -40,6 +42,7 @@
 #ifdef SHEEPSHAVER
 #include "main.h"
 #include "prefs.h"
+#include "cpu_emulation.h"
 #endif
 
 #if ENABLE_MON
@@ -618,8 +621,10 @@ void powerpc_cpu::execute_loadstore(uint32 opcode)
 
 	if (LD)
 		operand_RD::set(this, opcode, OP::apply(memory_helper<SZ, RX>::load(ea)));
-	else
-		memory_helper<SZ, RX>::store(ea, operand_RS::get(this, opcode));
+	else {
+		const uint32 store_value = operand_RS::get(this, opcode);
+		memory_helper<SZ, RX>::store(ea, store_value);
+	}
 
 	if (UP)
 		RA::set(this, opcode, ea);
@@ -649,8 +654,10 @@ void powerpc_cpu::execute_loadstore_multiple(uint32 opcode)
 	while (r <= 31) {
 		if (LD)
 			gpr(r) = vm_read_memory_4(ea);
-		else
-			vm_write_memory_4(ea, gpr(r));
+		else {
+			const uint32 store_value = gpr(r);
+			vm_write_memory_4(ea, store_value);
+		}
 		r++;
 		ea += 4;
 	}
@@ -687,13 +694,26 @@ void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
 		v = operand_fp_dw_RS::get(this, opcode);
 		if (DB)
 			vm_write_memory_8(ea, v);
-		else
-			vm_write_memory_4(ea, fp_store_single_convert(v));
+		else {
+			const uint32 store_value = fp_store_single_convert(v);
+			vm_write_memory_4(ea, store_value);
+		}
 	}
 
 	if (UP)
 		RA::set(this, opcode, ea);
 
+	increment_pc(4);
+}
+
+void powerpc_cpu::execute_stfiwx(uint32 opcode)
+{
+	const uint32 a = operand_RA_or_0::get(this, opcode);
+	const uint32 b = operand_RB::get(this, opcode);
+	const uint32 ea = PPCStfiwxEffectiveAddress(a, b);
+	const uint32 store_value = PPCStfiwxStoreWord(operand_fp_dw_RS::get(this, opcode));
+
+	vm_write_memory_4(ea, store_value);
 	increment_pc(4);
 }
 
@@ -769,7 +789,8 @@ void powerpc_cpu::execute_store_string(uint32 opcode)
 	int rs = rS_field::extract(opcode);
 	int sh = 24;
 	for (int i = 0; i < nb; i++) {
-		vm_write_memory_1(ea + i, gpr(rs) >> sh);
+		const uint32 store_value = (gpr(rs) >> sh) & 0xff;
+		vm_write_memory_1(ea + i, store_value);
 		sh -= 8;
 		if (sh < 0) {
 			sh = 24;
@@ -806,16 +827,17 @@ void powerpc_cpu::execute_stwcx(uint32 opcode)
 	const uint32 ea = RA::get(this, opcode) + operand_RB::get(this, opcode);
 	cr().clear(0);
 	if (regs().reserve_valid) {
-		if (regs().reserve_addr == ea /* physical_addr(EA) */
+			if (regs().reserve_addr == ea /* physical_addr(EA) */
 #if KPX_MAX_CPUS != 1
-			/* HACK: if another processor wrote to the reserved block,
-			   nothing happens, i.e. we should operate as if reserve == 0 */
-			&& regs().reserve_data == vm_read_memory_4(ea)
+				/* HACK: if another processor wrote to the reserved block,
+				   nothing happens, i.e. we should operate as if reserve == 0 */
+				&& regs().reserve_data == vm_read_memory_4(ea)
 #endif
-			) {
-			vm_write_memory_4(ea, operand_RS::get(this, opcode));
-			cr().set(0, standalone_CR_EQ_field::mask());
-		}
+				) {
+				const uint32 store_value = operand_RS::get(this, opcode);
+				vm_write_memory_4(ea, store_value);
+				cr().set(0, standalone_CR_EQ_field::mask());
+			}
 		regs().reserve_valid = 0;
 	}
 	cr().set_so(0, xer().get_so());

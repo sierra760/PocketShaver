@@ -8,8 +8,14 @@
 /* Define if building universal (internal helper macro) */
 /* #undef AC_APPLE_UNIVERSAL_BUILD */
 
-/* Define if using a PowerPC CPU emulator. */
+/* Define if using a PowerPC CPU emulator.
+ *
+ * See config-ios-aarch64.h for rationale.
+ * Respect any pre-existing command-line definition instead of hard-overriding.
+ */
+#ifndef EMULATED_PPC
 #define EMULATED_PPC 1
+#endif
 
 /* Define to enable dyngen engine */
 #define ENABLE_DYNGEN 0

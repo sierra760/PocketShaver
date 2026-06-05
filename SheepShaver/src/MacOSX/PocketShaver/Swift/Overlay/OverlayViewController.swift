@@ -156,6 +156,10 @@ public class OverlayViewController: UIViewController {
 			self?.inputInteractionModel.handle(output)
 		}
 
+		hiddenInputFieldDelegate.willEndEditing = { [weak self] in
+			self?.transition(to: .normal, allowHiddenInputFieldResponserResignation: false)
+		}
+
 		setupGestureInputView()
 
 		if state != .normal {
@@ -238,14 +242,14 @@ public class OverlayViewController: UIViewController {
 			performanceLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
 		])
 
-		if UIDevice.isSimulator || UIDevice.isiOSAppOnMac {
+		if UIDevice.isSimulator {
 			becomeFirstResponder()
 		}
 	}
 
 	public override var canBecomeFirstResponder: Bool {
 		get {
-			return UIDevice.isSimulator || UIDevice.isiOSAppOnMac
+			return UIDevice.isSimulator
 		}
 	}
 
@@ -253,7 +257,7 @@ public class OverlayViewController: UIViewController {
 		if UIDevice.isSimulator,
 		   motion == .motionShake {
 			// For debugging purposes
-			transition(to: .showingGamepad)
+			transition(to: .showingKeyboard)
 		}
 	}
 
@@ -287,6 +291,8 @@ public class OverlayViewController: UIViewController {
 		NotificationCenter.default.addObserver(self, selector: #selector(displayRelativeMouseCapabilityDialogueIfEligible), name: LocalNotifications.relativeMouseModeCapabilityFound, object: nil)
 		NotificationCenter.default.addObserver(self, selector: #selector(displayJaggyCursorWarningDialogueIfEligible), name: LocalNotifications.jaggyCursorResolutionSelected, object: nil)
 		NotificationCenter.default.addObserver(self, selector: #selector(displayGotIpAddress), name: LocalNotifications.gotIpAddress, object: nil)
+		NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillChangePosition), name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+		NotificationCenter.default.addObserver(self, selector: #selector(keyboardDidChangePosition), name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
 	}
 
 	private func loadGamepadSettings() {
@@ -296,7 +302,10 @@ public class OverlayViewController: UIViewController {
 		nextGamepadLayerView.load(config: GamepadManager.shared.nextConfig)
 	}
 
-	private func transition(to state: OverlayState) {
+	private func transition(
+		to state: OverlayState,
+		allowHiddenInputFieldResponserResignation: Bool = true
+	) {
 		// On Mac ("Designed for iPad"), only allow normal and keyboard states —
 		// the on-screen gamepad is hidden because the user has real input devices.
 		if Self.hideGamepad && (state == .showingGamepad || state == .editingGamepad) {
@@ -306,9 +315,12 @@ public class OverlayViewController: UIViewController {
 		self.state = state
 		switch state {
 		case .normal:
+			gamepadLayerView.alpha = 1
 			transformSDLContainerView(.identity)
 			dragInteractionModel.resetSdlViewVerticalOffset()
-			hiddenInputField.resignFirstResponder()
+			if allowHiddenInputFieldResponserResignation {
+				hiddenInputField.resignFirstResponder()
+			}
 			transformAllGamepadLayoutViews(.init(translationX: 0, y: -view.frame.size.height))
 			gestureInputView.set(state: state)
 			gamepadLayerView.isUserInteractionEnabled = false
@@ -375,6 +387,10 @@ public class OverlayViewController: UIViewController {
 				gamepadSettingsName: gamepadSettingsName,
 				showHints: Self.hideGamepad ? false : MiscellaneousSettings.current.showHints
 			)
+
+			if result.state == .showingKeyboard {
+				gamepadLayerView.alpha = 0
+			}
 
 			UIView.animate(
 				withDuration: result.willTranslateInLongAxis ? 0.6 : 0.28,
@@ -671,88 +687,23 @@ public class OverlayViewController: UIViewController {
 			atBottom: true
 		)
 	}
+
+	@objc
+	private func keyboardWillChangePosition(notification: NSNotification) {
+		if let keyboardFrame: NSValue = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue {
+			hiddenInputField.reportKeyboardWillChangePosition(keyboardFrame.cgRectValue)
+		}
+	}
+
+	@objc
+	private func keyboardDidChangePosition(notification: NSNotification) {
+		if let keyboardFrame: NSValue = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue {
+			hiddenInputField.reportKeyboardDidChangePosition(keyboardFrame.cgRectValue)
+		}
+	}
 }
 
 extension OverlayViewController {
-	
-	// MARK: - Cmd+key interception (Designed for iPad on Mac)
-
-	/// Return an empty array so SDL2's internal UIKeyCommand registrations
-	/// don't intercept Cmd+key combos via the responder chain before
-	/// `pressesBegan` fires.
-	public override var keyCommands: [UIKeyCommand]? { [] }
-
-	/// Set of HID usage codes that are bare modifier keys.
-	/// We use this to distinguish "Cmd held while pressing a letter" from
-	/// "Cmd key pressed alone".
-	private static let modifierHIDCodes: Set<UIKeyboardHIDUsage> = [
-		.keyboardLeftGUI, .keyboardRightGUI,
-		.keyboardLeftShift, .keyboardRightShift,
-		.keyboardLeftAlt, .keyboardRightAlt,
-		.keyboardLeftControl, .keyboardRightControl,
-	]
-
-	public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-		for press in presses {
-			guard let key = press.key else { continue }
-
-			let code = key.keyCode
-
-			// Bare Cmd key down → forward .cmd ADB key-down
-			if code == .keyboardLeftGUI || code == .keyboardRightGUI {
-				inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)
-				continue  // consumed — don't call super for this press
-			}
-
-			// Cmd-modified non-modifier key
-			if key.modifierFlags.contains(.command),
-			   !Self.modifierHIDCodes.contains(code) {
-
-				// Cmd+Shift+Q → quit PocketShaver
-				if key.modifierFlags.contains(.shift), code == .keyboardQ {
-					exit(0)
-				}
-
-				// Forward Cmd + mapped key as ADB events
-				if let mappedKey = SDLKey(fromHIDUsage: code) {
-					inputInteractionModel.handle(.cmd, isDown: true, hapticAllowed: false)
-					inputInteractionModel.handle(mappedKey, isDown: true, hapticAllowed: false)
-				}
-				continue  // consumed
-			}
-
-			// Everything else → default responder chain (SDL / soft keyboard / etc.)
-			super.pressesBegan(Set([press]), with: event)
-		}
-	}
-
-	public override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-		for press in presses {
-			guard let key = press.key else { continue }
-
-			let code = key.keyCode
-
-			// Bare Cmd key up
-			if code == .keyboardLeftGUI || code == .keyboardRightGUI {
-				inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)
-				continue
-			}
-
-			// Cmd-modified non-modifier key up
-			if key.modifierFlags.contains(.command),
-			   !Self.modifierHIDCodes.contains(code) {
-
-				if let mappedKey = SDLKey(fromHIDUsage: code) {
-					inputInteractionModel.handle(mappedKey, isDown: false, hapticAllowed: false)
-					inputInteractionModel.handle(.cmd, isDown: false, hapticAllowed: false)
-				}
-				continue
-			}
-
-			// Everything else
-			super.pressesEnded(Set([press]), with: event)
-		}
-	}
 
 	public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
 		// Intercept Cmd+W (performClose:) to prevent the app from closing.
@@ -791,7 +742,6 @@ extension OverlayViewController {
 
 
 		sdlVC.embed(vc)
-
 		lockWindowSize()
 	}
 
@@ -814,7 +764,7 @@ extension OverlayViewController {
 	}
 }
 
-extension OverlayViewController: @preconcurrency PerformanceCounterDelegate {
+extension OverlayViewController: PerformanceCounterDelegate {
 
 	func performanceCounter(_ counter: PerformanceCounter, didUpdateWithReport report: PerformanceCounterReport) {
 		if MiscellaneousSettings.current.fpsReporting && MiscellaneousSettings.current.networkTransferRateReportingEnabled {

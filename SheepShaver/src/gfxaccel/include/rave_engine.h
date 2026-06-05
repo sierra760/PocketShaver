@@ -14,6 +14,80 @@
 
 #include <stdint.h>
 
+#include "rave_ati_tag_policy.h"
+
+struct RaveBGRAImageStats {
+	uint32_t nonzero;       // any BGRA channel is non-zero
+	uint32_t alpha;         // alpha channel is non-zero
+	uint32_t rgb;           // at least one RGB channel is non-zero
+	uint32_t white;         // opaque/near-opaque white RGB pixels
+	uint32_t first_nonzero; // pixelCount if absent
+	uint32_t first_alpha;   // pixelCount if absent
+	uint32_t first_rgb;     // pixelCount if absent
+};
+
+/*
+ * Bugdom's ARGB16 sprite textures often have transparent top-left borders,
+ * so diagnostics and empty checks need whole-image scans instead of leading
+ * samples.
+ */
+static inline RaveBGRAImageStats RaveBGRAImageAnalyze(const uint8_t *pixels, uint32_t pixelCount)
+{
+	RaveBGRAImageStats stats = {0, 0, 0, 0, pixelCount, pixelCount, pixelCount};
+	if (!pixels) return stats;
+	for (uint32_t i = 0; i < pixelCount; i++) {
+		const uint32_t off = i * 4;
+		const uint8_t b = pixels[off];
+		const uint8_t g = pixels[off + 1];
+		const uint8_t r = pixels[off + 2];
+		const uint8_t a = pixels[off + 3];
+		const bool hasRGB = (b != 0 || g != 0 || r != 0);
+		if (hasRGB || a != 0) {
+			if (stats.nonzero == 0) stats.first_nonzero = i;
+			stats.nonzero++;
+		}
+		if (a != 0) {
+			if (stats.alpha == 0) stats.first_alpha = i;
+			stats.alpha++;
+		}
+		if (hasRGB) {
+			if (stats.rgb == 0) stats.first_rgb = i;
+			stats.rgb++;
+		}
+		if (a >= 0xF0 && r >= 0xF0 && g >= 0xF0 && b >= 0xF0) {
+			stats.white++;
+		}
+	}
+	return stats;
+}
+
+static inline bool RaveBGRAImageHasData(const uint8_t *pixels, uint32_t pixelCount)
+{
+	return RaveBGRAImageAnalyze(pixels, pixelCount).nonzero != 0;
+}
+
+/*
+ * Some classic QD3D/RAVE clients hand the engine ARGB32 mask textures whose
+ * alpha channel carries the image and whose RGB channels are entirely black.
+ * With kQATextureOp_Modulate, literal black RGB makes those masks disappear
+ * against dark scenes. Treat the no-RGB case as a coverage mask and provide
+ * white source color, matching Bugdom's own grayscale-is-alpha texture path.
+ */
+static inline bool RaveBGRAWhitenAlphaOnlyMask(uint8_t *pixels, uint32_t pixelCount)
+{
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(pixels, pixelCount);
+	if (!pixels || stats.alpha == 0 || stats.rgb != 0) return false;
+	for (uint32_t i = 0; i < pixelCount; i++) {
+		const uint32_t off = i * 4;
+		if (pixels[off + 3] != 0) {
+			pixels[off] = 0xFF;
+			pixels[off + 1] = 0xFF;
+			pixels[off + 2] = 0xFF;
+		}
+	}
+	return true;
+}
+
 /*
  *  RAVE sub-opcode constants
  *
@@ -124,12 +198,21 @@ enum {
 	kRaveHookAccessTextureEnd = 217,  // QAAccessTextureEnd hook
 	kRaveHookAccessBitmap     = 218,  // QAAccessBitmap hook
 	kRaveHookAccessBitmapEnd  = 219,  // QAAccessBitmapEnd hook
+	// Q3Pixmap_Set_Image intercept. Dispatch
+	// sub-opcode only — the activation path (FindLibSymbol hook on the
+	// QuickDraw 3D library fragment) is deferred to a follow-up change.
+	// When activated, the PPC thunk dispatches here with
+	// r3 = pixmapAddr, r4 = srcHostAddr, r5 = byteCount. Tests invoke
+	// NativeHookQ3PixmapSetImage directly (no dispatch round-trip).
+	kRaveHookQ3PixmapSetImage = 220,  // Q3Pixmap_Set_Image intercept (deferred activation)
+	kRaveHookEngineEnable     = 221,  // QAEngineEnable hook
+	kRaveHookEngineDisable    = 222,  // QAEngineDisable hook
 
-	kRaveHookCount            = 20
+	kRaveHookCount            = 23
 };
 
 // ATI RaveExtFuncs sub-opcodes (300-303)
-// These are PPC-callable TVECTs delivered via SetPtr(kATIRaveExtFuncs)
+// These are PPC-callable TVECTs delivered via kATIRaveExtFuncs.
 enum {
 	kRaveATIClearDrawBuffer  = 300,
 	kRaveATIClearZBuffer     = 301,
@@ -151,7 +234,18 @@ enum {
  */
 
 #define RAVE_MAX_TAG 154  // covers GL tags up to kQATagGL_TextureEnvColor_b (153)
-#define RAVE_ATI_TAG_COUNT 43  // kATITriCache(0) through kATIMeshAsStrip(42)
+static inline bool RaveEffectiveDepthWriteEnabled(uint32_t standardZBufferMask,
+                                                  uint32_t atiDepthWriteEnable)
+{
+	return standardZBufferMask != 0 && atiDepthWriteEnable != 0;
+}
+
+static inline float RaveClampMetalDepth(float z)
+{
+	if (!(z >= 0.0f)) return 0.0f;
+	if (z > 1.0f) return 1.0f;
+	return z;
+}
 
 union RaveStateValue {
 	float    f;
@@ -176,16 +270,21 @@ struct RaveNoticeMethod {
  *
  *  Transparent triangles are buffered during draw calls (when kQATag_ZSortedHint=1)
  *  and flushed back-to-front at RenderEnd for correct transparency compositing.
- *  Uses float[3][12] instead of RaveVertex[3] because RaveVertex is defined in
- *  rave_metal_renderer.mm, not this header. Layout is identical (12 floats = 48 bytes).
+ *  Uses float arrays instead of RaveVertex[3] because RaveVertex is defined in
+ *  rave_metal_renderer.mm, not this header. Layout must match RaveVertex.
  */
+#define RAVE_VERTEX_FLOATS 20
+#define RAVE_VERTEX_BYTES  (RAVE_VERTEX_FLOATS * sizeof(float))
+
 struct ZSortTriangle {
-	float      verts[3][12];   // 3 vertices x 12 floats (pos4+color4+uv4) = 144 bytes
+	float      verts[3][RAVE_VERTEX_FLOATS];
 	float      sortKey;
 	bool       textured;
 	uint32_t   textureMacAddr;
 	int32_t    textureOp;
 	int32_t    blendMode;
+	uint32_t   glBlendSrc;
+	uint32_t   glBlendDst;
 	int32_t    filterMode;
 };
 
@@ -201,7 +300,7 @@ struct RaveDrawPrivate {
 	struct RaveMetalState *metal;   // Metal resources, opaque to .cpp
 
 	// Vertex staging buffer for geometry submission
-	uint8_t       *vertexStagingBuffer;   // native heap, 64K vertices * 40 bytes = 2.5MB
+	uint8_t       *vertexStagingBuffer;   // native heap, 64K vertices
 	uint32_t       vertexStagingCount;    // current vertex count in staging buffer
 	uint32_t       vertexStagingCapacity; // max vertices (65536)
 
@@ -240,7 +339,16 @@ extern void RaveThunksInit(void);
 extern uint32_t RaveDispatch(uint32_t r3, uint32_t r4, uint32_t r5,
                              uint32_t r6, uint32_t r7, uint32_t r8);
 
-// Engine registration entry point (implemented in plan 02)
+// @autoreleasepool wrapper around RaveDispatch (defined in
+// gfxaccel_arc_shim.mm).  Called from sheepshaver_glue.cpp:NATIVE_RAVE_DISPATCH
+// in place of direct RaveDispatch so the emul thread drains autoreleased
+// MTL*/NS* temporaries every dispatch call.  Fixes Nanosaur steady-state
+// memory growth.
+extern uint32_t RaveDispatchARC(uint32_t r3, uint32_t r4, uint32_t r5,
+                                uint32_t r6, uint32_t r7, uint32_t r8);
+
+
+// Engine registration entry point
 extern void RaveRegisterEngine(void);
 
 // Returns true if RAVE engine has been successfully registered
@@ -278,6 +386,8 @@ extern uint32_t rave_orig_access_texture;
 extern uint32_t rave_orig_access_texture_end;
 extern uint32_t rave_orig_access_bitmap;
 extern uint32_t rave_orig_access_bitmap_end;
+extern uint32_t rave_orig_engine_enable;
+extern uint32_t rave_orig_engine_disable;
 
 // Per-hook patch info for unpatch-call-repatch chaining.
 // Stores the original 4 instructions and addresses needed to safely chain
@@ -290,7 +400,7 @@ struct RaveHookPatchInfo {
 	bool     active;            // Whether this hook is installed
 };
 
-#define RAVE_NUM_HOOKED_APIS 20
+#define RAVE_NUM_HOOKED_APIS 22
 extern RaveHookPatchInfo rave_hook_patches[RAVE_NUM_HOOKED_APIS];
 
 // Hook indices into rave_hook_patches[] — matches apis[] order in RaveInstallHooks
@@ -314,7 +424,9 @@ enum {
 	kRaveHookIdx_AccessTexture    = 16,
 	kRaveHookIdx_AccessTextureEnd = 17,
 	kRaveHookIdx_AccessBitmap     = 18,
-	kRaveHookIdx_AccessBitmapEnd  = 19
+	kRaveHookIdx_AccessBitmapEnd  = 19,
+	kRaveHookIdx_EngineEnable     = 20,
+	kRaveHookIdx_EngineDisable    = 21
 };
 
 // Safe chaining: temporarily restores original code, calls via CallMacOS, re-patches.
@@ -367,6 +479,12 @@ extern os_log_t rave_log;
 
 extern bool rave_logging_enabled;
 
+#if defined(__GNUC__)
+void RaveDiagLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#else
+void RaveDiagLog(const char *fmt, ...);
+#endif
+
 #ifdef __APPLE__
 #define RAVE_LOG(fmt, ...) do { \
 	if (rave_logging_enabled) \
@@ -383,13 +501,14 @@ extern bool rave_logging_enabled;
 
 static constexpr bool rave_logging_enabled = false;
 #define RAVE_LOG(fmt, ...) do {} while (0)
+static inline void RaveDiagLog(const char *, ...) {}
 
 #endif /* ACCEL_LOGGING_ENABLED */
 
 /*
  *  Resource handle table for dummy texture/bitmap/color table resources.
  *  Same pattern as draw context table (1-based handles, fixed size).
- *  Phase 4 upgrades entries to hold real Metal textures.
+ *  Entries hold real Metal textures.
  */
 enum RaveResourceType {
 	kRaveResourceFree = 0,
@@ -402,7 +521,7 @@ struct RaveResourceEntry {
 	RaveResourceType type;
 	uint32_t         mac_addr;   // SheepMem address visible to PPC side
 
-	// Phase 4: Metal texture data
+	// Metal texture data
 	void            *metal_texture;   // id<MTLTexture> stored as void* for C++ header
 	uint32_t         pixel_type;      // kQAPixel_* value
 	uint32_t         width;
@@ -412,20 +531,43 @@ struct RaveResourceEntry {
 	uint32_t         original_size;   // size of original_pixels buffer
 	uint32_t         row_bytes;       // original row bytes for level 0
 	uint32_t         bound_clut;      // resource handle of bound color table (0 = none)
-	uint16_t         priority;        // GAP-010: priority bits from flags >> 16 (per RAVE 1.6 spec)
-	uint32_t         pixmap_mac_addr; // deferred: Mac address of pixel data (indexed textures)
-	bool             pixels_copied;   // true once pixel data has been copied (at Detach time)
+	uint8_t          priority;        // 4-bit priority (0-15) from bits [31:28] per RAVE 1.6 spec
+	uint32_t         pixmap_mac_addr; // deferred direct texture Mac address
+	bool             pixels_copied;   // true once non-empty direct texture data has been observed
+	uint32_t         diag_alpha_zero; // diagnostic: transparent pixels after latest CLUT expansion
+	uint32_t         diag_index_zero; // diagnostic: source index-zero pixels after latest CLUT expansion
+	uint32_t         diag_rgb_nonzero; // diagnostic: non-black level-0 RGB pixels after conversion
 
 	// CPU pixel access (AccessTexture/AccessBitmap support)
 	uint8_t         *cpu_pixel_data;       // permanent CPU copy in original Mac format
 	uint32_t         cpu_pixel_data_size;   // total bytes
 	uint32_t         cpu_pixel_mac_addr;    // Mac-visible address (for PPC access)
 
+	// Q3Pixmap_Set_Image intercept. When set to true by
+	// NativeHookQ3PixmapSetImage, the draw-time read paths
+	// (RaveRealizeDeferredTexture, RaveRefreshTextureFromPixmap) must
+	// prefer cpu_pixel_data over pixmap_mac_addr — cpu_pixel_data holds
+	// the synchronously-copied "authoritative" pixels and the
+	// pixmap_mac_addr Mac heap region may have been freed by the game
+	// (classic-Mac lifecycle pattern). Stays false for textures where
+	// no Set_Image intercept ever fires; those keep the existing
+	// pixmap_mac_addr read path.
+	bool             cpu_pixel_data_is_authoritative;
+
 	// Color table specific fields
 	uint32_t        *clut_data;       // expanded BGRA32 palette (256 or 16 entries)
 	uint32_t         clut_count;      // number of palette entries (256 for CL8, 16 for CL4)
 	int32_t          transparent_index; // -1 if none
 };
+
+static inline bool RaveTextureNeedsLivePixmapRefresh(const RaveResourceEntry *entry)
+{
+	return entry &&
+	       entry->metal_texture != nullptr &&
+	       entry->pixmap_mac_addr != 0 &&
+	       !entry->cpu_pixel_data_is_authoritative &&
+	       !entry->pixels_copied;
+}
 
 #define RAVE_MAX_RESOURCES 512
 
@@ -440,12 +582,60 @@ extern RaveResourceEntry *RaveResourceGet(uint32_t handle);
 // Lookup by Mac address. Returns 1-based handle, or 0 if not found.
 extern uint32_t RaveResourceFindByAddr(uint32_t mac_addr);
 
+// Lookup a RAVE texture entry whose
+// pixmap_mac_addr matches `pixmapAddr`. Returns nullptr if no match
+// (most common case — not every Q3Pixmap is tracked by a RAVE texture).
+// O(n) over rave_resource_table[0..RAVE_MAX_RESOURCES-1]; n is bounded
+// small (512) so this is cheap enough to run from the Q3Pixmap_Set_Image
+// intercept callback. Thread-safety: callers must hold the same
+// invariant as the existing RaveResource* API (single-threaded RAVE
+// dispatch).
+extern RaveResourceEntry *RaveFindTextureByPixmapAddr(uint32_t pixmapAddr);
+
+// Q3Pixmap_Set_Image intercept callback.
+// When the emulated game writes sprite pixels through Q3Pixmap_Set_Image,
+// the FindLibSymbol-based hook (deferred activation) calls this function
+// to synchronously copy the pixels into
+// the RAVE engine's cpu_pixel_data buffer before the Mac heap region
+// gets freed / recycled.
+//
+// Arguments:
+//   pixmapAddr  - Mac address of the target pixmap storage (the buffer
+//                 the game will later free). We look this up against
+//                 every RAVE texture's captured pixmap_mac_addr.
+//   srcHostAddr - Mac address of the source pixel data (the caller-side
+//                 buffer containing the real PICT-decoded pixels). Copied
+//                 into cpu_pixel_data via Host2Mac_memcpy.
+//   byteCount   - Number of bytes to copy (bounded by the receiving
+//                 entry's cpu_pixel_data_size).
+//
+// If no RAVE texture is tracking `pixmapAddr`, returns silently (the
+// write is unrelated to any RAVE-managed texture — common case). If a
+// match is found and the entry has a valid cpu_pixel_data allocation,
+// copies min(byteCount, cpu_pixel_data_size) bytes and sets
+// cpu_pixel_data_is_authoritative = true. Tests call this directly from
+// the harness (no PPC dispatch round-trip) to simulate what the
+// activation-path hook would do on a live Bugdom binary.
+extern void NativeHookQ3PixmapSetImage(uint32_t pixmapAddr,
+                                        uint32_t srcHostAddr,
+                                        uint32_t byteCount);
+
 // Deferred texture creation: creates Metal texture from current Mac memory contents.
 // Called at first draw-time use when metal_texture is nullptr and pixmap_mac_addr is set.
 extern void RaveRealizeDeferredTexture(RaveResourceEntry *entry);
 extern void RaveRefreshTextureFromPixmap(RaveResourceEntry *entry);
 extern bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
                           uint32_t width, uint32_t height, uint32_t rowBytes);
+
+// Test-harness convenience. ConvertPixels
+// variant that reads from a host-side pointer instead of a Mac address.
+// Used by RAVETextureLifecycleTests to exercise the realize/refresh
+// paths on PSFakeMacRAM-backed storage without standing up a full PPC
+// emulator. Production code continues to use ConvertPixels (the Mac
+// address variant).
+extern bool ConvertPixelsFromHost(uint32_t pixelType, const uint8_t *srcHost,
+                                   uint8_t *dst, uint32_t width,
+                                   uint32_t height, uint32_t rowBytes);
 
 /*
  *  Engine method dispatch functions (called from rave_dispatch.cpp)
@@ -461,11 +651,15 @@ extern int32_t NativeEngineColorTableNew(uint32_t tableType, uint32_t pixelDataA
 extern void NativeEngineColorTableDelete(uint32_t colorTableAddr);
 extern int32_t NativeEngineTextureBindColorTable(uint32_t textureAddr, uint32_t colorTableAddr);
 extern int32_t NativeEngineBitmapBindColorTable(uint32_t bitmapAddr, uint32_t colorTableAddr);
+extern bool RaveGetLastCL8ColorTableRGBSnapshot(uint8_t outRGB[768]);
 
 // AccessTexture/AccessBitmap CPU pixel access (RAVE 1.6)
-extern int32_t NativeEngineAccessTexture(uint32_t textureAddr, uint32_t pixelTypePtr, uint32_t pixelBufferPtr, uint32_t rowBytesPtr);
+// SDK signatures: AccessTexture(texture, mipmapLevel, flags, TQAPixelBuffer*)
+//                 AccessBitmap(bitmap, flags, TQAPixelBuffer*)
+// TQAPixelBuffer = TQADeviceMemory = {rowBytes(+0), pixelType(+4), width(+8), height(+12), baseAddr(+16)}
+extern int32_t NativeEngineAccessTexture(uint32_t textureAddr, uint32_t mipmapLevel, uint32_t flags, uint32_t bufferStructAddr);
 extern int32_t NativeEngineAccessTextureEnd(uint32_t textureAddr, uint32_t dirtyRectAddr);
-extern int32_t NativeEngineAccessBitmap(uint32_t bitmapAddr, uint32_t pixelTypePtr, uint32_t pixelBufferPtr, uint32_t rowBytesPtr);
+extern int32_t NativeEngineAccessBitmap(uint32_t bitmapAddr, uint32_t flags, uint32_t bufferStructAddr);
 extern int32_t NativeEngineAccessBitmapEnd(uint32_t bitmapAddr, uint32_t dirtyRectAddr);
 
 /*
@@ -481,7 +675,7 @@ extern void RaveReleaseTexture(void *metalTexture);
 
 /*
  *  ATI RaveExtFuncs native handlers (implemented in rave_metal_renderer.mm)
- *  Temporary weak stubs in rave_dispatch.cpp until Plan 04 provides real implementations.
+ *  Temporary weak stubs in rave_dispatch.cpp until native implementations are available.
  */
 extern int32_t NativeATIClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr);
 extern int32_t NativeATIClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr);

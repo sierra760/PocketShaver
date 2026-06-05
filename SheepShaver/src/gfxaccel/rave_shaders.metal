@@ -4,24 +4,27 @@
  *  (C) 2026 Sierra Burkhart (sierra760)
  *
  *  Uber-shader using Metal function constants for compile-time
- *  specialization. 16 pipeline state variants are pre-built from
- *  combinations of texture/fog/alpha_test/multi_texture boolean constants.
+ *  specialization. RAVE builds texture/fog/alpha_test/multi_texture
+ *  combinations per blend mode, with premultiply tied to that blend mode.
  */
 
 #include <metal_stdlib>
 using namespace metal;
 
 // Function constants for pipeline specialization
-// 2 x 2 x 2 x 2 = 16 pipeline state combinations
+// Texture/fog/alpha/multitexture state, plus output alpha convention.
 constant bool has_texture       [[function_constant(0)]];
 constant bool has_fog           [[function_constant(1)]];
 constant bool has_alpha_test    [[function_constant(2)]];
 constant bool has_multi_texture [[function_constant(3)]];
+constant bool premultiply_output [[function_constant(4)]];
 
 struct VertexIn {
     float4 position [[attribute(0)]];
     float4 color    [[attribute(1)]];
     float4 texcoord [[attribute(2)]];  // (uOverW, vOverW, invW, 0) for textured; (0,0,0,0) for Gouraud
+    float4 diffuse  [[attribute(3)]];
+    float4 specular [[attribute(4)]];
 };
 
 struct VertexOut {
@@ -30,6 +33,8 @@ struct VertexOut {
     float4 color;
     float4 texcoord;  // pass all 4 for perspective-correct interpolation
     float4 texcoord2; // second UV pair for multi-texture (uOverW2, vOverW2, invW2, 0)
+    float4 diffuse;
+    float4 specular;
 };
 
 struct Viewport {
@@ -64,6 +69,7 @@ struct FragmentUniforms {
     float env_color_g;
     float env_color_b;
     float env_color_a;
+    int use_vertex_alpha_for_texture_opacity;
 };
 
 vertex VertexOut rave_vertex(VertexIn in [[stage_in]],
@@ -80,6 +86,8 @@ vertex VertexOut rave_vertex(VertexIn in [[stage_in]],
     out.position.w = in.position.w;  // always 1.0 for now
     out.pointSize = vertUniforms.point_width;
     out.color = in.color;
+    out.diffuse = in.diffuse;
+    out.specular = in.specular;
     if (has_texture || has_fog) {
         out.texcoord = in.texcoord;  // pass through all 4 components (fog needs texcoord.z = invW)
     }
@@ -112,26 +120,35 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         // flip needed here — the interpolated values are already correct.
 
         float4 texPix = tex.sample(samp, uv, bias(uniforms.mipmap_bias));
+        bool sampledTransparentTexel = texPix.a <= 0.0;
+        float vertexOpacity = uniforms.use_vertex_alpha_for_texture_opacity ? color.a : 1.0;
 
-        // TextureOp processing per RAVE spec
-        // Per RAVE spec, Decal takes precedence over Modulate when both bits set
+        // TextureOp processing per RAVE spec: TextureOp is a mask, so the
+        // decal/base step can be followed by diffuse modulation and highlight.
         if (uniforms.texture_op & 4) {  // Decal
             texPix.rgb = texPix.a * texPix.rgb + (1.0 - texPix.a) * color.rgb;
-            texPix.a = color.a;
+            texPix.a = vertexOpacity;
         } else if (uniforms.texture_op & 16) {  // Blend (bit 4): GL_TEXTURE_ENV_MODE GL_BLEND
             // Per GL spec: Cv = (1-Cs)*Cc + Cs*Cv where Cs=texture, Cc=env_color
             float3 envColor = float3(uniforms.env_color_r, uniforms.env_color_g, uniforms.env_color_b);
             texPix.rgb = (1.0 - texPix.rgb) * envColor + texPix.rgb * color.rgb;
-            texPix.a *= color.a;
-        } else if (uniforms.texture_op & 1) {  // Modulate: color.rgb carries kd_rgb (only if Decal/Blend not set)
-            texPix.rgb = saturate(texPix.rgb * color.rgb);
-            texPix.a *= color.a;
+            texPix.a *= vertexOpacity;
         } else {
-            texPix.a *= color.a;
+            texPix.a *= vertexOpacity;
         }
 
-        if (uniforms.texture_op & 2) {  // Highlight: color.rgb carries ks_rgb (additive)
-            texPix.rgb = saturate(texPix.rgb + color.rgb);
+        // Fully transparent samples must not write depth; Bugdom draws large
+        // cutout texture quads with normal Z enabled.
+        if (sampledTransparentTexel && !(uniforms.texture_op & 4)) {
+            discard_fragment();
+        }
+
+        if (uniforms.texture_op & 1) {  // Modulate: multiply by kd_rgb
+            texPix.rgb = saturate(texPix.rgb * in.diffuse.rgb);
+        }
+
+        if (uniforms.texture_op & 2) {  // Highlight: add ks_rgb
+            texPix.rgb = saturate(texPix.rgb + in.specular.rgb);
         }
 
         color = texPix;
@@ -182,22 +199,32 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         }
     }
 
+    // Fog invW depth z=1/invW and all 5 fog modes verified against RAVE.h.
+    // Test: RAVERenderingStateTests.testFogLinear, testFogExponential, testFogExponentialSquared
+    // FogMode_Alpha uses vertex alpha as fog factor, output alpha=1.0 per spec.
+    // Test: RAVERenderingStateTests.testFogAlpha
+    //
     // Fog SECOND (applied only to surviving fragments)
+    // FogMode_None(0): no fog
+    // FogMode_Alpha(1): fog_factor = vertex.alpha, then alpha = 1.0
+    // FogMode_Linear(2): z = 1/invW, fog = (end - z) / (end - start)
+    // FogMode_Exponential(3): z = 1/invW, fog = exp(-density * z)
+    // FogMode_ExponentialSquared(4): z = 1/invW, fog = exp(-(density*z)^2)
     if (has_fog) {
         float fog_factor = 1.0;
         if (uniforms.fog_mode == 1) {
             // Alpha-based fog: vertex alpha IS the fog interpolation factor
-            fog_factor = color.a;
+            fog_factor = in.color.a;
         } else if (uniforms.fog_mode == 2) {
-            // Linear fog -- GAP-011: use invW-based depth when available
+            // Linear fog: use perspective depth; submitted z is post-projection depth and over-fogs QD3D menu billboards.
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             fog_factor = clamp((uniforms.fog_end - z) / (uniforms.fog_end - uniforms.fog_start), 0.0, 1.0);
         } else if (uniforms.fog_mode == 3) {
-            // Exponential fog -- GAP-011: use invW-based depth when available
+            // Exponential fog: z = 1/invW, fog = clamp(exp(-density * z), 0, 1)
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             fog_factor = clamp(exp(-uniforms.fog_density * z), 0.0, 1.0);
         } else if (uniforms.fog_mode == 4) {
-            // Exponential squared fog -- GAP-011: use invW-based depth when available
+            // Exponential squared fog: z = 1/invW, fog = clamp(exp(-(density*z)^2), 0, 1)
             float z = (in.texcoord.z > 0.0) ? (1.0 / in.texcoord.z) : (in.position.z * uniforms.fog_max_depth);
             float dz = uniforms.fog_density * z;
             fog_factor = clamp(exp(-dz * dz), 0.0, 1.0);
@@ -205,8 +232,12 @@ fragment float4 rave_fragment(VertexOut in [[stage_in]],
         float3 fog_color = float3(uniforms.fog_color_r, uniforms.fog_color_g, uniforms.fog_color_b);
         color.rgb = mix(fog_color, color.rgb, fog_factor);
         if (uniforms.fog_mode == 1) {
-            color.a = 1.0;  // GAP-013: FogMode_Alpha disables vertex alpha blending
+            color.a = 1.0;  // FogMode_Alpha disables vertex alpha blending per spec
         }
+    }
+
+    if (premultiply_output) {
+        color.rgb *= color.a;
     }
 
     return color;

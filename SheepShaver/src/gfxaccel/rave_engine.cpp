@@ -22,24 +22,128 @@
 #include "macos_util.h"
 #include "thunks.h"
 #include "rave_engine.h"
+#include "rave_device_summary.h"
+#include "rave_engine_enable_policy.h"
+#include "rave_engine_identity.h"
+#include "rave_texture_snapshot_policy.h"
+#include "rave_metal_renderer.h"
+#include "dsp_pixmap_offsets.h"
+#include "gfxaccel_resources.h"
+#include "metal_compositor.h"  // MetalCompositorSubmitFrame_ClearCachedOverlay
 
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <cstdarg>
 
 #define DEBUG 0
 #include "debug.h"
 
-// RAVE error codes
-#define kQANoErr          0
-#define kQANotSupported  -1
-#define kQAError         -2
+#if ACCEL_LOGGING_ENABLED
+static FILE *RaveDiagFile()
+{
+	static bool initialized = false;
+	static FILE *file = nullptr;
+
+	if (initialized) return file;
+	initialized = true;
+
+	const char *dumpDir = getenv("TMPDIR");
+	if (dumpDir == nullptr || dumpDir[0] == '\0') dumpDir = "/tmp";
+	size_t dumpDirLen = strlen(dumpDir);
+	const char *slash = (dumpDirLen > 0 && dumpDir[dumpDirLen - 1] == '/') ? "" : "/";
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s%srave_diag.txt", dumpDir, slash);
+	file = fopen(path, "w");
+	if (file != nullptr) {
+		printf("RAVE DIAG: verbose log path=%s\n", path);
+		fflush(stdout);
+	} else {
+		printf("RAVE DIAG: verbose log fopen_failed path=%s errno=%d (%s)\n",
+		       path, errno, strerror(errno));
+		fflush(stdout);
+	}
+	return file;
+}
+
+void RaveDiagLog(const char *fmt, ...)
+{
+	if (!rave_logging_enabled) return;
+	FILE *file = RaveDiagFile();
+	if (file == nullptr) return;
+
+	va_list args;
+	va_start(args, fmt);
+	fprintf(file, "RAVE DIAG: ");
+	vfprintf(file, fmt, args);
+	fprintf(file, "\n");
+	fflush(file);
+	va_end(args);
+}
+#endif
+
+#ifdef TESTING_BUILD
+// ---------------------------------------------------------------------------
+// TESTING_BUILD probe for rave_engine.cpp.
+//
+// rave_engine.cpp does NOT call SharedMetalDevice() or any singleton that
+// fails in test context.  ConvertPixels and RavePixelFormatName are pure
+// CPU functions callable from tests with only PSFakeMacRAM installed.
+//
+// RaveTesting_IsTestBuild() is a trivial probe so tests can assert the
+// TESTING_BUILD compilation path is active for this translation unit.
+// ---------------------------------------------------------------------------
+extern "C" int RaveTesting_IsTestBuild(void)
+{
+	return 1;
+}
+#endif /* TESTING_BUILD */
+
+// RAVE error codes (must match TQAError enum in RAVE.h)
+#define kQANoErr                    0
+#define kQAError                    1
+#define kQAOutOfMemory              2
+#define kQANotSupported             3
+#define kQAOutOfDate                4
+#define kQAParamErr                 5
+#define kQAGestaltUnknown           6
+#define kQADisplayModeUnsupported   7
+#define kQAOutOfVideoMemory         8
 
 // Free list for recycling TQADrawContext Mac addresses.
 // SheepMem::ReserveProc is a permanent bump allocator -- without recycling,
 // apps that create/destroy contexts every frame (e.g. RAVE Bench) exhaust
 // the 512KB SheepMem region and corrupt PPC memory, causing hangs.
 static std::vector<uint32> rave_ctx_free_list;
+
+static uint8_t rave_last_cl8_color_table_rgb[768];
+static bool rave_last_cl8_color_table_valid = false;
+
+static void RaveRememberCL8ColorTableSnapshot(const uint32_t *clut, uint32_t count)
+{
+	if (clut == nullptr || count != 256)
+		return;
+
+	for (uint32_t i = 0; i < 256; i++) {
+		const uint32_t bgra = clut[i];
+		rave_last_cl8_color_table_rgb[i * 3 + 0] = (uint8_t)((bgra >> 16) & 0xffu);
+		rave_last_cl8_color_table_rgb[i * 3 + 1] = (uint8_t)((bgra >> 8) & 0xffu);
+		rave_last_cl8_color_table_rgb[i * 3 + 2] = (uint8_t)(bgra & 0xffu);
+	}
+	rave_last_cl8_color_table_valid = true;
+}
+
+bool RaveGetLastCL8ColorTableRGBSnapshot(uint8_t outRGB[768])
+{
+	if (!rave_last_cl8_color_table_valid || outRGB == nullptr)
+		return false;
+	memcpy(outRGB, rave_last_cl8_color_table_rgb, sizeof(rave_last_cl8_color_table_rgb));
+	return true;
+}
 
 // kQAPixel_* constants already defined in enum below (line ~155)
 
@@ -94,11 +198,73 @@ enum {
 	kQAGestalt_NumSelectors
 };
 
-// TQADevice type discriminator
-enum {
-	kQADeviceMemory = 0,
-	kQADeviceGDevice = 1
-};
+static void RaveLogDeviceSummary(const char *label, uint32 device)
+{
+	if (device == 0) {
+		RAVE_LOG("%s: device=NULL", label);
+		return;
+	}
+
+	uint32 deviceType = ReadMacInt32(device + kRaveDeviceOff_Type);
+	if (deviceType == kRaveDeviceTypeMemory) {
+		uint32 rowBytes  = ReadMacInt32(device + kRaveDeviceOff_MemoryRowBytes);
+		uint32 pixelType = ReadMacInt32(device + kRaveDeviceOff_MemoryPixelType);
+		uint32 width     = ReadMacInt32(device + kRaveDeviceOff_MemoryWidth);
+		uint32 height    = ReadMacInt32(device + kRaveDeviceOff_MemoryHeight);
+		uint32 baseAddr  = ReadMacInt32(device + kRaveDeviceOff_MemoryBaseAddr);
+		RAVE_LOG("%s: device=0x%08x type=%s rowBytes=%u pixelType=%u "
+		         "size=%ux%u baseAddr=0x%08x",
+		         label, device, RaveDeviceTypeName(deviceType),
+		         rowBytes, pixelType, width, height, baseAddr);
+	} else if (deviceType == kRaveDeviceTypeGDevice) {
+		uint32 gdevice = ReadMacInt32(device + kRaveDeviceOff_GDeviceHandle);
+		RAVE_LOG("%s: device=0x%08x type=%s gDevice=0x%08x",
+		         label, device, RaveDeviceTypeName(deviceType), gdevice);
+		if (gdevice != 0) {
+			uint32 gdevicePtr = ReadMacInt32(gdevice);
+			uint32 pixMapH = gdevicePtr != 0
+				? ReadMacInt32(gdevicePtr + GDEVICE_OFF_PMAP)
+				: 0;
+			uint32 pixMapPtr = pixMapH != 0 ? ReadMacInt32(pixMapH) : 0;
+			if (pixMapPtr != 0) {
+				uint32 baseAddr = ReadMacInt32(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BASEADDR);
+				uint16 rbRaw = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_ROWBYTES);
+				int16 top = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_TOP);
+				int16 left = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_LEFT);
+				int16 bottom = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_BOT);
+				int16 right = (int16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_BOUNDS_RIGHT);
+				uint16 pixelType = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELTYPE);
+				uint16 pixelSize = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_PIXELSIZE);
+				uint16 cmpCount = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPCOUNT);
+				uint16 cmpSize = (uint16)ReadMacInt16(
+					pixMapPtr + DSP_MAINDEVICE_PIXMAP_OFF_CMPSIZE);
+				RAVE_LOG("%s: GDevice ptr=0x%08x pixMapH=0x%08x "
+				         "pixMap=0x%08x baseAddr=0x%08x rbRaw=0x%04x "
+				         "rb=%u bounds=%d,%d,%d,%d pixelType=0x%04x "
+				         "pixelSize=%u cmpCount=%u cmpSize=%u",
+				         label, gdevicePtr, pixMapH, pixMapPtr, baseAddr,
+				         rbRaw, (unsigned)(rbRaw & 0x3FFFu),
+				         (int)top, (int)left, (int)bottom, (int)right,
+				         pixelType, pixelSize, cmpCount, cmpSize);
+			} else {
+				RAVE_LOG("%s: GDevice ptr=0x%08x pixMapH=0x%08x "
+				         "pixMap=NULL", label, gdevicePtr, pixMapH);
+			}
+		}
+	} else {
+		RAVE_LOG("%s: device=0x%08x type=%s(%u)",
+		         label, device, RaveDeviceTypeName(deviceType), deviceType);
+	}
+}
 
 // kQAOptional_* feature flags (RAVE 1.6)
 // Bit assignments MUST match DDK RAVE.h exactly.
@@ -169,8 +335,12 @@ enum {
 	kQAPixel_ACL16_88 = 11,
 	kQAPixel_I8 = 12,
 	kQAPixel_AI16_88 = 13,
-	kQAPixel_YUV422 = 14,   // GAP-007: YUV 4:2:2 interleaved
-	kQAPixel_YUV411 = 15    // GAP-007: YUV 4:1:1 interleaved
+	// YUV YUVS/YUVU conversion implemented. Test: RAVEPixelTypeTests.testYUVS_convertPixels
+	// Renamed per QD3D 1.6 RAVE.h -- both are 4:2:2 variants (unsigned vs signed UV), not 4:2:2 vs 4:1:1
+	kQAPixel_YUVS = 14,     // YUYV unsigned UV (4:2:2)
+	kQAPixel_YUVU = 15,     // YUYV signed UV (4:2:2)
+	kQAPixel_YUV422 = 14,   // backward-compat alias for kQAPixel_YUVS
+	kQAPixel_YUV411 = 15    // backward-compat alias for kQAPixel_YUVU (misnomer)
 };
 
 // OptionalFeatures bitmask -- advertise features we actually support.
@@ -191,23 +361,27 @@ enum {
 static const uint32 kAllOptionalFeatures =
 	kQAOptional_DeepZ | kQAOptional_Texture | kQAOptional_TextureHQ |
 	kQAOptional_TextureColor | kQAOptional_Blend | kQAOptional_BlendAlpha |
-	kQAOptional_Antialias | kQAOptional_ZSorted | kQAOptional_PerspectiveZ |
+	// Deliberate: kQAOptional_PerspectiveZ (bit8) de-advertised — depth is always
+	// submitted as raw z (rave_metal_renderer.mm:1234); 1/invW HSR deferred (Tomb Raider 95.0
+	// out-of-[0,1] Metal clipping, :1229-1233). Capability honesty: no advertised-but-inert bit.
+	kQAOptional_Antialias | kQAOptional_ZSorted |
 	kQAOptional_CL4 | kQAOptional_CL8 |
 	kQAOptional_FogAlpha | kQAOptional_FogDepth | kQAOptional_MultiTextures |
 	kQAOptional_MipmapBias | kQAOptional_ChannelMask | kQAOptional_ZBufferMask |
 	kQAOptional_AlphaTest | kQAOptional_AccessTexture | kQAOptional_AccessBitmap |
 	kQAOptional_AccessDrawBuffer | kQAOptional_AccessZBuffer |
-	kQAOptional_ClearDrawBuffer | kQAOptional_ClearZBuffer | // GAP-016: OffscreenDrawContexts removed (not implemented)
-	kQAOptional_OpenGL;
+	kQAOptional_ClearDrawBuffer | kQAOptional_ClearZBuffer | // OffscreenDrawContexts removed (not implemented)
+	kQAOptional_OpenGL;  // GL tags 100-153 are stored/retrieved via Set/GetInt — games rely on this for scissor, blend, wrap
 
-// OptionalFeatures2 bitmask -- only advertise what we support
+// OptionalFeatures2 bitmask -- only advertise what we support.
 // Bit assignments now match DDK RAVE 1.6 Specification exactly.
 static const uint32 kAllOptionalFeatures2 =
 	kQAOptional2_TextureDrawContexts | kQAOptional2_BitmapDrawContexts |
-	kQAOptional2_Busy | kQAOptional2_SwapBuffers | kQAOptional2_PriorityBits |  // GAP-001
+	kQAOptional2_Busy | kQAOptional2_SwapBuffers |
+	kQAOptional2_PriorityBits |  // kQAOptional2_PriorityBits advertised correctly; priority extraction fixed. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 	kQAOptional2_BitmapScale;
 
-// GAP-029: kQAFast_* constants (RAVE 1.6) -- DIFFERENT bit positions from kQAOptional_*
+// kQAFast_* bit positions verified against RAVE.h. Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 // These are NOT aliases. Per RAVE.h, kQAFast_xxx has its own bit namespace.
 enum {
 	kQAFast_None            = 0,
@@ -393,6 +567,87 @@ uint32_t RaveResourceFindByAddr(uint32_t mac_addr) {
 		}
 	}
 	return 0;
+}
+
+/*
+ *  Lookup a RAVE texture entry whose
+ *  pixmap_mac_addr matches `pixmapAddr`.
+ *
+ *  Returns the first matching texture entry, or nullptr if no match.
+ *  Bitmap and color-table entries are excluded (they don't use
+ *  pixmap_mac_addr in the same sense — bitmap data is eager-copied, so
+ *  we only care about the deferred-direct-format texture path that
+ *  Bugdom's ARGB16 sprites take).
+ */
+RaveResourceEntry *RaveFindTextureByPixmapAddr(uint32_t pixmapAddr)
+{
+	if (pixmapAddr == 0) return nullptr;
+	for (int i = 0; i < RAVE_MAX_RESOURCES; i++) {
+		RaveResourceEntry *e = &rave_resource_table[i];
+		if (e->type == kRaveResourceTexture &&
+		    e->pixmap_mac_addr == pixmapAddr) {
+			return e;
+		}
+	}
+	return nullptr;
+}
+
+/*
+ *  Q3Pixmap_Set_Image intercept callback.
+ *
+ *  Synchronously copies `byteCount` bytes from `srcHostAddr` into the
+ *  cpu_pixel_data buffer of the RAVE texture tracking `pixmapAddr`,
+ *  bounded by the entry's cpu_pixel_data_size. Marks the entry as
+ *  `cpu_pixel_data_is_authoritative` so the subsequent
+ *  RaveRealizeDeferredTexture / RaveRefreshTextureFromPixmap calls
+ *  read from cpu_pixel_data instead of pixmap_mac_addr.
+ *
+ *  If no RAVE texture tracks this pixmap address, returns silently —
+ *  most Q3Pixmap_Set_Image calls are unrelated to any RAVE texture
+ *  (e.g. Q3Pixmaps backing 2D PICT draws, not 3D sprite textures),
+ *  and we must not log-spam or stall in those cases.
+ *
+ *  Thread-safety: inherits the single-threaded RAVE dispatch invariant.
+ *  The FindLibSymbol-based activation hook (deferred to a follow-up)
+ *  runs on the emulated PPC
+ *  thread, same as RAVE dispatch, so no additional locking is needed.
+ */
+void NativeHookQ3PixmapSetImage(uint32_t pixmapAddr,
+                                 uint32_t srcHostAddr,
+                                 uint32_t byteCount)
+{
+	RaveResourceEntry *entry = RaveFindTextureByPixmapAddr(pixmapAddr);
+	if (!entry) {
+		// Not a RAVE-tracked pixmap — unrelated Q3Pixmap_Set_Image call.
+		// Silent return; must not log-spam.
+		return;
+	}
+	if (!entry->cpu_pixel_data || entry->cpu_pixel_data_size == 0) {
+		// Entry exists but has no cpu_pixel_data buffer (Mac_sysalloc
+		// failed at TextureNew time). Defensive: fall back to the
+		// pixmap_mac_addr path by leaving the flag unset.
+		RAVE_LOG("Q3Pixmap_Set_Image: entry has no cpu_pixel_data buffer; "
+		         "pixmap=0x%08x", pixmapAddr);
+		return;
+	}
+
+	// Bound the copy by our cpu_pixel_data buffer size.
+	uint32_t copyBytes = byteCount;
+	if (copyBytes > entry->cpu_pixel_data_size) {
+		copyBytes = entry->cpu_pixel_data_size;
+	}
+
+	// Copy src -> cpu_pixel_data. Under EMULATED_PPC, srcHostAddr is a
+	// Mac address; Mac2HostAddr resolves it to a host pointer. Under
+	// TESTING_BUILD (EMULATED_PPC=0), Mac2HostAddr is the identity cast
+	// per PSFakeMacRAM's contract.
+	memcpy(entry->cpu_pixel_data, Mac2HostAddr(srcHostAddr), copyBytes);
+
+	entry->cpu_pixel_data_is_authoritative = true;
+
+	RAVE_LOG("Q3Pixmap_Set_Image intercept: pixmap=0x%08x src=0x%08x "
+	         "bytes=%u (bounded=%u) -> cpu_pixel_data_is_authoritative=true",
+	         pixmapAddr, srcHostAddr, byteCount, copyBytes);
 }
 
 /*
@@ -643,6 +898,89 @@ static void ExpandACL16_88(const uint8_t *srcBuf, uint8_t *dst, uint32_t width, 
 }
 
 
+// BT.601 YUYV-to-BGRA converter for kQAPixel_YUVS (unsigned UV).
+// YUYV format: 2 pixels per 4 bytes. Big-endian Mac byte order: Y0 U Y1 V.
+// BT.601: R = Y + 1.402*(V-128), G = Y - 0.344*(U-128) - 0.714*(V-128), B = Y + 1.772*(U-128)
+// Output: BGRA8 (B=byte0, G=byte1, R=byte2, A=0xFF).
+// T-08-03 mitigation: validate width*2 <= rowBytes before pixel loop.
+static inline uint8_t clamp_u8(int v)
+{
+	return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+static void ConvertYUVS(uint32 srcAddr, uint8_t *dst,
+                        uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	// T-08-03: rowBytes must be at least width*2 (2 bytes per pixel in YUYV)
+	if (width > 0 && rowBytes < width * 2) {
+		memset(dst, 0, (size_t)width * height * 4);
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		uint32 rowAddr = srcAddr + y * rowBytes;
+		for (uint32_t x = 0; x < width; x += 2) {
+			uint8_t Y0 = ReadMacInt8(rowAddr + x * 2 + 0);
+			uint8_t U  = ReadMacInt8(rowAddr + x * 2 + 1);
+			uint8_t Y1 = ReadMacInt8(rowAddr + x * 2 + 2);
+			uint8_t V  = ReadMacInt8(rowAddr + x * 2 + 3);
+
+			// BT.601 unsigned UV: offset by -128 to center around zero
+			int cr = V - 128;
+			int cb = U - 128;
+			for (int p = 0; p < 2; p++) {
+				if (x + p >= width) break;  // handle odd widths
+				int Yp = (p == 0) ? Y0 : Y1;
+				int r = Yp + (int)(1.402f * cr);
+				int g = Yp - (int)(0.344f * cb) - (int)(0.714f * cr);
+				int b = Yp + (int)(1.772f * cb);
+				uint32_t idx = (y * width + x + p) * 4;
+				dst[idx + 0] = clamp_u8(b);   // B
+				dst[idx + 1] = clamp_u8(g);   // G
+				dst[idx + 2] = clamp_u8(r);   // R
+				dst[idx + 3] = 0xFF;           // A (opaque)
+			}
+		}
+	}
+}
+
+// BT.601 YUYV-to-BGRA converter for kQAPixel_YUVU (signed UV).
+// Same as YUVS but UV bytes are interpreted as signed: int cr = (int8_t)V; int cb = (int8_t)U;
+// No -128 offset since the values are already in signed range [-128..127].
+static void ConvertYUVU(uint32 srcAddr, uint8_t *dst,
+                        uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	// T-08-03: rowBytes must be at least width*2 (2 bytes per pixel in YUYV)
+	if (width > 0 && rowBytes < width * 2) {
+		memset(dst, 0, (size_t)width * height * 4);
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		uint32 rowAddr = srcAddr + y * rowBytes;
+		for (uint32_t x = 0; x < width; x += 2) {
+			uint8_t Y0 = ReadMacInt8(rowAddr + x * 2 + 0);
+			uint8_t U  = ReadMacInt8(rowAddr + x * 2 + 1);
+			uint8_t Y1 = ReadMacInt8(rowAddr + x * 2 + 2);
+			uint8_t V  = ReadMacInt8(rowAddr + x * 2 + 3);
+
+			// BT.601 signed UV: interpret U/V as signed bytes directly
+			int cr = (int8_t)V;
+			int cb = (int8_t)U;
+			for (int p = 0; p < 2; p++) {
+				if (x + p >= width) break;  // handle odd widths
+				int Yp = (p == 0) ? Y0 : Y1;
+				int r = Yp + (int)(1.402f * cr);
+				int g = Yp - (int)(0.344f * cb) - (int)(0.714f * cr);
+				int b = Yp + (int)(1.772f * cb);
+				uint32_t idx = (y * width + x + p) * 4;
+				dst[idx + 0] = clamp_u8(b);   // B
+				dst[idx + 1] = clamp_u8(g);   // G
+				dst[idx + 2] = clamp_u8(r);   // R
+				dst[idx + 3] = 0xFF;           // A (opaque)
+			}
+		}
+	}
+}
+
 /*
  *  RavePixelFormatName - return human-readable name for a kQAPixel_* constant
  *  Used by diagnostic logging to identify texture formats on-device.
@@ -664,8 +1002,8 @@ static const char *RavePixelFormatName(uint32_t pixelType)
 		case kQAPixel_ACL16_88:     return "ACL16_88";
 		case kQAPixel_I8:           return "I8";
 		case kQAPixel_AI16_88:      return "AI16_88";
-		case kQAPixel_YUV422:       return "YUV422";
-		case kQAPixel_YUV411:       return "YUV411";
+		case kQAPixel_YUVS:         return "YUVS";
+		case kQAPixel_YUVU:         return "YUVU";
 		default:                    return "UNKNOWN";
 	}
 }
@@ -684,12 +1022,14 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 			ConvertARGB32(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB32:
+			// RGB32 validated. Test: RAVEPixelTypeTests.testRGB32_convertPixels
 			ConvertRGB32(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_ARGB16:
 			ConvertARGB16(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB16:
+			// RGB16 validated. Test: RAVEPixelTypeTests.testRGB16_convertPixels
 			ConvertRGB16(srcAddr, dst, width, height, rowBytes);
 			break;
 		case kQAPixel_RGB8_332:
@@ -704,39 +1044,65 @@ bool ConvertPixels(uint32_t pixelType, uint32 srcAddr, uint8_t *dst,
 		case kQAPixel_AI16_88:
 			ConvertAI16_88(srcAddr, dst, width, height, rowBytes);
 			break;
-		// GAP-008: Stub converters for exotic pixel types
-		// These produce opaque black BGRA as a safe fallback.
-		case kQAPixel_Alpha1:
-		case kQAPixel_RGB16_565:
-		case kQAPixel_RGB24: {
-			RAVE_LOG("ConvertPixels: stub conversion for pixelType=%d (%dx%d) -> opaque black",
-			         pixelType, width, height);
-			uint32_t totalPixels = width * height * 4;
-			memset(dst, 0, totalPixels);
-			// Set alpha to 0xFF for opaque black
-			for (uint32_t i = 3; i < totalPixels; i += 4) {
-				dst[i] = 0xFF;
-			}
+		case kQAPixel_YUVS:
+			// YUVS BT.601 conversion. Test: RAVEPixelTypeTests.testYUVS_convertPixels
+			ConvertYUVS(srcAddr, dst, width, height, rowBytes);
 			break;
-		}
+		case kQAPixel_YUVU:
+			// YUVU BT.601 signed-UV conversion. Test: RAVEPixelTypeTests.testYUVU_convertPixels_signedUV
+			ConvertYUVU(srcAddr, dst, width, height, rowBytes);
+			break;
+		// Exotic types are deliberately unconverted. Test: RAVEPixelTypeTests.testExoticPixelTypes_documentedErrors
+		// These return false (unconverted) because they are not used by Mac OS 9 RAVE apps:
+		case kQAPixel_Alpha1:
+			// Deliberate: kQAPixel_Alpha1 not used by known Mac OS 9 RAVE apps.
+		case kQAPixel_RGB16_565:
+			// Deliberate: kQAPixel_RGB16_565 is "Win32 ONLY" per RAVE.h; no Mac OS 9 apps use this path.
+		case kQAPixel_RGB24:
+			// Deliberate: kQAPixel_RGB24 is "Win32 ONLY" per RAVE.h.
+			converted = false;
+			break;
 		default:
 			converted = false;  // indexed format -- needs CLUT
 			break;
 	}
 
-	// [DIAG-T03] Log first 4 output BGRA pixel values for texture diagnostics
+	// [DIAG-T03] Log first 4 output BGRA pixel values and full-image coverage
+	// for texture diagnostics.
 	if (converted && rave_logging_enabled && width > 0 && height > 0) {
 		uint32_t px[4] = {0, 0, 0, 0};
 		uint32_t numPx = width * height;
 		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
 			memcpy(&px[i], &dst[i * 4], 4);
 		}
-		printf("RAVE DIAG: ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X\n",
-		       RavePixelFormatName(pixelType), pixelType, width, height,
-		       px[0], px[1], px[2], px[3]);
+		RaveBGRAImageStats stats = RaveBGRAImageAnalyze(dst, numPx);
+		RaveDiagLog("ConvertPixels fmt=%s(%d) %dx%d px[0-3]=%08X %08X %08X %08X nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u",
+		            RavePixelFormatName(pixelType), pixelType, width, height,
+		            px[0], px[1], px[2], px[3],
+		            stats.nonzero, stats.alpha, stats.rgb, stats.white,
+		            stats.first_nonzero, stats.first_alpha, stats.first_rgb);
 	}
 
 	return converted;
+}
+
+
+/*
+ *  Host-pointer variant of ConvertPixels.
+ *
+ *  Under EMULATED_PPC=0 (test build), Mac2HostAddr is the identity cast
+ *  and ReadMacInt* reduces to host-endian byte loads at a host pointer.
+ *  The existing ConvertPixels already works on host pointers in that
+ *  case — we just need to cast the pointer to uint32.  This wrapper
+ *  makes the intent explicit (no Mac-address arithmetic involved) and
+ *  gives tests a clean entry point.
+ */
+bool ConvertPixelsFromHost(uint32_t pixelType, const uint8_t *srcHost,
+                            uint8_t *dst, uint32_t width,
+                            uint32_t height, uint32_t rowBytes)
+{
+	return ConvertPixels(pixelType, (uint32)(uintptr_t)srcHost, dst,
+	                     width, height, rowBytes);
 }
 
 
@@ -755,8 +1121,8 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 	uint32_t rowBytes = ReadMacInt32(imagesAddr + 8);
 	uint32_t pixmap   = ReadMacInt32(imagesAddr + 12);
 
-	// GAP-010: Extract priority bits from upper 16 bits of flags (per RAVE 1.6 spec)
-	entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+	// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+	entry->priority = (uint8_t)((flags >> 28) & 0xF);
 
 	bool hasMipmaps = (flags & 2);  // kQATexture_Mipmap = (1 << 1) = bit 1
 	uint32_t mipLevels = 1;
@@ -771,13 +1137,20 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 	entry->mip_levels = mipLevels;
 	entry->row_bytes  = rowBytes;
 
+	// New textures start with
+	// cpu_pixel_data_is_authoritative=false; the flag is flipped by
+	// NativeHookQ3PixmapSetImage if a Q3Pixmap_Set_Image intercept
+	// fires for this texture's pixmap_mac_addr. Explicit init for
+	// clarity even though RaveResourceAlloc memsets the entry to 0.
+	entry->cpu_pixel_data_is_authoritative = false;
+
 	bool isIndexed = (pixelType == kQAPixel_CL8 || pixelType == kQAPixel_CL4 || pixelType == kQAPixel_ACL16_88);
 
 	// [DIAG-T03] Texture creation diagnostic: format, dimensions, flags
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: TextureCreate fmt=%s(%d) %dx%d mips=%d indexed=%d flags=0x%08X rowBytes=%d\n",
-		       RavePixelFormatName(pixelType), pixelType, w, h, mipLevels,
-		       isIndexed ? 1 : 0, flags, rowBytes);
+		RaveDiagLog("TextureCreate fmt=%s(%d) %dx%d mips=%d indexed=%d flags=0x%08X rowBytes=%d",
+		            RavePixelFormatName(pixelType), pixelType, w, h, mipLevels,
+		            isIndexed ? 1 : 0, flags, rowBytes);
 	}
 
 	if (isIndexed) {
@@ -821,27 +1194,68 @@ static void RaveCreateTextureFromImages(uint32_t flags, uint32_t pixelType,
 		RAVE_LOG("TextureNew indexed (pixelType=%d) %dx%d mips=%d rowBytes=%d pixmap=0x%08x",
 		       pixelType, w, h, mipLevels, rowBytes, pixmap);
 	} else {
-		// Direct format -- defer Metal texture creation until first draw.
-		// Some textures (QD3D menu backgrounds) start with empty pixmap data
-		// that gets filled later via QAAccessTexture/End.  Others (game-engine
-		// textures) have valid data immediately.  Deferred creation handles both.
+		// Direct format. Snapshot immediately when level 0 already contains
+		// converted data; otherwise keep the existing deferred path for clients
+		// that hand RAVE an empty buffer and fill it shortly after TextureNew.
 		entry->pixmap_mac_addr = pixmap;
 		entry->metal_texture = nullptr;
 		entry->pixels_copied = false;
 
-		// For mipmapped textures, cache the TQAImage array (it may be on
-		// the caller's stack and won't survive past this call).
-		if (hasMipmaps && mipLevels > 1) {
-			uint32_t imagesSize = mipLevels * 16;
-			entry->original_pixels = new uint8_t[imagesSize];
-			entry->original_size = imagesSize;
-			for (uint32_t b = 0; b < imagesSize; b++) {
-				entry->original_pixels[b] = ReadMacInt8(imagesAddr + b);
-			}
-		}
+		uint8_t *expanded = new uint8_t[w * h * 4];
+		const bool converted = ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
+		const bool whitenedAlphaMask =
+			(pixelType == kQAPixel_ARGB32) && RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
+		RaveBGRAImageStats sourceStats = converted
+			? RaveBGRAImageAnalyze(expanded, w * h)
+			: RaveBGRAImageStats{0, 0, 0, 0, w * h, w * h, w * h};
+		entry->diag_alpha_zero = (w * h) - sourceStats.alpha;
+		entry->diag_index_zero = 0;
+		entry->diag_rgb_nonzero = sourceStats.rgb;
+		const bool snapshotNow =
+			converted && RaveDirectTextureShouldSnapshotConvertedSource(sourceStats.nonzero);
 
-		RAVE_LOG("TextureNew deferred (pixelType=%d) %dx%d mips=%d pixmap=0x%08x",
-		       pixelType, w, h, mipLevels, pixmap);
+		if (snapshotNow) {
+			entry->metal_texture = RaveCreateMetalTexture(w, h, mipLevels, expanded, w * 4);
+			if (mipLevels > 1 && entry->metal_texture) {
+				uint32_t mw = (w > 1) ? w / 2 : 1;
+				uint32_t mh = (h > 1) ? h / 2 : 1;
+				for (uint32_t level = 1; level < mipLevels; level++) {
+					uint32_t mRowBytes = ReadMacInt32(imagesAddr + level * 16 + 8);
+					uint32_t mPixmap   = ReadMacInt32(imagesAddr + level * 16 + 12);
+					uint8_t *mipData = new uint8_t[mw * mh * 4];
+					ConvertPixels(pixelType, mPixmap, mipData, mw, mh, mRowBytes);
+					if (pixelType == kQAPixel_ARGB32) {
+						RaveBGRAWhitenAlphaOnlyMask(mipData, mw * mh);
+					}
+					RaveUploadMipLevel(entry->metal_texture, level, mw, mh, mipData, mw * 4);
+					delete[] mipData;
+					mw = (mw > 1) ? mw / 2 : 1;
+					mh = (mh > 1) ? mh / 2 : 1;
+				}
+			}
+			entry->pixels_copied = (entry->metal_texture != nullptr);
+			RAVE_LOG("TextureNew direct snapshot (pixelType=%d) %dx%d mips=%d pixmap=0x%08x -> metal=%p nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u alphaMaskWhite=%d",
+			         pixelType, w, h, mipLevels, pixmap, entry->metal_texture,
+			         sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
+			         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb,
+			         whitenedAlphaMask);
+		} else {
+			// For deferred mipmapped textures, cache the TQAImage array (it
+			// may be on the caller's stack and won't survive past this call).
+			if (hasMipmaps && mipLevels > 1) {
+				uint32_t imagesSize = mipLevels * 16;
+				entry->original_pixels = new uint8_t[imagesSize];
+				entry->original_size = imagesSize;
+				for (uint32_t b = 0; b < imagesSize; b++) {
+					entry->original_pixels[b] = ReadMacInt8(imagesAddr + b);
+				}
+			}
+			RAVE_LOG("TextureNew deferred (pixelType=%d) %dx%d mips=%d pixmap=0x%08x empty=%d converted=%d",
+			         pixelType, w, h, mipLevels, pixmap,
+			         RaveDirectTextureShouldSnapshotConvertedSource(sourceStats.nonzero) ? 0 : 1,
+			         converted ? 1 : 0);
+		}
+		delete[] expanded;
 	}
 
 	// Allocate CPU pixel buffer in Mac address space for AccessTexture support.
@@ -878,9 +1292,23 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 	uint32_t rowBytes = entry->row_bytes;
 	uint32_t mipLevels = entry->mip_levels;
 
-	// Always read from the original pixmap — QD3D writes texture data there
-	// after QATextureNew returns but before the first draw call.
+	// Prefer cpu_pixel_data when a
+	// Q3Pixmap_Set_Image intercept has synchronously copied the real
+	// pixel data into our engine-owned buffer. This handles the
+	// classic-Mac transient-buffer lifecycle (Bugdom sprites) where
+	// pixmap_mac_addr would otherwise read stale/recycled heap data.
+	// If the flag is false, fall back to the original pixmap_mac_addr
+	// path — preserves working-title behavior (spider-web sprite,
+	// Nanosaur opaque textures, any title whose source buffer is
+	// persistent across the first draw).
 	uint32_t pixmap = entry->pixmap_mac_addr;
+	const char *readSrcName = "pixmap_mac_addr";
+	if (entry->cpu_pixel_data_is_authoritative &&
+	    entry->cpu_pixel_mac_addr != 0 &&
+	    entry->cpu_pixel_data_size > 0) {
+		pixmap = entry->cpu_pixel_mac_addr;
+		readSrcName = "cpu_pixel_data (R2 intercept)";
+	}
 
 	// [DIAG] Sample raw source pixels at realize time
 	if (rave_logging_enabled) {
@@ -888,26 +1316,23 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		for (int s = 0; s < 4 && s < (int)(w * h); s++) {
 			raw[s] = (uint16_t)ReadMacInt16(pixmap + s * 2);
 		}
-		printf("RAVE DIAG: Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x\n",
-		       raw[0], raw[1], raw[2], raw[3], pixmap);
+		RaveDiagLog("Realize raw src px[0-3]=0x%04x 0x%04x 0x%04x 0x%04x at pixmap=0x%08x (%s)",
+		            raw[0], raw[1], raw[2], raw[3], pixmap, readSrcName);
 	}
 
 	uint8_t *expanded = new uint8_t[w * h * 4];
 	ConvertPixels(pixelType, pixmap, expanded, w, h, rowBytes);
+	const bool whitenedAlphaMask =
+		(pixelType == kQAPixel_ARGB32) && RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
 
-	// Check if source data was all zeros (placeholder texture from QD3D).
-	// Sample a few pixels — if all are opaque black (0xFF000000 in BGRA),
-	// the game likely hasn't written real data yet.
-	bool sourceWasEmpty = true;
-	uint32_t sampleCount = (w * h < 64) ? w * h : 64;
-	for (uint32_t i = 0; i < sampleCount; i++) {
-		uint32_t offset = i * 4;
-		// Check if any pixel has non-zero color (B, G, R channels)
-		if (expanded[offset] != 0 || expanded[offset+1] != 0 || expanded[offset+2] != 0) {
-			sourceWasEmpty = false;
-			break;
-		}
-	}
+	// Check the whole converted image. Bugdom's ARGB16 sprites commonly
+	// have transparent top-left borders, so a small leading sample can mark
+	// real texture data as empty.
+	RaveBGRAImageStats sourceStats = RaveBGRAImageAnalyze(expanded, w * h);
+	bool sourceWasEmpty = (sourceStats.nonzero == 0);
+	entry->diag_alpha_zero = (w * h) - sourceStats.alpha;
+	entry->diag_index_zero = 0;
+	entry->diag_rgb_nonzero = sourceStats.rgb;
 
 	entry->metal_texture = RaveCreateMetalTexture(w, h, mipLevels, expanded, w * 4);
 
@@ -928,6 +1353,9 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 
 			uint8_t *mipData = new uint8_t[mw * mh * 4];
 			ConvertPixels(pixelType, mPixmap, mipData, mw, mh, mRowBytes);
+			if (pixelType == kQAPixel_ARGB32) {
+				RaveBGRAWhitenAlphaOnlyMask(mipData, mw * mh);
+			}
 			RaveUploadMipLevel(entry->metal_texture, level, mw, mh, mipData, mw * 4);
 			delete[] mipData;
 
@@ -943,13 +1371,18 @@ void RaveRealizeDeferredTexture(RaveResourceEntry *entry)
 		Host2Mac_memcpy(entry->cpu_pixel_mac_addr, Mac2HostAddr(pixmap), entry->cpu_pixel_data_size);
 	}
 
-	// Only mark as fully copied if source had real data.
-	// If source was empty, leave pixels_copied=false so subsequent frames
-	// will re-check the pixmap (QD3D may write real data later).
+	// Record whether any data was present at first realization. Normal
+	// QATextureNew calls have copy semantics, so once we have non-empty data
+	// the Metal copy becomes authoritative. If the first realization was empty,
+	// RaveTextureNeedsLivePixmapRefresh keeps polling until the late-filled
+	// pixels show up.
 	entry->pixels_copied = !sourceWasEmpty;
 
-	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d",
-	       pixelType, w, h, mipLevels, pixmap, entry->metal_texture, sourceWasEmpty);
+	RAVE_LOG("TextureRealize: pixelType=%d %dx%d mips=%d pixmap=0x%08x -> metal=%p empty=%d nz=%u a=%u rgb=%u white=%u first[nz/a/rgb]=%u/%u/%u alphaMaskWhite=%d",
+	         pixelType, w, h, mipLevels, pixmap, entry->metal_texture, sourceWasEmpty,
+	         sourceStats.nonzero, sourceStats.alpha, sourceStats.rgb, sourceStats.white,
+	         sourceStats.first_nonzero, sourceStats.first_alpha, sourceStats.first_rgb,
+	         whitenedAlphaMask);
 }
 
 
@@ -976,9 +1409,9 @@ static void RaveCreateBitmapFromImage(uint32_t pixelType, uint32 imageAddr,
 
 	// [DIAG-T03] Bitmap creation diagnostic: format, dimensions, flags
 	if (rave_logging_enabled) {
-		printf("RAVE DIAG: BitmapCreate fmt=%s(%d) %dx%d indexed=%d rowBytes=%d\n",
-		       RavePixelFormatName(pixelType), pixelType, w, h,
-		       isIndexed ? 1 : 0, rowBytes);
+		RaveDiagLog("BitmapCreate fmt=%s(%d) %dx%d indexed=%d rowBytes=%d",
+		            RavePixelFormatName(pixelType), pixelType, w, h,
+		            isIndexed ? 1 : 0, rowBytes);
 	}
 
 	if (isIndexed) {
@@ -1048,6 +1481,7 @@ static void RaveCreateColorTableData(uint32_t tableType, uint32 pixelDataAddr,
 	entry->clut_data = clut;
 	entry->clut_count = count;
 	entry->transparent_index = (transparentIndex != 0) ? 0 : -1;
+	RaveRememberCL8ColorTableSnapshot(clut, count);
 
 	RAVE_LOG("ColorTableNew tableType=%d count=%d transparentFlag=%d (idx0 %s)",
 	       tableType, count, transparentIndex,
@@ -1110,16 +1544,129 @@ static void RaveReExpandWithCLUT(RaveResourceEntry *texEntry, RaveResourceEntry 
 		               texEntry->row_bytes, clutEntry->clut_data, clutEntry->clut_count);
 	}
 
-	// [DIAG-T03] Log first 4 BGRA pixels after CLUT expansion
-	if (rave_logging_enabled && w > 0 && h > 0) {
+	uint32_t numPx = w * h;
+	uint32_t indexZero = 0;
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(expanded, numPx);
+	if (numPx > 0) {
+		if (texEntry->pixel_type == kQAPixel_CL8) {
+			for (uint32_t y = 0; y < h; y++) {
+				for (uint32_t x = 0; x < w; x++) {
+					if (texEntry->original_pixels[y * texEntry->row_bytes + x] == 0) indexZero++;
+				}
+			}
+		} else if (texEntry->pixel_type == kQAPixel_CL4) {
+			for (uint32_t y = 0; y < h; y++) {
+				for (uint32_t x = 0; x < w; x++) {
+					uint8_t byte = texEntry->original_pixels[y * texEntry->row_bytes + x / 2];
+					uint8_t idx = (x & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+					if (idx == 0) indexZero++;
+				}
+			}
+		}
+		texEntry->diag_alpha_zero = numPx - stats.alpha;
+		texEntry->diag_index_zero = indexZero;
+		texEntry->diag_rgb_nonzero = stats.rgb;
+	}
+
+	// [DIAG-T03] Log first 4 BGRA pixels and transparency coverage after CLUT expansion.
+	if (rave_logging_enabled && numPx > 0) {
+		static uint32_t sClutDumpCount = 0;
 		uint32_t px[4] = {0, 0, 0, 0};
-		uint32_t numPx = w * h;
 		for (uint32_t i = 0; i < 4 && i < numPx; i++) {
 			memcpy(&px[i], &expanded[i * 4], 4);
 		}
-		printf("RAVE DIAG: CLUTExpand fmt=%s(%d) %dx%d clut=%d px[0-3]=%08X %08X %08X %08X\n",
-		       RavePixelFormatName(texEntry->pixel_type), texEntry->pixel_type, w, h,
-		       clutEntry->clut_count, px[0], px[1], px[2], px[3]);
+		RaveDiagLog("CLUTExpand fmt=%s(%d) %dx%d clut=%d px[0-3]=%08X %08X %08X %08X alpha0=%u idx0=%u transIdx=%d",
+		            RavePixelFormatName(texEntry->pixel_type), texEntry->pixel_type, w, h,
+		            clutEntry->clut_count, px[0], px[1], px[2], px[3],
+		            texEntry->diag_alpha_zero, indexZero, clutEntry->transparent_index);
+
+		if (texEntry->diag_alpha_zero > 0 && sClutDumpCount < 8) {
+			sClutDumpCount++;
+			const char *dumpDir = getenv("TMPDIR");
+			if (dumpDir == nullptr || dumpDir[0] == '\0') dumpDir = "/tmp";
+			size_t dumpDirLen = strlen(dumpDir);
+			const char *slash = (dumpDirLen > 0 && dumpDir[dumpDirLen - 1] == '/') ? "" : "/";
+			char path[192];
+			snprintf(path, sizeof(path),
+			         "%s%srave_clut_%02u_mac%08x_%ux%u_a0%u.ppm",
+			         dumpDir, slash, sClutDumpCount, texEntry->mac_addr, w, h,
+			         texEntry->diag_alpha_zero);
+			FILE *f = fopen(path, "wb");
+			if (f != nullptr) {
+				fprintf(f, "P6\n%u %u\n255\n", w, h);
+				for (uint32_t y = 0; y < h; y++) {
+					for (uint32_t x = 0; x < w; x++) {
+						uint32_t p = (y * w + x) * 4;
+						uint8_t b = expanded[p + 0];
+						uint8_t g = expanded[p + 1];
+						uint8_t r = expanded[p + 2];
+						uint8_t a = expanded[p + 3];
+						uint8_t rgb[3];
+						if (a == 0) {
+							bool checker = (((x >> 3) ^ (y >> 3)) & 1) != 0;
+							rgb[0] = checker ? 0x40 : 0x20;
+							rgb[1] = 0x00;
+							rgb[2] = checker ? 0x40 : 0x20;
+						} else {
+							rgb[0] = r;
+							rgb[1] = g;
+							rgb[2] = b;
+						}
+						fwrite(rgb, 1, sizeof(rgb), f);
+					}
+				}
+				fclose(f);
+				RaveDiagLog("CLUTDump path=%s", path);
+			} else {
+				RaveDiagLog("CLUTDump fopen_failed path=%s errno=%d (%s)",
+				            path, errno, strerror(errno));
+			}
+
+			if (sClutDumpCount <= 3) {
+				const uint32_t cols = 64;
+				const uint32_t rows = 64;
+				const char ramp[] = " .:-=+*#%@";
+				RaveDiagLog("CLUTAscii[%u] mac=0x%08x %ux%u alpha0=%u begin",
+				            sClutDumpCount, texEntry->mac_addr, w, h,
+				            texEntry->diag_alpha_zero);
+				for (uint32_t row = 0; row < rows; row++) {
+					char line[cols + 1];
+					uint32_t y0 = (row * h) / rows;
+					uint32_t y1 = ((row + 1) * h) / rows;
+					if (y1 <= y0) y1 = y0 + 1;
+					for (uint32_t col = 0; col < cols; col++) {
+						uint32_t x0 = (col * w) / cols;
+						uint32_t x1 = ((col + 1) * w) / cols;
+						if (x1 <= x0) x1 = x0 + 1;
+						uint32_t opaqueCount = 0;
+						uint32_t lumSum = 0;
+						for (uint32_t yy = y0; yy < y1 && yy < h; yy++) {
+							for (uint32_t xx = x0; xx < x1 && xx < w; xx++) {
+								uint32_t p = (yy * w + xx) * 4;
+								uint8_t b = expanded[p + 0];
+								uint8_t g = expanded[p + 1];
+								uint8_t r = expanded[p + 2];
+								uint8_t a = expanded[p + 3];
+								if (a != 0) {
+									opaqueCount++;
+									lumSum += (uint32_t)r * 30 + (uint32_t)g * 59 + (uint32_t)b * 11;
+								}
+							}
+						}
+						if (opaqueCount == 0) {
+							line[col] = ' ';
+						} else {
+							uint32_t lum = lumSum / (opaqueCount * 100);
+							uint32_t rampIdx = (lum * 9) / 255;
+							line[col] = ramp[rampIdx];
+						}
+					}
+					line[cols] = '\0';
+					RaveDiagLog("CLUTAscii[%u] |%s|", sClutDumpCount, line);
+				}
+				RaveDiagLog("CLUTAscii[%u] end", sClutDumpCount);
+			}
+		}
 	}
 
 	texEntry->metal_texture = RaveCreateMetalTexture(w, h, texEntry->mip_levels, expanded, w * 4);
@@ -1184,8 +1731,8 @@ int32_t NativeEngineBitmapNew(uint32_t flags, uint32_t pixelType,
 	}
 	RaveResourceEntry *entry = RaveResourceGet(handle);
 	RaveCreateBitmapFromImage(pixelType, imageAddr, entry);
-	// GAP-010: Extract priority bits from upper 16 bits of flags
-	entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+	// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+	entry->priority = (uint8_t)((flags >> 28) & 0xF);
 	WriteMacInt32(newBitmapPtr, entry->mac_addr);
 	return kQANoErr;
 }
@@ -1274,15 +1821,11 @@ int32_t NativeEngineBitmapBindColorTable(uint32_t bitmapAddr, uint32_t colorTabl
  *  AccessTextureEnd re-uploads modified pixel data back to the Metal texture.
  */
 
-// GAP-015: RAVE 1.6 spec defines AccessTexture with a mipmapLevel parameter,
-// but the PPC dispatch path (rave_dispatch.cpp) only forwards 4 arguments
-// (r3=textureAddr, r4=pixelTypePtr, r5=pixelBufferPtr, r6=rowBytesPtr).
-// The mipmapLevel (r7, 5th arg) is not dispatched. This is acceptable since
-// no known game uses per-mip-level access -- they always access level 0.
-// If mipmapLevel dispatch is ever needed, add r7 forwarding in rave_dispatch.cpp
-// case kRaveEngineAccessTexture and update this function signature.
-int32_t NativeEngineAccessTexture(uint32_t textureAddr, uint32_t pixelTypePtr,
-                                   uint32_t pixelBufferPtr, uint32_t rowBytesPtr)
+// SDK signature: TQAError TQAAccessTexture(TQATexture*, long mipmapLevel, long flags, TQAPixelBuffer*)
+// TQAPixelBuffer = TQADeviceMemory = {rowBytes(+0), pixelType(+4), width(+8), height(+12), baseAddr(+16)}
+// mipmapLevel is accepted but only level 0 data is returned (no known game uses per-mip access).
+int32_t NativeEngineAccessTexture(uint32_t textureAddr, uint32_t mipmapLevel,
+                                   uint32_t flags, uint32_t bufferStructAddr)
 {
 	uint32_t handle = RaveResourceFindByAddr(textureAddr);
 	if (handle == 0) return kQANotSupported;
@@ -1290,12 +1833,15 @@ int32_t NativeEngineAccessTexture(uint32_t textureAddr, uint32_t pixelTypePtr,
 	if (!entry || entry->type != kRaveResourceTexture) return kQANotSupported;
 	if (!entry->cpu_pixel_data || entry->cpu_pixel_mac_addr == 0) return kQANotSupported;
 
-	// Always returns level 0 data (see mipmapLevel note above)
-	WriteMacInt32(pixelTypePtr, entry->pixel_type);
-	WriteMacInt32(pixelBufferPtr, entry->cpu_pixel_mac_addr);
-	WriteMacInt32(rowBytesPtr, entry->row_bytes);
-	RAVE_LOG("AccessTexture: tex=0x%08x -> buf=0x%08x rowBytes=%d (level 0 only)",
-	         textureAddr, entry->cpu_pixel_mac_addr, entry->row_bytes);
+	// Populate TQAPixelBuffer (TQADeviceMemory) struct at bufferStructAddr
+	WriteMacInt32(bufferStructAddr + 0,  entry->row_bytes);
+	WriteMacInt32(bufferStructAddr + 4,  entry->pixel_type);
+	WriteMacInt32(bufferStructAddr + 8,  entry->width);
+	WriteMacInt32(bufferStructAddr + 12, entry->height);
+	WriteMacInt32(bufferStructAddr + 16, entry->cpu_pixel_mac_addr);
+	RAVE_LOG("AccessTexture: tex=0x%08x mip=%d flags=0x%x -> buf=0x%08x %dx%d rowBytes=%d",
+	         textureAddr, mipmapLevel, flags, entry->cpu_pixel_mac_addr,
+	         entry->width, entry->height, entry->row_bytes);
 	return kQANoErr;
 }
 
@@ -1355,6 +1901,16 @@ int32_t NativeEngineAccessTextureEnd(uint32_t textureAddr, uint32_t dirtyRectAdd
 		// cpu_pixel_data is in Mac memory, so use its Mac address for conversion
 		uint32_t macAddr = entry->cpu_pixel_mac_addr;
 		ConvertPixels(entry->pixel_type, macAddr, expanded, w, h, entry->row_bytes);
+		if (entry->type == kRaveResourceTexture && entry->pixel_type == kQAPixel_ARGB32) {
+			RaveBGRAWhitenAlphaOnlyMask(expanded, w * h);
+		}
+	}
+
+	if (entry->type == kRaveResourceTexture) {
+		RaveBGRAImageStats stats = RaveBGRAImageAnalyze(expanded, w * h);
+		entry->diag_alpha_zero = (w * h) - stats.alpha;
+		entry->diag_index_zero = 0;
+		entry->diag_rgb_nonzero = stats.rgb;
 	}
 
 	// Re-upload level 0
@@ -1371,8 +1927,10 @@ int32_t NativeEngineAccessTextureEnd(uint32_t textureAddr, uint32_t dirtyRectAdd
 	return kQANoErr;
 }
 
-int32_t NativeEngineAccessBitmap(uint32_t bitmapAddr, uint32_t pixelTypePtr,
-                                  uint32_t pixelBufferPtr, uint32_t rowBytesPtr)
+// SDK signature: TQAError TQAAccessBitmap(TQABitmap*, long flags, TQAPixelBuffer*)
+// TQAPixelBuffer = TQADeviceMemory = {rowBytes(+0), pixelType(+4), width(+8), height(+12), baseAddr(+16)}
+int32_t NativeEngineAccessBitmap(uint32_t bitmapAddr, uint32_t flags,
+                                  uint32_t bufferStructAddr)
 {
 	uint32_t handle = RaveResourceFindByAddr(bitmapAddr);
 	if (handle == 0) return kQANotSupported;
@@ -1380,11 +1938,15 @@ int32_t NativeEngineAccessBitmap(uint32_t bitmapAddr, uint32_t pixelTypePtr,
 	if (!entry || entry->type != kRaveResourceBitmap) return kQANotSupported;
 	if (!entry->cpu_pixel_data || entry->cpu_pixel_mac_addr == 0) return kQANotSupported;
 
-	WriteMacInt32(pixelTypePtr, entry->pixel_type);
-	WriteMacInt32(pixelBufferPtr, entry->cpu_pixel_mac_addr);
-	WriteMacInt32(rowBytesPtr, entry->row_bytes);
-	RAVE_LOG("AccessBitmap: bmp=0x%08x -> buf=0x%08x rowBytes=%d",
-	         bitmapAddr, entry->cpu_pixel_mac_addr, entry->row_bytes);
+	// Populate TQAPixelBuffer (TQADeviceMemory) struct at bufferStructAddr
+	WriteMacInt32(bufferStructAddr + 0,  entry->row_bytes);
+	WriteMacInt32(bufferStructAddr + 4,  entry->pixel_type);
+	WriteMacInt32(bufferStructAddr + 8,  entry->width);
+	WriteMacInt32(bufferStructAddr + 12, entry->height);
+	WriteMacInt32(bufferStructAddr + 16, entry->cpu_pixel_mac_addr);
+	RAVE_LOG("AccessBitmap: bmp=0x%08x flags=0x%x -> buf=0x%08x %dx%d rowBytes=%d",
+	         bitmapAddr, flags, entry->cpu_pixel_mac_addr,
+	         entry->width, entry->height, entry->row_bytes);
 	return kQANoErr;
 }
 
@@ -1537,25 +2099,28 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_FastFeatures:
-		// GAP-029: Use kAllFastFeatures (kQAFast_* namespace per spec)
+		// Use kAllFastFeatures (kQAFast_* namespace per spec). Test: RAVEABITests.testKQAFast_bitPositions_matchSpec
 		// Metal accelerates everything, so bit values match OptionalFeatures
 		WriteMacInt32(responsePtr, kAllFastFeatures);
 		RAVE_LOG("EngineGestalt: %s -> 0x%08x", gestalt_selector_names[selector], kAllFastFeatures);
 		break;
 
 	case kQAGestalt_VendorID:
-		WriteMacInt32(responsePtr, 1);  // kQAVendor_ATI
-		RAVE_LOG("EngineGestalt: %s -> 1 (kQAVendor_ATI)", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedVendorID);
+		RAVE_LOG("EngineGestalt: %s -> %u (kQAVendor_ATI)", gestalt_selector_names[selector],
+		         kRaveAdvertisedVendorID);
 		break;
 
 	case kQAGestalt_EngineID:
-		WriteMacInt32(responsePtr, 0x50534852);  // 'PSHR' (PocketSHaveR)
-		RAVE_LOG("EngineGestalt: %s -> 0x50534852 ('PSHR')", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedEngineID);
+		RAVE_LOG("EngineGestalt: %s -> 0x%08x (ATI Rage 128)", gestalt_selector_names[selector],
+		         kRaveAdvertisedEngineID);
 		break;
 
 	case kQAGestalt_Revision:
-		WriteMacInt32(responsePtr, 0x00010000);  // 1.0
-		RAVE_LOG("EngineGestalt: %s -> 0x00010000 (1.0)", gestalt_selector_names[selector]);
+		WriteMacInt32(responsePtr, kRaveAdvertisedRevision);
+		RAVE_LOG("EngineGestalt: %s -> 0x%08x (1.0)", gestalt_selector_names[selector],
+		         kRaveAdvertisedRevision);
 		break;
 
 	case kQAGestalt_ASCIINameLength:
@@ -1564,14 +2129,15 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_ASCIIName:
-		// Copy name string into Mac address space
+		// Copy name string into Mac address space (SDK specifies strcpy semantics, must NUL-terminate)
 		Host2Mac_memcpy(responsePtr, (uint8 *)kEngineASCIIName, kEngineASCIINameLength);
+		WriteMacInt8(responsePtr + kEngineASCIINameLength, 0);
 		RAVE_LOG("EngineGestalt: %s -> \"%s\"", gestalt_selector_names[selector], kEngineASCIIName);
 		break;
 
 	case kQAGestalt_TextureMemory:
 	case kQAGestalt_FastTextureMemory:
-		WriteMacInt32(responsePtr, 64 * 1024 * 1024);  // 64MB
+		WriteMacInt32(responsePtr, kRaveAdvertisedTextureMemoryBytes);
 		RAVE_LOG("EngineGestalt: %s -> 64MB", gestalt_selector_names[selector]);
 		break;
 
@@ -1588,7 +2154,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_TexturePixelTypesAllowed:
-		// GAP-009: Added RGB32 and RGB16 to allowed texture pixel types
+		// Added RGB32 and RGB16 to allowed texture pixel types
 		WriteMacInt32(responsePtr, (1 << kQAPixel_ARGB32) | (1 << kQAPixel_RGB32) |
 					  (1 << kQAPixel_ARGB16) | (1 << kQAPixel_RGB16) |
 					  (1 << kQAPixel_CL8) | (1 << kQAPixel_CL4) |
@@ -1603,11 +2169,12 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	case kQAGestalt_BitmapPixelTypesAllowed:
-		WriteMacInt32(responsePtr, (1 << kQAPixel_ARGB32) | (1 << kQAPixel_ARGB16) |
+		WriteMacInt32(responsePtr, (1 << kQAPixel_ARGB32) | (1 << kQAPixel_RGB32) |
+					  (1 << kQAPixel_ARGB16) | (1 << kQAPixel_RGB16) |
 					  (1 << kQAPixel_CL8) | (1 << kQAPixel_CL4) |
 					  (1 << kQAPixel_RGB8_332) | (1 << kQAPixel_ARGB16_4444) |
 					  (1 << kQAPixel_ACL16_88) | (1 << kQAPixel_I8) | (1 << kQAPixel_AI16_88));
-		RAVE_LOG("EngineGestalt: %s -> ARGB32|ARGB16|CL8|CL4|RGB8_332|ARGB16_4444|ACL16_88|I8|AI16_88", gestalt_selector_names[selector]);
+		RAVE_LOG("EngineGestalt: %s -> ARGB32|RGB32|ARGB16|RGB16|CL8|CL4|...", gestalt_selector_names[selector]);
 		break;
 
 	case kQAGestalt_BitmapPixelTypesPreferred:
@@ -1632,7 +2199,7 @@ int32 NativeEngineGestalt(uint32 selector, uint32 responsePtr)
 		break;
 
 	default:
-		// GAP-003: kQANotSupported is correct per spec for engines without engine-specific selectors
+		// kQANotSupported is correct per spec for engines without engine-specific selectors
 		// (kQAGestalt_EngineSpecific_Minimum and above fall through to here)
 		// ATI gestalt selectors (1000+)
 		if (selector == 1000) {  // kQATIGestalt_CurrentContext
@@ -1667,13 +2234,9 @@ int32 NativeEngineCheckDevice(uint32 devicePtr)
 	// Read device type from TQADevice struct (first field)
 	uint32 deviceType = ReadMacInt32(devicePtr);
 
-	if (deviceType == kQADeviceMemory) {
-		RAVE_LOG("EngineCheckDevice: kQADeviceMemory -> kQANoErr");
-	} else if (deviceType == kQADeviceGDevice) {
-		RAVE_LOG("EngineCheckDevice: kQADeviceGDevice -> kQANoErr");
-	} else {
-		RAVE_LOG("EngineCheckDevice: unknown device type %d -> kQANoErr", deviceType);
-	}
+	RaveLogDeviceSummary("EngineCheckDevice", devicePtr);
+	RAVE_LOG("EngineCheckDevice: %s(%u) -> kQANoErr",
+	         RaveDeviceTypeName(deviceType), deviceType);
 
 	// Accept all device types for maximum compatibility
 	return kQANoErr;
@@ -1690,6 +2253,7 @@ int32 NativeEngineCheckDevice(uint32 devicePtr)
  */
 uint32 NativeHookGetFirstEngine(uint32 device)
 {
+	RaveLogDeviceSummary("HOOK: QADeviceGetFirstEngine", device);
 	RAVE_LOG("HOOK: QADeviceGetFirstEngine(device=0x%08x) -> sentinel 0x%08x",
 		   device, rave_sentinel_engine);
 	return rave_sentinel_engine;
@@ -1769,6 +2333,48 @@ uint32 NativeHookEngineCheckDevice(uint32 engine, uint32 device)
 	}
 }
 
+/*
+ *  Hook handler: QAEngineEnable(vendorID, engineID) -> TQAError
+ *
+ *  Some games use this manager API as an engine-selection gate before
+ *  creating a draw context. The RAVE manager's internal engine list does not
+ *  reliably contain our injected sentinel, so handle BestChoice/ATI locally
+ *  and log the exact IDs requested.
+ */
+uint32 NativeHookEngineEnable(uint32 vendorID, uint32 engineID)
+{
+	RAVE_LOG("HOOK: QAEngineEnable(vendor=0x%08x engine=0x%08x)", vendorID, engineID);
+	if (RaveEngineEnableHandledByNative(vendorID, engineID)) {
+		RAVE_LOG("HOOK: QAEngineEnable -> kQANoErr (native accepted)");
+		return kQANoErr;
+	}
+
+	if (rave_orig_engine_enable == 0) return (uint32)(int32)kQANotSupported;
+	const uint32 args[] = { vendorID, engineID };
+	const uint32 result = RaveChainToOriginal(kRaveHookIdx_EngineEnable, 2, args);
+	RAVE_LOG("HOOK: QAEngineEnable -> chained result %d", (int32)result);
+	return result;
+}
+
+
+/*
+ *  Hook handler: QAEngineDisable(vendorID, engineID) -> TQAError
+ */
+uint32 NativeHookEngineDisable(uint32 vendorID, uint32 engineID)
+{
+	RAVE_LOG("HOOK: QAEngineDisable(vendor=0x%08x engine=0x%08x)", vendorID, engineID);
+	if (RaveEngineEnableHandledByNative(vendorID, engineID)) {
+		RAVE_LOG("HOOK: QAEngineDisable -> kQANoErr (native accepted)");
+		return kQANoErr;
+	}
+
+	if (rave_orig_engine_disable == 0) return (uint32)(int32)kQANotSupported;
+	const uint32 args[] = { vendorID, engineID };
+	const uint32 result = RaveChainToOriginal(kRaveHookIdx_EngineDisable, 2, args);
+	RAVE_LOG("HOOK: QAEngineDisable -> chained result %d", (int32)result);
+	return result;
+}
+
 
 /*
  *  Hook handler: QADrawContextNew(device, rect, clip, engine, flags, drawContext,
@@ -1828,12 +2434,11 @@ uint32 NativeHookDrawContextNew(uint32 device, uint32 rect, uint32 clip,
 			ctx = SheepMem::ReserveProc(ctx_size);
 			RAVE_LOG("HOOK: allocated ctx=0x%08x from SheepMem proc", ctx);
 		}
-		RAVE_LOG("HOOK: got ctx=0x%08x, zeroing %d bytes at host %p",
-		       ctx, ctx_size, Mac2HostAddr(ctx));
-		memset(Mac2HostAddr(ctx), 0, ctx_size);
-
-		// NativeDrawPrivateNew writes the drawPrivate handle at offset 0,
-		// version at offset 4, and all 35 draw method TVECTs at offset 8+.
+		// NativeDrawPrivateNew writes all 37 fields (handle + version +
+		// 35 TVECTs), so we skip zeroing here.  A memset would create a
+		// window where stale Mac-side references see NULL TVECT pointers,
+		// causing the PPC to dereference address 0 and crash in zeroed
+		// SheepMem memory.
 		RAVE_LOG("HOOK: calling NativeDrawPrivateNew(ctx=0x%08x, dev=0x%08x, rect=0x%08x, clip=0x%08x, flags=0x%08x)",
 		       ctx, device, rect, clip, flags);
 		int32 err = NativeDrawPrivateNew(ctx, device, rect, clip, flags);
@@ -1862,8 +2467,8 @@ uint32 NativeHookDrawContextNew(uint32 device, uint32 rect, uint32 clip,
 /*
  *  Hook handler: QATextureNew(engine, flags, pixelType, images[], &newTexture)
  *
- *  For sentinel engine: create a stub texture handle (Phase 3+ will implement
- *  real texture upload to Metal). For other engines: chain to original.
+ *  For sentinel engine: create a stub texture handle (real texture upload
+ *  to Metal is implemented later). For other engines: chain to original.
  *
  *  r3 = engine, r4 = flags, r5 = pixelType, r6 = images, r7 = &newTexture
  */
@@ -1908,8 +2513,8 @@ uint32 NativeHookBitmapNew(uint32 engine, uint32 flags, uint32 pixelType,
 		}
 		RaveResourceEntry *entry = RaveResourceGet(handle);
 		RaveCreateBitmapFromImage(pixelType, image, entry);
-		// GAP-010: Extract priority bits from upper 16 bits of flags
-		entry->priority = (uint16_t)((flags >> 16) & 0xFFFF);
+		// 4-bit priority at [31:28] per QACalculatePriorityBits. Test: RAVEABITests.testPriorityBits_extraction_matchesSpec
+		entry->priority = (uint8_t)((flags >> 28) & 0xF);
 		RAVE_LOG("HOOK: QABitmapNew(sentinel) flags=0x%x pixelType=%d %dx%d -> handle %d addr=0x%08x metal=%p",
 		       flags, pixelType, entry->width, entry->height, handle, entry->mac_addr, entry->metal_texture);
 		WriteMacInt32(newBitmapPtr, entry->mac_addr);
@@ -1968,9 +2573,32 @@ uint32 NativeHookDrawContextDelete(uint32 drawContextPtr) {
 		       drawContextPtr, handle);
 		NativeDrawPrivateDelete(handle);
 
+		// Invalidate the Mac-side handle so stale references via this
+		// address see handle=0 and fail gracefully in RaveGetContext(),
+		// rather than accidentally hitting a recycled handle slot.
+		WriteMacInt32(drawContextPtr + 0, 0);
+
 		// Recycle the Mac-side context address so the next QADrawContextNew
 		// can reuse it instead of permanently allocating from SheepMem.
 		rave_ctx_free_list.push_back(drawContextPtr);
+
+		// Clear the compositor's cached overlay on
+		// QADrawContextDestroy.  The cache holds a strong reference to the
+		// source MTLTexture that may outlive this engine's draw context;
+		// Nanosaur destroys and recreates its QADrawContext at scene
+		// transitions (menu <-> level 1 <-> level 2), and when a new
+		// context is created the overlay's shape / size / sampler state may
+		// differ.  Without this invalidation surface the prior scene's
+		// overlay content can bleed through the first frames of the new
+		// scene ("intermittent 3D stale pixel residue").
+		//
+		// Call sites for ClearCachedOverlay:
+		//   1. MetalCompositor_OnModeExit  (DMC mode change; metal_compositor.mm:198)
+		//   2. Compositor shutdown         (metal_compositor.mm tear-down)
+		//   3. QADrawContextDelete         (this call)
+		//
+		// Regression test: NanosaurSceneTransitionTests.
+		MetalCompositorSubmitFrame_ClearCachedOverlay();
 
 		return kQANoErr;
 	}
@@ -2177,7 +2805,7 @@ uint32 NativeHookAccessBitmap(uint32 engine, uint32 bitmap, uint32 flags, uint32
 {
 	if (engine == rave_sentinel_engine) {
 		RAVE_LOG("HOOK: QAAccessBitmap(sentinel, bmp=0x%08x, flags=0x%x)", bitmap, flags);
-		return (uint32)NativeEngineAccessBitmap(bitmap, flags, buffer, 0);
+		return (uint32)NativeEngineAccessBitmap(bitmap, flags, buffer);
 	} else {
 		if (rave_orig_access_bitmap == 0) return (uint32)(int32)kQANotSupported;
 		const uint32 args[] = { engine, bitmap, flags, buffer };
@@ -2260,6 +2888,85 @@ bool RaveIsRegistered(void)
 	return rave_registered;
 }
 
+/* ----------------------------------------------------------------------
+ * gfxaccel_resources fan-out handlers.
+ *
+ * RAVE registers a pair of attach/detach callbacks with gfxaccel_resources
+ * at engine init (RaveRegisterEngine, below). The resource manager fans
+ * out DMC on_mode_enter/exit events to engines via these callbacks.
+ *
+ * Lifecycle:
+ *   - on_mode_enter (LIFO) -> RaveOnAttach: pre-vend an overlay texture for
+ *     the new mode's resolution IF RAVE has an active context. Otherwise
+ *     skip; the next RaveCreateMetalOverlay call will vend lazily.
+ *   - on_mode_exit  (FIFO) -> RaveOnDetach: release the cached overlay
+ *     handle back to the resource manager so RAVE doesn't pin a stale
+ *     allocation across the mode switch.
+ *
+ * The handlers must NOT call back into DMC (the resource manager fan-out
+ * runs on the DMC writer's thread while holding the writer mutex —
+ * recursive subscribe/unsubscribe would deadlock; threat T-03-26 / T-03-27).
+ *
+ * These cross the .cpp/.mm boundary via the small extern "C" probes
+ * declared in rave_metal_renderer.h (rave_has_active_overlay,
+ * rave_get_overlay_dims, rave_release_overlay_for_detach).
+ * ---------------------------------------------------------------------- */
+static int32_t RaveOnAttach(uint32_t /* engine_id */,
+                            const struct DMCModeSnapshot *incoming,
+                            void * /* ctx */)
+{
+	/* If RAVE has no active overlay at attach time, skip pre-vending —
+	 * the next RaveCreateMetalOverlay (driven by an actual RAVE context
+	 * creation) will vend lazily. This is the common case for non-RAVE
+	 * workloads (e.g. pure-2D apps switching modes). */
+	if (!rave_has_active_overlay()) {
+		return 0;  /* kGfxAccelResNoErr — accept the transition */
+	}
+	if (incoming == NULL) {
+		return 0;  /* defensive — accept transition with no pre-vend */
+	}
+
+	/* RAVE was active in the outgoing mode; pre-vend at the incoming
+	 * mode's resolution so the compositor sees an overlay on its first
+	 * present after the mode switch. Vend
+	 * format is BGRA8Unorm (= MTLPixelFormatBGRA8Unorm = 80). */
+	void *tex = gfxaccel_resources_vend_overlay_texture(
+	                kGfxEngineRAVE,
+	                incoming->width,
+	                incoming->height,
+	                80 /* MTLPixelFormatBGRA8Unorm */);
+	if (tex == NULL) {
+		/* Vend failed — reject the transition. The rollback path is
+		 * safe under concurrent DMC readers. */
+		return -3009;  /* kDMCErrSubscriberRejected */
+	}
+	return 0;
+}
+
+static int32_t RaveOnDetach(uint32_t /* engine_id */,
+                            const struct DMCModeSnapshot * /* outgoing */,
+                            void * /* ctx */)
+{
+	/* Release the cached overlay (idempotent — no-op if RAVE has none).
+	 * The next RaveCreateMetalOverlay after the mode switch will re-vend
+	 * at the appropriate resolution. */
+	rave_release_overlay_for_detach();
+	return 0;
+}
+
+static bool rave_resource_handlers_registered = false;
+
+static void RaveRegisterResourceHandlers(void)
+{
+	if (rave_resource_handlers_registered) return;
+	struct GfxResEngineHandlers rave_handlers;
+	rave_handlers.attach = RaveOnAttach;
+	rave_handlers.detach = RaveOnDetach;
+	rave_handlers.ctx    = NULL;
+	gfxaccel_resources_register_engine(kGfxEngineRAVE, &rave_handlers);
+	rave_resource_handlers_registered = true;
+}
+
 void RaveRegisterEngine(void)
 {
 	// Guard against double registration AND re-entrancy.
@@ -2287,7 +2994,16 @@ void RaveRegisterEngine(void)
 
 	RAVE_LOG("RaveRegisterEngine() called");
 
-	// ---- Phase 1: Cache ALL library symbols BEFORE any CallMacOS ----
+	// ---- Step 0: Register RAVE's attach/detach handlers
+	// with the gfxaccel_resources fan-out registry.
+	// Idempotent (rave_resource_handlers_registered guard); safe to call
+	// before the QARegisterEngine attempt because gfxaccel_resources_init
+	// has already run (main_unix.cpp ordering: SharedMetalDevice ->
+	// MetalCompositorInit -> gfxaccel_resources_init -> ROM patches ->
+	// VideoInstallAccel -> RaveRegisterEngine).
+	RaveRegisterResourceHandlers();
+
+	// ---- Step 1: Cache ALL library symbols BEFORE any CallMacOS ----
 	//
 	// IMPORTANT: FindLibSymbol can trigger CFM fragment loading, which in turn
 	// calls VideoInstallAccel -> RaveRegisterEngine (re-entrancy). Our guard
@@ -2345,7 +3061,7 @@ void RaveRegisterEngine(void)
 	uint32 new_gestalt_tvect = FindLibSymbol("\014InterfaceLib", "\012NewGestalt");
 	RAVE_LOG("cached InterfaceLib: NewGestalt=0x%08x", new_gestalt_tvect);
 
-	// ---- Phase 2: Registration (CallMacOS calls, no more FindLibSymbol) ----
+	// ---- Step 2: Registration (CallMacOS calls, no more FindLibSymbol) ----
 
 	// Get the EngineGetMethod TVECT address to pass to QARegisterEngine
 	// Sub-opcode 100 (kRaveEngineDrawPrivateNew) is our EngineGetMethod callback
@@ -2373,7 +3089,7 @@ void RaveRegisterEngine(void)
 
 	RAVE_LOG("engine registered successfully");
 
-	// ---- Phase 3: Gestalt registration (uses cached NewGestalt TVECT) ----
+	// ---- Step 3: Gestalt registration (uses cached NewGestalt TVECT) ----
 
 	if (new_gestalt_tvect) {
 		typedef int16 (*new_gestalt_t)(uint32, uint32);
@@ -2405,7 +3121,7 @@ void RaveRegisterEngine(void)
 		RAVE_LOG("NewGestalt not found, skipping Gestalt registration");
 	}
 
-	// ---- Phase 4: Install enumeration hooks ----
+	// ---- Step 4: Install enumeration hooks ----
 	//
 	// The RAVE manager's QARegisterEngine requires an internal loading context
 	// (ZgLoadingSharedLibrary) that we can't satisfy from VideoInstallAccel.
@@ -2416,7 +3132,7 @@ void RaveRegisterEngine(void)
 	// handlers; for other engines, they chain to the original implementations.
 	RaveInstallHooks();
 
-	// Mark permanently registered only after all phases succeed
+	// Mark permanently registered only after all registration steps succeed.
 	rave_registered = true;
 	rave_reg_in_progress = false;
 
@@ -2441,8 +3157,8 @@ void RaveInstallHooks(void)
 {
 	RAVE_LOG("installing enumeration hooks");
 
-	// Find the RAVE library fragment name we already determined works
-	// Try all known library names (same as registration phase)
+	// Find the RAVE library fragment name we already determined works.
+	// Try all known library names used during registration.
 	static const char *rave_lib_names[] = {
 		"\031QuickDraw\xAA 3D Accelerator",  // 25 chars: CFM fragment name
 		"\022QuickDraw\xAA 3D RAVE",          // 18 chars: file name
@@ -2450,7 +3166,7 @@ void RaveInstallHooks(void)
 		NULL
 	};
 
-	// Look up all 8 APIs. We need them all from the same library.
+	// Look up all APIs. We need them all from the same library.
 	// The first 5 are enumeration/creation hooks, the last 3 are resource
 	// creation hooks needed because our sentinel engine is not in the RAVE
 	// manager's internal list (QARegisterEngine succeeds but ZgLoadingSharedLibrary
@@ -2481,8 +3197,10 @@ void RaveInstallHooks(void)
 		{ "\022QAAccessTextureEnd",     &rave_orig_access_texture_end,       kRaveHookAccessTextureEnd,      "QAAccessTextureEnd" },
 		{ "\016QAAccessBitmap",         &rave_orig_access_bitmap,            kRaveHookAccessBitmap,          "QAAccessBitmap" },
 		{ "\021QAAccessBitmapEnd",      &rave_orig_access_bitmap_end,        kRaveHookAccessBitmapEnd,       "QAAccessBitmapEnd" },
+		{ "\016QAEngineEnable",         &rave_orig_engine_enable,            kRaveHookEngineEnable,          "QAEngineEnable" },
+		{ "\017QAEngineDisable",        &rave_orig_engine_disable,           kRaveHookEngineDisable,         "QAEngineDisable" },
 	};
-	const int num_apis = 20;
+	const int num_apis = 22;
 
 	// Try each library name
 	bool all_found = false;
@@ -2679,6 +3397,14 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
 		delete[] bgra_data;
 		return kQAError;
 	}
+	bool whitenedAlphaMask = false;
+	if (effectivePixelType == kQAPixel_ARGB32) {
+		whitenedAlphaMask = RaveBGRAWhitenAlphaOnlyMask(bgra_data, width * height);
+	}
+	RaveBGRAImageStats stats = RaveBGRAImageAnalyze(bgra_data, width * height);
+	entry->diag_alpha_zero = (width * height) - stats.alpha;
+	entry->diag_index_zero = 0;
+	entry->diag_rgb_nonzero = stats.rgb;
 
 	// Re-upload to existing Metal texture at level 0
 	if (entry->metal_texture) {
@@ -2692,8 +3418,8 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
 
 	delete[] bgra_data;
 
-	RAVE_LOG("ATITextureUpdate: updated texture 0x%08x (%dx%d, pixelType=%d->%d)",
-	         textureAddr, width, height, pixelType, effectivePixelType);
+	RAVE_LOG("ATITextureUpdate: updated texture 0x%08x (%dx%d, pixelType=%d->%d, alphaMaskWhite=%d)",
+	         textureAddr, width, height, pixelType, effectivePixelType, whitenedAlphaMask);
 	return kQANoErr;
 }
 
@@ -2711,20 +3437,9 @@ int32_t NativeATITextureUpdate(uint32_t flags, uint32_t pixelType, uint32_t imag
  */
 int32_t NativeATIBindCodeBook(uint32_t textureAddr, uint32_t codebookPtr)
 {
-	uint32_t handle = RaveResourceFindByAddr(textureAddr);
-	RaveResourceEntry *entry = RaveResourceGet(handle);
-	if (!entry || entry->type != kRaveResourceTexture) {
-		RAVE_LOG("ATIBindCodeBook: texture not found at 0x%08x", textureAddr);
-		return kQAError;
-	}
-
-	if (codebookPtr == 0) {
-		RAVE_LOG("ATIBindCodeBook: null codebook pointer for texture 0x%08x", textureAddr);
-		return kQANoErr;  // No-op if null
-	}
-
-	RAVE_LOG("ATIBindCodeBook: texture 0x%08x codebook 0x%08x (stored, decompression on next update)",
+	// VQ codebook decompression is not implemented. Return kQANotSupported so
+	// callers know VQ textures won't render correctly with this engine.
+	RAVE_LOG("ATIBindCodeBook: texture 0x%08x codebook 0x%08x -> kQANotSupported (VQ not implemented)",
 	         textureAddr, codebookPtr);
-
-	return kQANoErr;
+	return kQANotSupported;
 }

@@ -61,6 +61,8 @@
 #import "OverlayViewControllerObjC.h"
 #import "MonitorResolutionsObjC.h"
 #include "metal_compositor.h"
+#include "display_mode_controller.h"
+#include "gfxaccel_resources.h"
 #endif
 
 #ifdef WIN32
@@ -482,6 +484,7 @@ static int sdl_depth_of_video_depth(int video_depth)
 static void sdl_display_dimensions(int &width, int &height)
 {
 	SDL_DisplayMode desktop_mode;
+	desktop_mode.refresh_rate = objc_getFrameRateSetting();
 	const int display_index = 0;	// TODO: try supporting multiple displays
 	if (SDL_GetDesktopDisplayMode(display_index, &desktop_mode) != 0) {
 		// TODO: report a warning, here?
@@ -726,6 +729,11 @@ static void shutdown_sdl_video()
 {
 	delete_sdl_video_surfaces();
 #if TARGET_OS_IPHONE
+	// Reverse-order teardown.
+	// gfxaccel_resources subscribed SECOND, so it shuts down FIRST so
+	// any in-flight DMC dispatch against its detach handler completes
+	// before the compositor drops its drawable refs.
+	gfxaccel_resources_shutdown();
 	MetalCompositorShutdown();
 #endif
 	delete_sdl_video_window();
@@ -752,6 +760,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	
 	if (flags & SDL_WINDOW_FULLSCREEN) {
 		SDL_DisplayMode desktop_mode;
+		desktop_mode.refresh_rate = objc_getFrameRateSetting();
 		if (SDL_GetDesktopDisplayMode(0, &desktop_mode) != 0) {
 			shutdown_sdl_video();
 			return NULL;
@@ -1147,6 +1156,20 @@ void driver_base::init()
 			MetalCompositorResize(fb_width, fb_height, VIDEO_MODE_DEPTH, VIDEO_MODE_ROW_BYTES, pitch, the_buffer, the_buffer_size);
 		} else {
 			MetalCompositorInit(fb_width, fb_height, VIDEO_MODE_DEPTH, VIDEO_MODE_ROW_BYTES, pitch, the_buffer, the_buffer_size);
+			// metal_compositor subscribes
+			// to DMC FIRST during MetalCompositorInit above; gfxaccel_resources
+			// subscribes SECOND here. LIFO on_mode_enter dispatch fires
+			// gfxaccel_resources.on_mode_enter FIRST (fans out to engines to
+			// attach their resources) and metal_compositor.on_mode_enter LAST,
+			// so the compositor sees attached engine resources on its first
+			// present after a mode switch. Init is a behavioral no-op when
+			// no engines are registered yet.
+			int32_t gfxres_err = gfxaccel_resources_init();
+			if (gfxres_err != 0) {
+				fprintf(stderr, "[gfxaccel_resources] init FAILED (err=%d) — "
+				                "proceeding with compositor-only framebuffer "
+				                "(fallback)\n", (int)gfxres_err);
+			}
 		}
 	}
 #endif
@@ -1162,6 +1185,15 @@ void driver_base::init()
 	{
 		uint8_t bw_pal[6] = {255,255,255, 0,0,0};
 		MetalCompositorUpdatePalette(bw_pal, 2);
+		// Bump DMC palette_gen so subscribers / snapshot readers observe the seed CLUT.
+		// By this line the DMC is in
+		// QuickDrawOwner state, NOT Quiescent — dmc_create() was called during
+		// VideoInit (earlier in boot, before monitor->video_open()), which
+		// transitions the controller from Quiescent → QuickDrawOwner (T1) via
+		// dmc_internal_fire_enter_events(). So the palette_gen bump here
+		// always takes effect on the seed B/W CLUT and the call never falls
+		// through the kDMCErrNotInitialized branch at runtime.
+		dmc_record_palette_change();
 	}
 #endif
 
@@ -1461,6 +1493,41 @@ bool SDL_monitor_desc::video_open(void)
 	return true;
 }
 
+#if defined(SHEEPSHAVER) && TARGET_OS_IPHONE
+// ---------------------------------------------------------------------------
+// DMCModeDescFromVModesIndex — build a DMCModeDesc from a VModes[] index
+//
+// Used by the display-mode-controller seam to route dmc_create()
+// at VideoInit end and dmc_request_mode_switch() at the mode-switch point.
+// Reads the Apple depth constant from viAppleMode and converts to the DMC
+// bit-count encoding (depth field = raw bit-count: 1, 2, 4, 8, 16, 32).
+// ---------------------------------------------------------------------------
+static void DMCModeDescFromVModesIndex(int idx, DMCModeDesc *out)
+{
+	out->width      = (uint32_t)VModes[idx].viXsize;
+	out->height     = (uint32_t)VModes[idx].viYsize;
+	// viAppleMode carries the APPLE_*_BIT constant; translate to a raw bit count
+	// per DMCModeDesc contract (depth in {1,2,4,8,16,32}).
+	int apple = (int)VModes[idx].viAppleMode;
+	uint32_t bit_depth;
+	switch (apple) {
+		case VIDEO_DEPTH_1BIT:  bit_depth = 1;  break;
+		case VIDEO_DEPTH_2BIT:  bit_depth = 2;  break;
+		case VIDEO_DEPTH_4BIT:  bit_depth = 4;  break;
+		case VIDEO_DEPTH_8BIT:  bit_depth = 8;  break;
+		case VIDEO_DEPTH_16BIT: bit_depth = 16; break;
+		case VIDEO_DEPTH_32BIT: bit_depth = 32; break;
+		default:                bit_depth = 8;  break;  // defensive fallback
+	}
+	out->depth            = bit_depth;
+	out->row_bytes        = (uint32_t)VModes[idx].viRowBytes;
+	out->pitch            = out->row_bytes;
+	out->vbl_usec         = 0;     // controller/compositor will compute from objc_getFrameRateSetting()
+	out->screen_base_mac  = 0;     // not meaningful pre-Resize
+	out->screen_base_host = NULL;
+}
+#endif /* SHEEPSHAVER && TARGET_OS_IPHONE */
+
 #ifdef SHEEPSHAVER
 bool VideoInit(void)
 {
@@ -1542,6 +1609,7 @@ bool VideoInit(bool classic)
 	// Mac screen depth follows X depth
 	screen_depth = 32;
 	SDL_DisplayMode desktop_mode;
+	desktop_mode.refresh_rate = objc_getFrameRateSetting();
 	if (SDL_GetDesktopDisplayMode(0, &desktop_mode) == 0) {
 		screen_depth = SDL_BITSPERPIXEL(desktop_mode.format);
 	}
@@ -1685,6 +1753,23 @@ bool VideoInit(bool classic)
 	int color_depth = get_customized_color_depth(default_depth);
 
 	D(bug("Return get_customized_color_depth %d\n", color_depth));
+
+#if TARGET_OS_IPHONE && defined(SHEEPSHAVER)
+	// Initialize the display-mode controller BEFORE the first compositor Init.
+	// Flow: VideoInit → monitor->video_open() → driver_base::init() →
+	// MetalCompositorInit() → dmc_subscribe("compositor"). The controller MUST
+	// exist before that subscribe lands (compositor subscribes FIRST so
+	// reverse-order enter makes it LAST).
+	{
+		DMCModeDesc initial;
+		DMCModeDescFromVModesIndex(cur_mode, &initial);
+		int32_t err = dmc_create(&initial);
+		if (err != kDMCNoErr) {
+			fprintf(stderr, "[DMC] dmc_create FAILED at VideoInit (err=%d) — "
+			                "continuing without DMC routing\n", (int)err);
+		}
+	}
+#endif
 
 	// Create SDL_monitor_desc for this (the only) display
 	SDL_monitor_desc *monitor = new SDL_monitor_desc(VideoModes, (video_depth)color_depth, default_id);
@@ -2000,6 +2085,9 @@ void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 #if TARGET_OS_IPHONE
 	// Update the GPU palette buffer so the Metal compositor renders correct colors
 	MetalCompositorUpdatePalette(pal, num_in);
+	// Bump DMC palette_gen so the compositor / engines can detect the CLUT change
+	// via dmc_current_snapshot()->palette_gen next frame (DMC seam).
+	dmc_record_palette_change();
 #endif
 
 	UNLOCK_PALETTE;
@@ -2073,14 +2161,45 @@ int16 video_mode_change(VidLocals *csSave, uint32 ParamPtr)
 			thread_stop_req = true;
 			while (!thread_stop_ack) ;
 
+#if TARGET_OS_IPHONE
+			// Route the mode switch through the display-mode controller
+			// seam. DMC owns its snapshot-ring state
+			// (active_owner, generation counters, palette/gamma hooks);
+			// the legacy `cur_mode` index into VModes[] is a separate
+			// compat handle consumed by the driver_base path
+			// (video_close → video_open → driver_base::init reads
+			// VModes[cur_mode] via VIDEO_MODE_INIT_MONITOR). An earlier
+			// change deleted the mirror assuming DMC would subsume the
+			// index, but the controller never writes cur_mode — causing
+			// switch_to_current_mode() to resize the Metal compositor
+			// to the OLD mode's dimensions/depth and produce garbled
+			// output (e.g. Nanosaur 640x480@16bpp switch staying at
+			// 1366x1024@APPLE_32_BIT). Restored below as an explicit,
+			// whitelisted seam — the only runtime `cur_mode` writer
+			// outside VideoInit bootstrap. See
+			// DMCWriteSiteInventoryTests allowedLineRanges rationale.
+			{
+				DMCModeDesc new_mode;
+				DMCModeDescFromVModesIndex(i, &new_mode);
+				int32_t err = dmc_request_mode_switch(&new_mode);
+				if (err != kDMCNoErr) {
+					fprintf(stderr, "[DMC] dmc_request_mode_switch FAILED (err=%d) — "
+					                "proceeding with legacy mode switch\n",
+					                (int)err);
+				}
+			}
+			// Sync the legacy VModes[] index so driver_base::init() reads
+			// the NEW mode's width/height/depth via VIDEO_MODE_INIT_MONITOR
+			// when switch_to_current_mode() reopens the display below.
 			cur_mode = i;
+#endif
 			monitor_desc *monitor = VideoMonitors[0];
 			monitor->switch_to_current_mode();
 
 			WriteMacInt32(ParamPtr + csBaseAddr, screen_base);
 			csSave->saveBaseAddr=screen_base;
-			csSave->saveData=VModes[cur_mode].viAppleID;/* First mode ... */
-			csSave->saveMode=VModes[cur_mode].viAppleMode;
+			csSave->saveData=VModes[i].viAppleID;/* First mode ... */
+			csSave->saveMode=VModes[i].viAppleMode;
 
 			// Enable interrupts and resume redraw thread
 			thread_stop_req = false;

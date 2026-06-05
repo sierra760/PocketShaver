@@ -36,6 +36,7 @@ class PreferencesGraphicsViewController: UITableViewController {
 		case graphicsAccelerationNqdToggle
 		case graphicsAccelerationRaveToggle
 		case graphicsAccelerationGlToggle
+		case graphicsAccelerationDspToggle
 		case graphicsAccelerationInfo
 	}
 
@@ -76,11 +77,17 @@ class PreferencesGraphicsViewController: UITableViewController {
 			guard let self else { return }
 			switch change {
 			case .selectedResolutionsChanged:
-				reloadData()
+				reloadSection(.monitorResolutions)
 			default:
 				break
 			}
 		}.store(in: &anyCancellables)
+	}
+
+	private func reloadSection(_ section: Section) {
+		var snapshot = dataSource.snapshot()
+		snapshot.reloadSections([section])
+		dataSource.apply(snapshot)
 	}
 
 	private func setupDataSource() {
@@ -88,9 +95,12 @@ class PreferencesGraphicsViewController: UITableViewController {
 			guard let self else { return UITableViewCell() }
 			switch itemIdentifier {
 			case .monitorResolutionsDisplay:
-				return PreferencesGeneralEnabledMonitorResolutionsCell(
-					monitorResolutions: model.monitorResolutions,
+				let monitorResolutionsState = PreferencesGeneralModel.MonitorResolutionsState(
+					enabledResolutions: model.monitorResolutions,
 					willBootFromCD: model.willBootFromCD
+				)
+				return PreferencesGeneralEnabledMonitorResolutionsCell(
+					monitorResolutionsState: monitorResolutionsState
 				) { [weak self] in
 					guard let self else { return }
 					let vc = preferencesResolutionsVC
@@ -168,6 +178,13 @@ class PreferencesGraphicsViewController: UITableViewController {
 				) { [weak self] isOn in
 					self?.model.glAccelEnabled = isOn
 				}
+			case .graphicsAccelerationDspToggle:
+				return PreferencesEnabledSettingCell(
+					title: "DrawSprocket (DSp) Acceleration",
+					isOn: model.dspAccelEnabled
+				) { [weak self] isOn in
+					self?.model.dspAccelEnabled = isOn
+				}
 			case .graphicsAccelerationInfo:
 				return PreferencesInformationCell(
 					text: "Experimental — Requires Metal GPU. Changes take effect on restart."
@@ -230,6 +247,7 @@ class PreferencesGraphicsViewController: UITableViewController {
 			.graphicsAccelerationNqdToggle,
 			.graphicsAccelerationRaveToggle,
 			.graphicsAccelerationGlToggle,
+			.graphicsAccelerationDspToggle,
 			.graphicsAccelerationInfo
 		])
 

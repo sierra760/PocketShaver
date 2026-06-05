@@ -14,7 +14,7 @@
  *    - NativeSetFloat/SetInt/SetPtr: store state values by tag ID
  *    - NativeGetFloat/GetInt/GetPtr: retrieve state values by tag ID
  *
- *  ObjC++ (.mm) for future Metal integration in Plan 02.
+ *  ObjC++ (.mm) for future Metal integration.
  */
 
 #include "sysdeps.h"
@@ -24,10 +24,15 @@
 
 #include <cstring>
 
-// RAVE error codes
-#define kQANoErr           0
-#define kQANotSupported   -1
-#define kQAError          -2
+// Forward declare Mac_sysalloc (from macos_util.h) to avoid UIKit header conflicts.
+extern uint32 Mac_sysalloc(uint32 size);
+
+// RAVE error codes (must match TQAError enum in RAVE.h)
+#define kQANoErr                    0
+#define kQAError                    1
+#define kQAOutOfMemory              2
+#define kQANotSupported             3
+#define kQAParamErr                 5
 
 // kQAContext flag bits
 #define kQAContext_NoZBuffer  (1 << 0)
@@ -180,6 +185,15 @@ static void InitStateDefaults(RaveDrawPrivate *ctx, uint32 flags)
 	// ATI state defaults (all zero from memset in RaveDrawPrivate allocation)
 	ctx->ati_fog_active = false;
 	memset(ctx->ati_state, 0, sizeof(ctx->ati_state));
+	uint32_t atiIntDefaults[RAVE_ATI_TAG_COUNT] = {};
+	RaveATIInitializeIntDefaults(atiIntDefaults, RAVE_ATI_TAG_COUNT);
+	for (uint32_t i = 0; i < RAVE_ATI_TAG_COUNT; i++) {
+		ctx->ati_state[i].i = atiIntDefaults[i];
+	}
+	RAVE_LOG("InitStateDefaults: ATI UT probe tag %u default=%u (0x%08x)",
+	         kRaveATIUnrealTournamentProbeTag,
+	         ctx->ati_state[kRaveATIUnrealTournamentProbeIndex].i,
+	         ctx->ati_state[kRaveATIUnrealTournamentProbeIndex].i);
 }
 
 /*
@@ -187,7 +201,7 @@ static void InitStateDefaults(RaveDrawPrivate *ctx, uint32 flags)
  *
  *  The struct has 35 method pointer fields starting at offset 8.
  *  Fields 0-34 all map to draw method tags.
- *  Fields 26-33 are RAVE 1.6 buffer access/clear methods (Phase 6).
+ *  Fields 26-33 are RAVE 1.6 buffer access/clear methods.
  */
 static const int kDrawContextMethodFields = 35;
 
@@ -263,7 +277,7 @@ int32 NativeDrawPrivateNew(uint32 drawContextAddr, uint32 deviceAddr,
 	// Allocate vertex staging buffer
 	ctx->vertexStagingCapacity = 65536;
 	ctx->vertexStagingCount = 0;
-	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * 48]; // 48 bytes per vertex (Phase 4 layout)
+	ctx->vertexStagingBuffer = new uint8_t[ctx->vertexStagingCapacity * RAVE_VERTEX_BYTES];
 
 	// Allocate multi-texture UV staging buffer (parallel to vertexStagingBuffer)
 	// 16 bytes per vertex: uOverW2(4) + vOverW2(4) + invW2(4) + pad(4)
@@ -313,9 +327,11 @@ int32 NativeDrawPrivateNew(uint32 drawContextAddr, uint32 deviceAddr,
 	rave_context_count++;
 
 	// Initialize Metal overlay (viewport-sized) and per-context resources.
-	// RaveOverlayRetain cancels any pending deferred destroy internally.
+	// Shared-overlay retain call deleted — per-engine ownership
+	// via gfxaccel_resources eliminates the shared refcount model entirely.
+	// RaveCreateMetalOverlay vends a per-engine overlay texture from
+	// gfxaccel_resources directly.
 	RaveCreateMetalOverlay(ctx->left, ctx->top, ctx->width, ctx->height);
-	RaveOverlayRetain();
 	RaveInitMetalResources(ctx);
 
 	RAVE_LOG("DrawPrivateNew: handle=%d size=%dx%d contexts=%d",
@@ -380,12 +396,16 @@ int32 NativeDrawPrivateDelete(uint32 drawPrivateHandle)
 	delete ctx;
 	rave_context_count--;
 
-	// Release one overlay refcount per context delete, matching the per-context
-	// RaveOverlayRetain() in NativeDrawPrivateNew. RaveOverlayRelease schedules
-	// deferred destroy if refcount reaches 0.
-	RaveOverlayRelease();
+	// Overlay lifetime is scoped to the DMC MODE, not to draw-context churn.
+	// When the last RAVE context goes away, LEAVE the cached overlay alive.
+	// The gfxaccel_resources fan-out (RaveOnDetach in rave_engine.cpp) will
+	// release it on real mode changes, and RaveOnAttach will re-vend at the
+	// new resolution. Tearing down here caused visible black flashes on every
+	// Nanosaur scene transition (menu ↔ gameplay) because the host's main-
+	// thread VBL presented frames during the interval between destroy and the
+	// next DrawPrivateNew → RaveCreateMetalOverlay call.
 
-	// Clamp for safety (non-overlay purposes)
+	// Clamp for safety
 	if (rave_context_count <= 0) {
 		rave_context_count = 0;
 		rave_current_draw_context_addr = 0;
@@ -428,6 +448,9 @@ int32 NativeSetFloat(uint32 drawContextAddr, uint32 tag, uint32 valueBits)
 			float value;
 			memcpy(&value, &valueBits, sizeof(float));
 			ctx->ati_state[ati_idx].f = value;
+			if (ati_idx == kRaveATIDepthWriteEnableIndex) {
+				ctx->dirty_flags |= 1;
+			}
 			// Activate ATI fog override when fog-related tags are set (indices 2-9)
 			if (ati_idx >= 2 && ati_idx <= 9) {
 				ctx->ati_fog_active = true;
@@ -472,6 +495,9 @@ int32 NativeSetInt(uint32 drawContextAddr, uint32 tag, uint32 value)
 		uint32_t ati_idx = tag - 1000;
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
 			ctx->ati_state[ati_idx].i = value;
+			if (ati_idx == kRaveATIDepthWriteEnableIndex) {
+				ctx->dirty_flags |= 1;
+			}
 			// Activate ATI fog override when fog-related tags are set (indices 2-9)
 			if (ati_idx >= 2 && ati_idx <= 9) {
 				ctx->ati_fog_active = true;
@@ -497,6 +523,34 @@ int32 NativeSetInt(uint32 drawContextAddr, uint32 tag, uint32 value)
 	return kQANoErr;
 }
 
+static void WriteATIRaveExtFuncsTable(uint32 ptr)
+{
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotClearDrawBuffer * 4,
+	              rave_method_tvects[kRaveATIClearDrawBuffer]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotClearZBuffer * 4,
+	              rave_method_tvects[kRaveATIClearZBuffer]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotTextureUpdate * 4,
+	              rave_method_tvects[kRaveATITextureUpdate]);
+	WriteMacInt32(ptr + kRaveATIRaveExtFuncsSlotBindCodeBook * 4,
+	              rave_method_tvects[kRaveATIBindCodeBook]);
+}
+
+static uint32 EnsureATIRaveExtFuncsTable(RaveDrawPrivate *ctx)
+{
+	uint32 ptr = ctx->ati_state[kRaveATIRaveExtFuncsIndex].i;
+	if (ptr == 0) {
+		ptr = Mac_sysalloc(kRaveATIRaveExtFuncsEntryCount * 4);
+		if (ptr == 0) {
+			RAVE_LOG("GetPtr: kATIRaveExtFuncs allocation failed");
+			return 0;
+		}
+		ctx->ati_state[kRaveATIRaveExtFuncsIndex].i = ptr;
+	}
+
+	WriteATIRaveExtFuncsTable(ptr);
+	return ptr;
+}
+
 
 /*
  *  NativeSetPtr - Store a pointer state value (Mac address)
@@ -513,12 +567,13 @@ int32 NativeSetPtr(uint32 drawContextAddr, uint32 tag, uint32 ptr)
 	// ATI EngineSpecific range (1000+)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
-		if (ati_idx == 21) {  // kATIRaveExtFuncs
-			// Write 4 TVECT addresses into the RaveExtFuncs struct at ptr
-			WriteMacInt32(ptr + 0, rave_method_tvects[kRaveATIClearDrawBuffer]);   // clearDrawBuffer
-			WriteMacInt32(ptr + 4, rave_method_tvects[kRaveATIClearZBuffer]);      // clearZBuffer
-			WriteMacInt32(ptr + 8, rave_method_tvects[kRaveATITextureUpdate]);     // textureUpdate
-			WriteMacInt32(ptr + 12, rave_method_tvects[kRaveATIBindCodeBook]);     // bindCodeBook
+		if (ati_idx == kRaveATIRaveExtFuncsIndex) {
+			if (ptr == 0) {
+				RAVE_LOG("SetPtr: kATIRaveExtFuncs ignored null pointer");
+				return kQAParamErr;
+			}
+			WriteATIRaveExtFuncsTable(ptr);
+			ctx->ati_state[kRaveATIRaveExtFuncsIndex].i = ptr;
 			RAVE_LOG("SetPtr: kATIRaveExtFuncs -> delivered 4 TVECT addresses to 0x%08x", ptr);
 			return kQANoErr;
 		}
@@ -588,7 +643,11 @@ uint32 NativeGetInt(uint32 drawContextAddr, uint32 tag)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
-			return ctx->ati_state[ati_idx].i;
+			uint32_t value = ctx->ati_state[ati_idx].i;
+			if (tag == kRaveATIUnrealTournamentProbeTag) {
+				RAVE_LOG("GetInt: ATI UT probe tag %u -> %u (0x%08x)", tag, value, value);
+			}
+			return value;
 		}
 		return 0;
 	}
@@ -615,6 +674,11 @@ uint32 NativeGetPtr(uint32 drawContextAddr, uint32 tag)
 	// ATI EngineSpecific range (1000+)
 	if (tag >= 1000) {
 		uint32_t ati_idx = tag - 1000;
+		if (ati_idx == kRaveATIRaveExtFuncsIndex) {
+			uint32 ptr = EnsureATIRaveExtFuncsTable(ctx);
+			RAVE_LOG("GetPtr: kATIRaveExtFuncs -> 0x%08x", ptr);
+			return ptr;
+		}
 		if (ati_idx < RAVE_ATI_TAG_COUNT) {
 			return ctx->ati_state[ati_idx].i;
 		}

@@ -22,7 +22,7 @@
 #include "gl_engine.h"
 #include "accel_logging.h"
 
-// Logging state -- disabled by default for GL (high call volume)
+// Logging state -- disabled by default to reduce production log noise.
 #if ACCEL_LOGGING_ENABLED
 bool gl_logging_enabled = false;
 #endif
@@ -270,7 +270,7 @@ extern void NativeGLTexCoord2sv(GLContext *ctx, uint32_t mac_ptr);
 extern void NativeGLTexCoord3sv(GLContext *ctx, uint32_t mac_ptr);
 extern void NativeGLTexCoord4sv(GLContext *ctx, uint32_t mac_ptr);
 
-// ---- Plan 08 remaining core GL externs (gl_state.cpp) ----
+// ---- Remaining core GL externs (gl_state.cpp) ----
 extern void NativeGLAccum(GLContext *ctx, uint32_t op, float value);
 extern void NativeGLClearAccum(GLContext *ctx, float r, float g, float b, float a);
 extern void NativeGLClearIndex(GLContext *ctx, float c);
@@ -1457,13 +1457,13 @@ uint32_t GLDispatch(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
 			NativeGLLogicOp(gl_current_context, r3);
 			return 0;
 		// --- Core GL: Map, Material, Matrix, Mult ---
-		case GL_SUB_MAP1D: NativeGLMap1d(gl_current_context, r3, 0, 0, (int32_t)r4, (int32_t)r5, r6); return 0;
+		case GL_SUB_MAP1D: NativeGLMap1d(gl_current_context, r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, (int32_t)r5, r6); return 0;
 		case GL_SUB_MAP1F: NativeGLMap1f(gl_current_context, r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, (int32_t)r5, r6); return 0;
-		case GL_SUB_MAP2D: NativeGLMap2d(gl_current_context, r3, 0, 0, (int32_t)r4, (int32_t)r5, 0, 0, (int32_t)r6, (int32_t)r7, r8); return 0;
+		case GL_SUB_MAP2D: NativeGLMap2d(gl_current_context, r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, (int32_t)r5, float_arg(float_bits, 2), float_arg(float_bits, 3), (int32_t)r6, (int32_t)r7, r8); return 0;
 		case GL_SUB_MAP2F: NativeGLMap2f(gl_current_context, r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, (int32_t)r5, float_arg(float_bits, 2), float_arg(float_bits, 3), (int32_t)r6, (int32_t)r7, r8); return 0;
-		case GL_SUB_MAP_GRID1D: NativeGLMapGrid1d(gl_current_context, (int32_t)r3, 0, 0); return 0;
+		case GL_SUB_MAP_GRID1D: NativeGLMapGrid1d(gl_current_context, (int32_t)r3, float_arg(float_bits, 0), float_arg(float_bits, 1)); return 0;
 		case GL_SUB_MAP_GRID1F: NativeGLMapGrid1f(gl_current_context, (int32_t)r3, float_arg(float_bits, 0), float_arg(float_bits, 1)); return 0;
-		case GL_SUB_MAP_GRID2D: NativeGLMapGrid2d(gl_current_context, (int32_t)r3, 0, 0, (int32_t)r4, 0, 0); return 0;
+		case GL_SUB_MAP_GRID2D: NativeGLMapGrid2d(gl_current_context, (int32_t)r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, float_arg(float_bits, 2), float_arg(float_bits, 3)); return 0;
 		case GL_SUB_MAP_GRID2F: NativeGLMapGrid2f(gl_current_context, (int32_t)r3, float_arg(float_bits, 0), float_arg(float_bits, 1), (int32_t)r4, float_arg(float_bits, 2), float_arg(float_bits, 3)); return 0;
 		case GL_SUB_MATERIALF:
 			NativeGLMaterialf(gl_current_context, r3, r4, float_arg(float_bits, 0));
@@ -1756,12 +1756,17 @@ uint32_t GLDispatch(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
 				// stack at shifted positions. Read type from stack arg -1 (the slot
 				// that would have been r10) and pixels from stack arg 0.
 				uint32_t type, pixels;
+				// This branch handles the dispatch-table calling convention
+				// (gl_dt_flag_addr == 1). The "else" branch handles the stub-call
+				// convention (gl_dt_flag_addr == 0). Both are real dispatch paths;
+				// neither is a "stub" in the unimplemented sense. See the gl_thunks.cpp
+				// comment for the full calling-convention contract.
 				if (gl_ppc_stack_arg_offset) {
 					// Dispatch-table path: type and pixels are both on the stack
 					type   = gl_ppc_stack_arg(-1);  // game's r10 equivalent
 					pixels = gl_ppc_stack_arg(0);    // game's stack arg 0
 				} else {
-					// Stub path: type is r10, pixels is stack arg 0
+					// FindLibSymbol path: type is r10, pixels is stack arg 0
 					type   = r10;
 					pixels = gl_ppc_stack_arg(0);
 				}

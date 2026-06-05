@@ -25,8 +25,19 @@ DerivedData/
 *.perspectivev3
 !default.perspectivev3
 xcuserdata/
-xcschemes/
+# Ignore user-local xcschemes but keep shared ones (xcshareddata/xcschemes/*)
+xcschemes/*
+!xcshareddata/xcschemes/**
 project.xcworkspace/
+
+resources/
+# Phase 3 Plan 03-02 exception: PocketShaverTests/Resources/ is an Xcode
+# test group for gfxaccel_resources lifecycle + zero-copy tests. The bare
+# `resources/` rule above matches case-insensitively on macOS and would
+# otherwise swallow this intentional path.
+!SheepShaver/src/MacOSX/PocketShaverTests/Resources/
+!SheepShaver/src/MacOSX/PocketShaverTests/Resources/**
+loggo.txt
 
 ## Xcode, Other
 *.moved-aside
@@ -38,3 +49,28 @@ project.xcworkspace/
 #
 *.idea
 SheepShaver/src/MacOSX/Launcher/English.lproj/VMSettingsWindow.nib/designable.nib
+
+.bg-shell/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/

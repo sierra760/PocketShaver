@@ -24,7 +24,27 @@ uint32_t gl_scratch_addr = 0;
 // These shift R3-R10 left by one position because the game passes the context
 // index in R3 and real GL args start at R4.
 uint32_t gl_dt_method_tvects[GL_MAX_SUBOPCODE];
-uint32_t gl_dt_flag_addr = 0;  // scratch word: 1 = dispatch-table call, 0 = stub call
+
+// gl_dt_flag_addr — runtime calling-convention discriminator.
+//
+// Two PPC calling conventions reach NativeGLDispatch:
+//   (A) FindLibSymbol TVECT (stub call): AllocateGLTVECT sets flag=0.
+//       GPR3..GPR10 carry the real GL function arguments directly.
+//   (B) Dispatch-table slot: AllocateGLDispatchTableTVECT sets flag=1.
+//       GPR3 = context index; GPR4..GPR10 carry the real arguments
+//       shifted by one register.
+//
+// gl_dispatch.cpp reads this flag into gl_ppc_stack_arg_offset:
+//   - flag=0 → args start at GPR3 (standard PPC ABI)
+//   - flag=1 → args start at GPR4 (context index in GPR3 is consumed)
+//
+// For 9+ argument functions (glTexImage2D, glTexSubImage2D), the flag also
+// determines the stack argument offset (PPC calling convention passes args
+// 9+ on the stack; the offset differs by one slot between conventions).
+//
+// Single-threaded by design: the emulator thread sets the flag, reads it,
+// and dispatches — no race. Do not eliminate; it's a runtime invariant.
+uint32_t gl_dt_flag_addr = 0;  // 1 = dispatch-table call, 0 = stub call
 // gl_logging_enabled is defined in gl_dispatch.cpp (single definition)
 
 /*
@@ -373,6 +393,10 @@ static void InitFuncSignatures()
 	SIG(GL_SUB_MAP1F, 6, 0x06);  // target=int, u1=float, u2=float, stride=int, order=int, points=ptr
 	// map1d(target, u1, u2, stride, order, points)
 	SIG(GL_SUB_MAP1D, 6, 0x06);
+	// map2f(target, u1, u2, ustride, uorder, v1, v2, vstride, vorder, points)
+	SIG(GL_SUB_MAP2F, 10, 0x66);  // floats at positions 1,2,5,6 = 0x66
+	// map2d(target, u1, u2, ustride, uorder, v1, v2, vstride, vorder, points)
+	SIG(GL_SUB_MAP2D, 10, 0x66);
 	// map_grid1f(un, u1, u2) -- un=int, u1=float, u2=float
 	SIG(GL_SUB_MAP_GRID1F, 3, 0x06);
 	// map_grid1d(un, u1, u2)
@@ -381,8 +405,20 @@ static void InitFuncSignatures()
 	SIG(GL_SUB_MAP_GRID2F, 6, 0x36);  // float_mask: bits 1,2,4,5 = 0x36
 	// map_grid2d(un, u1, u2, vn, v1, v2) -- same pattern with doubles
 	SIG(GL_SUB_MAP_GRID2D, 6, 0x36);
-	// blend_color(r, g, b, a) -- 4 floats (GL 1.2 core, not EXT)
-	SIG(GL_SUB_BLEND_COLOR_1_2, 4, 0x0F);
+
+	// GLU functions with float/double args (previously missing):
+	// gluProject(objX, objY, objZ, model, proj, viewport, winX, winY, winZ)
+	SIG(GL_SUB_GLU_PROJECT, 9, 0x07);  // doubles at positions 0,1,2
+	// gluUnProject(winX, winY, winZ, model, proj, viewport, objX, objY, objZ)
+	SIG(GL_SUB_GLU_UNPROJECT, 9, 0x07);
+	// gluPartialDisk(quad, inner, outer, slices, loops, startAngle, sweepAngle)
+	SIG(GL_SUB_GLU_PARTIALDISK, 7, 0x66);  // doubles at positions 1,2,5,6
+	// gluTessProperty(tess, which, data)
+	SIG(GL_SUB_GLU_TESSPROPERTY, 3, 0x04);  // double at position 2
+	// gluTessNormal(tess, x, y, z)
+	SIG(GL_SUB_GLU_TESSNORMAL, 4, 0x0E);  // doubles at positions 1,2,3
+	// gluNurbsProperty(nurb, property, value)
+	SIG(GL_SUB_GLU_NURBSPROPERTY, 3, 0x04);  // float at position 2
 
 	#undef SIG
 }

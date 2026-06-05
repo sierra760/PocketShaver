@@ -43,6 +43,8 @@ uint32_t rave_orig_access_texture = 0;
 uint32_t rave_orig_access_texture_end = 0;
 uint32_t rave_orig_access_bitmap = 0;
 uint32_t rave_orig_access_bitmap_end = 0;
+uint32_t rave_orig_engine_enable = 0;
+uint32_t rave_orig_engine_disable = 0;
 
 /*
  *  Allocate a single RAVE TVECT thunk in SheepMem
@@ -211,7 +213,7 @@ void RaveThunksInit(void)
 	RAVE_LOG("RaveThunksInit: allocated %d TVECTs, scratch at 0x%08x, sentinel at 0x%08x",
 			 tvect_count, rave_scratch_addr, rave_sentinel_engine);
 
-	// Diagnostic: dump draw method TVECT addresses (GAP-036: gated by rave_logging_enabled)
+	// TVECT diagnostic dump gated by rave_logging_enabled. Test: RAVEABITests.testTVECT_loggingGate
 	if (rave_logging_enabled) {
 		printf("RAVE ThunksInit: scratch=0x%08x, rave_opcode=0x%08x\n",
 		       rave_scratch_addr, rave_opcode);

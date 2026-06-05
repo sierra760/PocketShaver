@@ -41,6 +41,7 @@
 #include "timer.h"
 #include "rave_engine.h"
 #include "gl_engine.h"
+#include "dsp_engine.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1242,7 +1243,7 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 			gpr(5) = fbits;
 		}
 
-		uint32 rave_ret = RaveDispatch(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8));
+		uint32 rave_ret = RaveDispatchARC(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8));
 		gpr(3) = rave_ret;
 
 		// GetFloat returns float bits in gpr(3). PPC caller also expects
@@ -1345,7 +1346,7 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		}
 
 		// Call dispatch with GPR args and extracted float bits
-		gpr(3) = GLDispatch(arg_r3, arg_r4, arg_r5, arg_r6,
+		gpr(3) = GLDispatchARC(arg_r3, arg_r4, arg_r5, arg_r6,
 		                    arg_r7, arg_r8, arg_r9, arg_r10,
 		                    float_bits, fpr_idx);
 
@@ -1355,6 +1356,38 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		if (gpr(1) != saved_sp) gpr(1) = saved_sp;
 		if (gpr(2) != saved_r2) gpr(2) = saved_r2;
 
+		break;
+	}
+	case NATIVE_DSP_DISPATCH: {
+		// No Metal resources, so no @autoreleasepool wrapper is needed
+		// here; the context-lifecycle path wraps in @autoreleasepool once
+		// GPU calls (GetBackBuffer vending a MTLTexture) land. Register-
+		// preservation pattern mirrors RAVE/GL for re-entrant PPC safety.
+		uint32 saved_lr = lr();
+		uint32 saved_ctr = ctr();
+		uint32 saved_sp = gpr(1);
+		uint32 saved_r2 = gpr(2);
+
+		/* Stash caller LR + r11
+		 * for the one-shot DSpDispatch diagnostic on unresolved sub-opcodes
+		 * 400/401/501/502/600. r11 carries the CFM TVECT address under the
+		 * CFM ABI, so it identifies WHICH DSp symbol the caller jumped
+		 * through. Globals are defined in dsp_dispatch.cpp; single-thread
+		 * (emul) read+write so no synchronisation required. */
+		{
+			extern uint32_t dsp_caller_lr;
+			extern uint32_t dsp_caller_r11;
+			dsp_caller_lr = saved_lr;
+			dsp_caller_r11 = gpr(11);
+		}
+
+		uint32 dsp_ret = DSpDispatch(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8));
+		gpr(3) = dsp_ret;
+
+		if (lr() != saved_lr) { lr() = saved_lr; }
+		if (ctr() != saved_ctr) { ctr() = saved_ctr; }
+		if (gpr(1) != saved_sp) { gpr(1) = saved_sp; }
+		if (gpr(2) != saved_r2) { gpr(2) = saved_r2; }
 		break;
 	}
 	default:

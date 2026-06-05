@@ -20,18 +20,24 @@
 
 struct RaveDrawPrivate;
 
-// Overlay lifecycle (shared across all contexts, backed by compositor offscreen texture)
+// Overlay lifecycle (per-engine ownership via gfxaccel_resources;
+// no longer shared with GL, no refcount, no deferred-destroy).
 extern void RaveCreateMetalOverlay(int32_t left, int32_t top, int32_t width, int32_t height);
 extern void RaveDestroyMetalOverlay(void);
 extern void RaveClearOverlayToTransparent(void);
 
-// Deferred overlay destruction (prevents flicker on rapid create/destroy cycles)
-extern void RaveScheduleDeferredOverlayDestroy(void);
-extern void RaveCancelDeferredOverlayDestroy(void);
-
-// Overlay reference counting (shared between RAVE and GL engines)
-extern void RaveOverlayRetain(void);
-extern void RaveOverlayRelease(void);
+// Fan-out hooks: small C-linkage probes so rave_engine.cpp's
+// RaveOnAttach / RaveOnDetach handlers can interrogate / drive RAVE's
+// per-engine overlay state without needing direct ObjC++ access.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int  rave_has_active_overlay(void);
+int  rave_get_overlay_dims(uint32_t *outW, uint32_t *outH);
+void rave_release_overlay_for_detach(void);
+#ifdef __cplusplus
+}
+#endif
 
 // Per-context Metal resource management
 extern void RaveInitMetalResources(struct RaveDrawPrivate *priv);
@@ -82,11 +88,11 @@ extern int32_t NativeGetNoticeMethod(uint32_t drawContextAddr, uint32_t method,
                                       uint32_t callbackOutPtr, uint32_t refConOutPtr);
 
 // RAVE 1.6 buffer access (draw/Z buffer readback + writeback)
-extern int32_t NativeAccessDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr,
-                                       uint32_t rowBytesPtr, uint32_t bufferPtrPtr);
+// SDK: AccessDrawBuffer(ctx, TQAPixelBuffer*)   -- TQAPixelBuffer = {rowBytes, pixelType, width, height, baseAddr}
+// SDK: AccessZBuffer(ctx, TQAZBuffer*)           -- TQAZBuffer = {width, height, rowBytes, zbuffer, zDepth, isBigEndian}
+extern int32_t NativeAccessDrawBuffer(uint32_t drawContextAddr, uint32_t bufferStructAddr);
 extern int32_t NativeAccessDrawBufferEnd(uint32_t drawContextAddr, uint32_t dirtyRectAddr);
-extern int32_t NativeAccessZBuffer(uint32_t drawContextAddr, uint32_t rectAddr,
-                                    uint32_t rowBytesPtr, uint32_t bufferPtrPtr);
+extern int32_t NativeAccessZBuffer(uint32_t drawContextAddr, uint32_t bufferStructAddr);
 extern int32_t NativeAccessZBufferEnd(uint32_t drawContextAddr, uint32_t dirtyRectAddr);
 
 // RAVE 1.6 mid-frame buffer clear (sub-rect clear)
@@ -95,10 +101,10 @@ extern int32_t NativeClearDrawBuffer(uint32_t drawContextAddr, uint32_t rectAddr
 extern int32_t NativeClearZBuffer(uint32_t drawContextAddr, uint32_t rectAddr, uint32_t initialContextAddr);
 
 // RAVE 1.6 swap control, busy query, and render-to-texture (called from rave_dispatch.cpp)
-extern int32_t NativeSwapBuffers(uint32_t drawContextAddr);
+extern int32_t NativeSwapBuffers(uint32_t drawContextAddr, uint32_t dirtyRectAddr);
 extern int32_t NativeBusy(uint32_t drawContextAddr);
-extern uint32_t NativeTextureNewFromDrawContext(uint32_t drawContextAddr);
-extern uint32_t NativeBitmapNewFromDrawContext(uint32_t drawContextAddr);
+extern int32_t NativeTextureNewFromDrawContext(uint32_t drawContextAddr, uint32_t flags, uint32_t newTexturePtr);
+extern int32_t NativeBitmapNewFromDrawContext(uint32_t drawContextAddr, uint32_t flags, uint32_t newBitmapPtr);
 
 // Metal texture creation/upload functions (called from rave_engine.cpp via void* bridge)
 extern void *RaveCreateMetalTexture(uint32_t width, uint32_t height, uint32_t mipLevels,

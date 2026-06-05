@@ -766,11 +766,14 @@ struct GLTextureObject {
     int      depth;          // for 3D textures (GL_TEXTURE_3D_EXT)
     uint32_t min_filter;     // GLenum: GL_NEAREST, GL_LINEAR, etc.
     uint32_t mag_filter;     // GLenum
-    uint32_t wrap_s;         // GLenum: GL_REPEAT, GL_CLAMP, etc.
-    uint32_t wrap_t;         // GLenum
-    int      env_mode;       // GL_MODULATE, GL_DECAL, GL_BLEND, GL_REPLACE
-    bool     has_mipmaps;
-};
+	    uint32_t wrap_s;         // GLenum: GL_REPEAT, GL_CLAMP, etc.
+		    uint32_t wrap_t;         // GLenum
+			    int      env_mode;       // GL_MODULATE, GL_DECAL, GL_BLEND, GL_REPLACE
+			    bool     has_mipmaps;
+			    bool     legacy_ushort_palette_index_chain; // level-0 duplicated-byte indexed palette applies to mips
+				    bool     legacy_ushort_bgr332_chain; // level-0 duplicated-byte BGR332 fallback may apply to duplicated mips
+			    bool     legacy_ushort_index_gray_chain; // level-0 duplicated-byte index fallback applies to mips
+			};
 
 
 /*
@@ -1114,6 +1117,7 @@ struct GLContext {
     // ---- Enable/disable caps ----
     bool     depth_test;
     bool     blend;
+    bool     color_sum;                // GL_COLOR_SUM (EXT_secondary_color) — add secondary color after texturing
     bool     cull_face_enabled;
     uint32_t cull_face_mode;           // GL_FRONT, GL_BACK, GL_FRONT_AND_BACK
     uint32_t front_face;               // GL_CCW or GL_CW
@@ -1175,6 +1179,19 @@ struct GLContext {
     GLVertexArrayPointer edge_flag_array;
     GLVertexArrayPointer index_array;
 
+    // ---- Immediate draw-state latches ----
+    // ATI-era clients such as Warcraft III prepare texture state and client
+    // texcoords, then disable them immediately before glDrawElements. Track
+    // same-draw cleanup plus a bounded texture latch for subsequent array
+    // draws that keep binding textures and texcoords in the same batch.
+    uint32_t completed_draw_serial;
+    uint32_t texture_2d_enable_draw_serial[4];
+    uint32_t texcoord_array_enable_draw_serial[4];
+    bool     prepared_texture_2d_for_draw[4];
+    bool     latched_texture_2d_for_array_draw[4];
+    bool     prepared_texcoord_array_for_draw[4];
+    GLVertexArrayPointer prepared_texcoord_array[4];
+
     // ---- Display lists ----
     std::unordered_map<uint32_t, GLDisplayList> display_lists;
     uint32_t next_list_name;
@@ -1214,6 +1231,11 @@ struct GLContext {
     uint32_t render_mode;              // GL_RENDER, GL_SELECT, GL_FEEDBACK
     uint32_t selection_buffer_mac_ptr;
     int32_t  selection_buffer_size;
+    int32_t  selection_buffer_offset;  // current write position in selection buffer
+    int32_t  selection_hit_count;      // number of hit records written
+    bool     selection_hit_flag;       // true if any primitive was drawn since last name stack change
+    uint32_t selection_hit_z_min;      // min Z (as GLuint) for current hit
+    uint32_t selection_hit_z_max;      // max Z (as GLuint) for current hit
     uint32_t feedback_buffer_mac_ptr;
     int32_t  feedback_buffer_size;
     uint32_t feedback_type;
@@ -1258,10 +1280,18 @@ struct GLContext {
     float    pixel_transfer_depth_scale;
     float    pixel_transfer_depth_bias;
     // Pixel maps (small tables, max 256 entries each)
+    float    pixel_map_i_to_r[256];
+    float    pixel_map_i_to_g[256];
+    float    pixel_map_i_to_b[256];
+    float    pixel_map_i_to_a[256];
     float    pixel_map_r_to_r[256];
     float    pixel_map_g_to_g[256];
     float    pixel_map_b_to_b[256];
     float    pixel_map_a_to_a[256];
+    int      pixel_map_i_to_r_size;
+    int      pixel_map_i_to_g_size;
+    int      pixel_map_i_to_b_size;
+    int      pixel_map_i_to_a_size;
     int      pixel_map_r_to_r_size;
     int      pixel_map_g_to_g_size;
     int      pixel_map_b_to_b_size;
@@ -1348,6 +1378,15 @@ extern uint32_t GLDispatch(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
                            uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10,
                            const uint32_t *float_bits, int num_float_args);
 
+// @autoreleasepool wrapper around GLDispatch (defined in gfxaccel_arc_shim.mm).
+// See the RaveDispatchARC comment for the rationale.  Called from
+// sheepshaver_glue.cpp:NATIVE_GL_DISPATCH in
+// place of direct GLDispatch so the emul thread drains autoreleased MTL*/NS*
+// temporaries every dispatch call.
+extern uint32_t GLDispatchARC(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
+                              uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10,
+                              const uint32_t *float_bits, int num_float_args);
+
 // Install library hooks to intercept GL/AGL/GLU/GLUT function lookups
 extern void GLInstallHooks();
 
@@ -1377,6 +1416,7 @@ extern GLFuncSignature gl_func_signatures[];
 // Metal renderer functions (implemented in gl_metal_renderer.mm)
 extern void GLMetalInit(GLContext *ctx);
 extern void GLMetalBeginFrame(GLContext *ctx);
+extern void GLMetalClear(GLContext *ctx, uint32_t mask);
 extern void GLMetalEndFrame(GLContext *ctx);
 extern void GLMetalFlushImmediateMode(GLContext *ctx);
 extern void GLMetalRelease(GLContext *ctx);
@@ -1392,6 +1432,62 @@ extern void GLMetalUploadSubTexture3D(GLContext *ctx, GLTextureObject *texObj, i
 extern void GLMetalDestroyTexture(GLTextureObject *texObj);
 extern void GLMetalDrawPixels(GLContext *ctx, int width, int height, const uint8_t *bgra_data, int data_len);
 extern void GLMetalBitmap(GLContext *ctx, int width, int height, const uint8_t *bgra_data, int data_len);
+// Read a rectangle from the framebuffer into a malloc'd BGRA8 buffer. Caller must free().
+// Returns NULL on failure. Output length written to *out_len.
+extern uint8_t *GLMetalReadFramebufferRect(GLContext *ctx, int x, int y, int width, int height, int *out_len);
+
+/*
+ *  Per-engine overlay lifecycle + gfxaccel_resources fan-out
+ *  hooks for GL (mirrors RAVE's overlay pattern).
+ *
+ *  gl_overlay_bind / gl_overlay_unbind / gl_overlay_present are called from
+ *  gl_engine.cpp's NativeAGLSetDrawable / NativeAGLSwapBuffers. They own
+ *  the kGfxEngineGL fleet slot's overlay texture lifetime and emit a
+ *  kLayerSlotOverlay CompositeLayer via MetalCompositorSubmitFrame on
+ *  present.
+ *
+ *  gl_has_active_overlay / gl_get_overlay_dims / gl_release_overlay_for_detach
+ *  are the C-linkage probes consumed by gl_engine.cpp's GLOnAttach / GLOnDetach
+ *  fan-out handlers (registered with gfxaccel_resources at GLInstallHooks).
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void gl_overlay_bind(int32_t left, int32_t top, int32_t width, int32_t height);
+void gl_overlay_unbind(void);
+void gl_overlay_present(void);
+int  gl_has_active_overlay(void);
+int  gl_get_overlay_dims(uint32_t *outW, uint32_t *outH);
+void gl_release_overlay_for_detach(void);
+int  GLContextGetOffscreenDrawable(GLContext *ctx,
+                                   uint32_t *outW,
+                                   uint32_t *outH,
+                                   uint32_t *outRowbytes,
+                                   uint32_t *outBaseaddr);
+uint64_t GLCompositeLatestOffscreenToGuestSurface(uint32_t dstBaseaddr,
+                                                  uint32_t dstRowbytes,
+                                                  uint32_t dstWidth,
+                                                  uint32_t dstHeight,
+                                                  uint32_t dstDepthBits);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtent(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentDirtyRect(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits,
+	int32_t dirtyX,
+	int32_t dirtyY,
+	int32_t dirtyWidth,
+	int32_t dirtyHeight);
+uint64_t GLCompositeLatestOffscreenToGuestSurfaceUsingLatestExtentIfNotSuppressed(
+	uint32_t dstBaseaddr,
+	uint32_t dstRowbytes,
+	uint32_t dstDepthBits);
+#ifdef __cplusplus
+}
+#endif
 
 
 #endif /* GL_ENGINE_H */

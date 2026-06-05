@@ -7,6 +7,7 @@
 
 import UIKit
 import Combine
+import AVFoundation
 
 enum HoverOffsetMode {
 	case off
@@ -16,6 +17,30 @@ enum HoverOffsetMode {
 	case diagonallyAbove
 }
 
+/// Input-event kinds forwarded to
+/// DSp contexts via DSpEventService.swift's Combine subscription.
+/// Mirrors the DSp 1.7 EventRecord.what enumeration subset (classic
+/// Mac toolbox values; see dsp_event_record.h kDSpEvent_*).
+enum DSpInputEventKind {
+	case keyDown     // kDSpEvent_KeyDown = 3
+	case keyUp       // kDSpEvent_KeyUp = 4
+	case mouseDown   // kDSpEvent_MouseDown = 1
+	case mouseUp     // kDSpEvent_MouseUp = 2
+}
+
+/// Swift-side value type that InputInteractionModel
+/// publishes on dspInputEventSubject. DSpEventService.swift's Combine
+/// subscription translates this into the 7-arg
+/// DSpHostBridge_EnqueueEventToActiveContexts C call. Fields map 1:1
+/// to DSpEventRecord (dsp_event_record.h).
+struct DSpInputEvent {
+	let kind: DSpInputEventKind
+	let keyCode: Int        // SDLKey.enValue for key events; 0 for mouse
+	let buttonIndex: Int    // 1 = primary (mouse click) per classic Mac; 0 for key
+	let modifiers: UInt16   // modifier mask; 0 (unused)
+	let timestamp: UInt32   // TickCount equivalent; 0 (unused)
+}
+
 @MainActor
 class InputInteractionModel {
 	enum Change {
@@ -23,6 +48,7 @@ class InputInteractionModel {
 		case canToggleRelativeMouseModeChanged(isEnabled: Bool)
 		case hoverOffsetModeChanged(HoverOffsetMode)
 		case iPadMousePassthroughChanged(isEnabled: Bool)
+		case audioConfigurationChanged(Bool, HostAudioVolume)
 	}
 
 	fileprivate struct OffsetConfig {
@@ -30,9 +56,17 @@ class InputInteractionModel {
 		let y: CGFloat
 	}
 
+	enum HostAudioVolume {
+		case low
+		case mid
+		case high
+	}
+
 	private let keyDownFeedbackGenerator = UIImpactFeedbackGenerator(style: .soft)
 	private(set) var isRelativeMouseModeEnabled = false
 	private var silenceRelativeMouseModeChanges = false
+
+	private var hostAudioVolumeChangeObservation: NSKeyValueObservation!
 
 	private(set) var hoverOffsetMode: HoverOffsetMode = MiscellaneousSettings.current.bootInHoverMode ? .justAbove : .off {
 		didSet {
@@ -54,16 +88,51 @@ class InputInteractionModel {
 
 	var showWarning: ((String) -> Void)?
 
+	var miscSettings: MiscellaneousSettings {
+		.current
+	}
+
 	var canToggleRelativeMouseMode: Bool {
-		MiscellaneousSettings.current.relativeMouseModeSetting == .manual ||
-		MiscellaneousSettings.current.relativeMouseModeSetting == .automatic
+		miscSettings.relativeMouseModeSetting == .manual ||
+		miscSettings.relativeMouseModeSetting == .automatic
 	}
 
 	var iPadMousePassthrough: Bool {
-		MiscellaneousSettings.current.iPadMousePassthrough
+		miscSettings.iPadMousePassthrough
+	}
+
+	var isAudioEnabled: Bool {
+		miscSettings.audioEnabled
+	}
+
+	var hostAudioVolume: HostAudioVolume {
+		let hostAudioVolumeRaw = AVAudioSession.sharedInstance().outputVolume
+		if hostAudioVolumeRaw >= 0.66 {
+			return .high
+		} else if hostAudioVolumeRaw >= 0.33 {
+			return .mid
+		} else {
+			return .low
+		}
 	}
 
 	let changeSubject = PassthroughSubject<Change, Never>()
+
+	/// Input-event fan-out channel for
+	/// DSpEventService. Publishes AFTER the existing objc_ADB* calls in
+	/// handle() methods — observer-only, does not alter primary delivery
+	/// path (existing gamepad/keyboard/mouse tests
+	/// continue to exercise the objc_ADB path identically).
+	///
+	/// Subscribers: DSpEventService.shared.install() attaches a .sink on
+	/// this subject that translates DSpInputEvent →
+	/// DSpHostBridge_EnqueueEventToActiveContexts. Publishing happens on
+	/// main thread (class is @MainActor); subscription runs on main
+	/// thread (Combine default for main-published subjects); C bridge
+	/// walks dsp_context_table on main thread; SPSC-ring write fences
+	/// cross-thread visibility via memory_order_release on events_head
+	/// for the emul-thread ProcessEvent reader.
+	let dspInputEventSubject = PassthroughSubject<DSpInputEvent, Never>()
 
 	static let shared = InputInteractionModel()
 
@@ -72,15 +141,21 @@ class InputInteractionModel {
 		NotificationCenter.default.addObserver(self, selector: #selector(handleRelativeMouseModeDisabled), name: LocalNotifications.relativeMouseModeDisabled, object: nil)
 		NotificationCenter.default.addObserver(self, selector: #selector(handleRelativeMouseModeSettingChanged), name: LocalNotifications.relativeMouseModeSettingChanged, object: nil)
 		NotificationCenter.default.addObserver(self, selector: #selector(handleIPadMousePassthroughChanged), name: LocalNotifications.iPadMousePassthroughChanged, object: nil)
+		NotificationCenter.default.addObserver(self, selector: #selector(handleAudioConfigurationChanged), name: LocalNotifications.audioEnabledChanged, object: nil)
+		hostAudioVolumeChangeObservation = AVAudioSession.sharedInstance().observe(\.outputVolume) { [weak self] _, _ in
+			Task { @MainActor in
+				self?.handleAudioConfigurationChanged()
+			}
+		}
 
-		if MiscellaneousSettings.current.relativeMouseModeSetting == .alwaysOn {
+		if miscSettings.relativeMouseModeSetting == .alwaysOn {
 			objc_setRelativeMouseMode(true)
 			handleRelativeMouseModeEnabled()
 		}
-		if (MiscellaneousSettings.current.bootInHoverMode &&
-			!MiscellaneousSettings.current.iPadMousePassthrough &&
-			MiscellaneousSettings.current.relativeMouseModeSetting != .alwaysOn) {
-			hoverOffsetMode = .justAbove
+		if (miscSettings.bootInHoverMode &&
+			!miscSettings.iPadMousePassthrough &&
+			miscSettings.relativeMouseModeSetting != .alwaysOn) {
+			hoverOffsetMode = .diagonallyAbove
 		}
 	}
 
@@ -98,9 +173,22 @@ class InputInteractionModel {
 			objc_ADBKeyUp(key.enValue)
 		}
 
+		// Publish the key event to DSpEventService
+		// AFTER the primary ADB delivery — observer-only.
+		// Gamepad-mapped-to-key events route through here too (GamepadButton
+		// dispatches via handle(key:) with the mapped SDLKey per the current
+		// GamepadConfig), so DSp sees gamepad events as keyboard events.
+		dspInputEventSubject.send(DSpInputEvent(
+			kind: isDown ? .keyDown : .keyUp,
+			keyCode: Int(key.enValue),
+			buttonIndex: 0,
+			modifiers: 0,
+			timestamp: 0
+		))
+
 		if isDown,
 		   hapticAllowed,
-		   MiscellaneousSettings.current.keyHapticFeedback {
+		   miscSettings.keyHapticFeedback {
 			keyDownFeedbackGenerator.impactOccurred()
 		}
 	}
@@ -131,13 +219,32 @@ class InputInteractionModel {
 			if isDown {
 				objc_ADBWriteMouseDown(0)
 
+				// Publish mouseDown to DSp AFTER
+				// primary ADB delivery — observer-only.
+				dspInputEventSubject.send(DSpInputEvent(
+					kind: .mouseDown,
+					keyCode: 0,
+					buttonIndex: 1,  // classic Mac: 1 = primary (left) button
+					modifiers: 0,
+					timestamp: 0
+				))
+
 				Task { @MainActor in
-					if MiscellaneousSettings.current.keyHapticFeedback {
+					if miscSettings.keyHapticFeedback {
 						objc_mousedownHapticFeedback() // Same haptic feedback as mouse click
 					}
 				}
 			} else {
 				objc_ADBWriteMouseUp(0)
+
+				// Publish mouseUp to DSp.
+				dspInputEventSubject.send(DSpInputEvent(
+					kind: .mouseUp,
+					keyCode: 0,
+					buttonIndex: 1,
+					modifiers: 0,
+					timestamp: 0
+				))
 			}
 		case .cmdW:
 			if !isDown {
@@ -152,6 +259,12 @@ class InputInteractionModel {
 		case .rightClick:
 			if !isDown {
 				RightClick.performRightClick()
+			}
+		case .audioEnabled:
+			if !isDown {
+				let newValue = !miscSettings.audioEnabled
+				miscSettings.set(audioEnabled: newValue)
+				objc_update_audio_enabled_setting(newValue)
 			}
 		}
 	}
@@ -182,17 +295,17 @@ class InputInteractionModel {
 
 	func beginSecondFingerClickIfEligible() {
 		guard objc_ADBHoversOnMouseDown(),
-		!MiscellaneousSettings.current.iPadMousePassthrough else {
+		!miscSettings.iPadMousePassthrough else {
 			return
 		}
 
 		secondFingerGestureStartTime = Date()
 
-		if MiscellaneousSettings.current.mouseHapticFeedback {
+		if miscSettings.mouseHapticFeedback {
 			objc_mousedownHapticFeedback()
 		}
 
-		let delay = MiscellaneousSettings.current.secondFingerSwipe ? 0.03 : 0
+		let delay = miscSettings.secondFingerSwipe ? 0.03 : 0
 		hoverModeClickIfStilTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
 			Task { @MainActor [weak self] in
 				await self?.beginSecondFingerClick()
@@ -481,7 +594,7 @@ class InputInteractionModel {
 
 		self.hoverOffsetMode = hoverOffsetMode
 
-		if MiscellaneousSettings.current.mouseHapticFeedback,
+		if miscSettings.mouseHapticFeedback,
 		   let latestMouseDownHapticFeedbackTimestamp = objc_getLatestMouseDownHapticFeedbackTimestamp() {
 			let timeSinceMousedownHapticFeedback = Date().timeIntervalSince(latestMouseDownHapticFeedbackTimestamp)
 			if timeSinceMousedownHapticFeedback > 0.12 {
@@ -563,12 +676,17 @@ class InputInteractionModel {
 
 	@objc
 	private func handleIPadMousePassthroughChanged() {
-		let isEnabled = MiscellaneousSettings.current.iPadMousePassthrough
+		let isEnabled = miscSettings.iPadMousePassthrough
 		if isEnabled {
 			hoverOffsetMode = .off
 		}
 		
 		changeSubject.send(.iPadMousePassthroughChanged(isEnabled: isEnabled))
+	}
+
+	@objc
+	private func handleAudioConfigurationChanged() {
+		changeSubject.send(.audioConfigurationChanged(isAudioEnabled, hostAudioVolume))
 	}
 }
 

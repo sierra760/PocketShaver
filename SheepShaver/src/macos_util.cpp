@@ -29,6 +29,9 @@
 #include "macos_util.h"
 #include "thunks.h"
 #include "prefs.h"
+#if TARGET_OS_IPHONE
+#include "gfxaccel/include/gl_synthetic_symbol_policy.h"
+#endif
 #include <algorithm>
 
 #define DEBUG 0
@@ -74,6 +77,32 @@ static inline void DisposePtr(uint32 arg1)
 {
 	CallMacOS1(d_ptr, d_tvect, arg1);
 }
+
+#if TARGET_OS_IPHONE
+static uint32 FindSyntheticLibSymbol(const char *lib_str, const char *sym_str)
+{
+	uint16_t sub_opcode = 0;
+	if (!GLSyntheticFindLibSymbolSubOpcode(lib_str, sym_str, &sub_opcode))
+		return 0;
+	if (sub_opcode >= GL_MAX_SUBOPCODE)
+		return 0;
+
+	const uint32 tvect = gl_method_tvects[sub_opcode];
+	if (tvect == 0)
+		return 0;
+
+	D(bug("FindLibSymbol: synthetic symbol '%s' in '%s' -> 0x%08lx\n",
+	      sym_str + 1, lib_str + 1, (unsigned long)tvect));
+	return tvect;
+}
+#else
+static uint32 FindSyntheticLibSymbol(const char *lib_str, const char *sym_str)
+{
+	(void)lib_str;
+	(void)sym_str;
+	return 0;
+}
+#endif
 
 
 /*
@@ -304,7 +333,7 @@ uint32 FindLibSymbol(const char *lib_str, const char *sym_str)
 		D(bug(" FindSymbol1: ret %d, sym_addr %p, sym_class %ld\n", (int16)r.d[0], sym_addr.value(), sym_class.value()));
 //!! CloseConnection()?
 		if (r.d[0])
-			return 0;
+			return FindSyntheticLibSymbol(lib_str, sym_str);
 		else
 			return sym_addr.value();
 
@@ -328,7 +357,7 @@ uint32 FindLibSymbol(const char *lib_str, const char *sym_str)
 		D(bug(" FindSymbol: ret %d, sym_addr %p, sym_class %ld\n", res, sym_addr.value(), sym_class.value()));
 //!!??		CloseConnection(&conn_id);
 		if (res)
-			return 0;
+			return FindSyntheticLibSymbol(lib_str, sym_str);
 		else
 			return sym_addr.value();
 	}
