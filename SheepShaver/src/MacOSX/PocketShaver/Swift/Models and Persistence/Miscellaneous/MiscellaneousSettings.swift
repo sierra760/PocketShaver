@@ -53,8 +53,8 @@ enum KeyboardAutoOffsetSetting: String, Codable, CaseIterable {
 }
 
 enum GammaRampSetting: String, Codable, CaseIterable {
-	case osDefined
 	case linear
+	case osDefined
 }
 
 class MiscellaneousSettings: Codable {
