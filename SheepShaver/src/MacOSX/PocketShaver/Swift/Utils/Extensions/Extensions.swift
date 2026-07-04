@@ -212,15 +212,22 @@ extension UIButton {
 }
 
 extension FileManager {
-	// Mac Catalyst runs unsandboxed and has no per-app container, so pin all
-	// app data under a single stable home (~/PocketShaver Home) that mirrors
-	// the Designed-for-iPad container's Data/ layout. Kept in sync with the
-	// C++/ObjC path resolution in utils_ios.mm / xpram_unix.cpp.
+	// On the (unsandboxed) Mac Catalyst build we deliberately store all app data
+	// under the app's container Data directory
+	// (~/Library/Containers/<bundle-id>/Data) rather than the user's visible
+	// home, to keep it out of casual sight and reduce accidental corruption.
+	// Kept byte-identical to utils_ios.mm's pocketshaver_home_directory() so
+	// Swift and the emulator core agree on the same container path.
 	// NSHomeDirectory() (not FileManager.homeDirectoryForCurrentUser, which is
-	// unavailable on Mac Catalyst) — matches utils_ios.mm's C++ resolution so
-	// Swift and the emulator core agree on the same home.
+	// unavailable on Mac Catalyst) returns the real user home here because the
+	// build is unsandboxed.
 	static var pocketShaverHome: URL {
-		URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("PocketShaver Home")
+		let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+		let bundleID = Bundle.main.bundleIdentifier ?? "com.carbjo.pocketshaver"
+		return home
+			.appendingPathComponent("Library/Containers", isDirectory: true)
+			.appendingPathComponent(bundleID, isDirectory: true)
+			.appendingPathComponent("Data", isDirectory: true)
 	}
 
 	@objc
