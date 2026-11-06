@@ -54,13 +54,7 @@ public class PreferencesViewController: UIViewController {
 		button.configuration = .defaultConfig
 		button.configuration?.baseBackgroundColor = .gray
 		if UIDevice.deviceType == .mac {
-			// The Mac idiom swaps UIButton to an AppKit-style bezel that
-			// ignores the filled configuration (fill, corner radius, frame
-			// height), leaving a washed-out sliver. Keep the iPad rendering.
 			button.preferredBehavioralStyle = .pad
-			// The prefs window fills the whole Mac screen, so the default
-			// title size gets lost in the full-width bar — scale the type up
-			// with the taller Mac height set in viewDidLoad.
 			button.configuration?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
 				var attributes = attributes
 				attributes.font = .boldSystemFont(ofSize: 20)
@@ -103,8 +97,6 @@ public class PreferencesViewController: UIViewController {
 	private var anyCancellables = Set<AnyCancellable>()
 
 	@objc public private(set) var isDone: Bool = false
-
-	private var displayedViewController: UIViewController?
 
 	private var lockInterfaceOrientationsToLandscape = false
 	private var pendingBoot: (() -> Void)?
@@ -193,6 +185,10 @@ public class PreferencesViewController: UIViewController {
 		super.viewDidAppear(animated)
 
 		MonitorResolutionManager.shared.registerSafeAreaInsets(view.safeAreaInsets)
+
+#if !targetEnvironment(macCatalyst)
+		probeRotationLock()
+#endif
 	}
 
 	public override func viewWillDisappear(_ animated: Bool) {
@@ -286,6 +282,10 @@ public class PreferencesViewController: UIViewController {
 				}
 			case .alwaysLandscapeModeOptionToggled:
 				updateBottomButton()
+			case .quitAndRelaunchFromStikDebugRequested:
+				Task {
+					await self.quitAndRelaunchFromStikDebug()
+				}
 			default:
 				break
 			}
@@ -374,6 +374,21 @@ public class PreferencesViewController: UIViewController {
 		} catch {}
 	}
 
+	private func presentRotationLockAlert() {
+		let alertVC = UIAlertController(
+			title: "Restart recommended",
+			message: "If PocketShaver is already running when launched from StikDebug, iOS will refuse to lock screen rotation when booting emulation.\n\nPress 'Quit & open StikDebug' and press Enable JIT in StikDebug dialogue to enable JIT without the rotation issue.",
+			preferredStyle: .alert
+		)
+		alertVC.addAction(.init(title: "Quit & open StikDebug", style: .default, handler: { _ in
+			Task { @MainActor in
+				await self.quitAndRelaunchFromStikDebug()
+			}
+		}))
+		alertVC.addAction(.init(title: "Don't restart", style: .cancel))
+		present(alertVC, animated: true)
+	}
+
 	private func displayNeedsRestartDialogue() {
 		let alertVC = UIAlertController(
 			title: "Restart needed",
@@ -391,6 +406,34 @@ public class PreferencesViewController: UIViewController {
 			}))
 		}
 		present(alertVC, animated: true)
+	}
+
+	@MainActor
+	private func quitAndRelaunchFromStikDebug() async {
+		let block = {
+			let url = StikDebugJitManager.shared.stikDebugUrl(withPid: false)!
+			await UIApplication.shared.open(url)
+
+			exit(0)
+		}
+
+		switch model.mode {
+		case .startup:
+			await block()
+		case .duringEmulation:
+			let alertVC = UIAlertController(
+				title: "Restart needed",
+				message: "To enable JIT, a restart is needed. Press 'Quit & relaunch from StikDebug' to enable JIT.",
+				preferredStyle: .alert
+			)
+			alertVC.addAction(.init(title: "Quit & relaunch from StikDebug", style: .default, handler: { _ in
+				Task { @MainActor in
+					await block()
+				}
+			}))
+			alertVC.addAction(.init(title: "Cancel", style: .cancel))
+			present(alertVC, animated: true)
+		}
 	}
 
 	@objc
@@ -417,6 +460,8 @@ public class PreferencesViewController: UIViewController {
 
 	@objc
 	public static func presentStartup() -> PreferencesViewController {
+		StikDebugJitManager.shared.acquireIfLaunchedByDebugger()
+
 		let vc = PreferencesViewController(mode: .startup)
 
 		prefsWindow.windowLevel = .normal
@@ -437,6 +482,27 @@ public class PreferencesViewController: UIViewController {
 		prefsWindow.isHidden = true
 	}
 }
+
+#if !targetEnvironment(macCatalyst)
+extension PreferencesViewController {
+	// If PocketShaver was already running when StikDebug launched it, iOS refuses every geometry request
+	private func probeRotationLock() {
+		guard #available(iOS 16.0, *),
+			  model.mode == .startup,
+			  MiscellaneousSettings.current.alwaysLandscapeMode,
+			  StikDebugJitManager.shared.isDebuggerAttached,
+			  let windowScene = view.window?.windowScene else { return }
+
+		let currentOrientation = UIInterfaceOrientationMask(rawValue: 1 << UInt(windowScene.interfaceOrientation.rawValue))
+		windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: currentOrientation)) { [weak self] error in
+			guard (error as NSError).domain == "BSActionErrorDomain" else { return }
+			DispatchQueue.main.async {
+				self?.presentRotationLockAlert()
+			}
+		}
+	}
+}
+#endif
 
 #if targetEnvironment(macCatalyst)
 @MainActor private var staleInactiveAppearanceObserver: NSObjectProtocol?
