@@ -54,7 +54,11 @@ public class PreferencesViewController: UIViewController {
 		button.configuration = .defaultConfig
 		button.configuration?.baseBackgroundColor = .gray
 		if UIDevice.deviceType == .mac {
+			// The Mac idiom's AppKit-style bezel ignores the filled
+			// configuration. Keep the iPad rendering.
 			button.preferredBehavioralStyle = .pad
+			// Larger title for the full-screen Mac window, matching the taller
+			// bar height set in viewDidLoad.
 			button.configuration?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
 				var attributes = attributes
 				attributes.font = .boldSystemFont(ofSize: 20)
@@ -101,6 +105,7 @@ public class PreferencesViewController: UIViewController {
 	private var lockInterfaceOrientationsToLandscape = false
 	private var pendingBoot: (() -> Void)?
 	private var bootRotationRequestID = UUID()
+	private var activeSizeTransition: ObjectIdentifier?
 
 	public override var shouldAutorotate: Bool {
 		return true
@@ -206,10 +211,14 @@ public class PreferencesViewController: UIViewController {
 	}
 
 	public override func viewWillTransition(to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator) {
+		let transition = ObjectIdentifier(coordinator)
+		activeSizeTransition = transition
 		super.viewWillTransition(to: size, with: coordinator)
 		coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-			self?.updateBottomButton()
-			self?.finishBootAfterRotationIfReady(afterTransition: true)
+			guard let self, activeSizeTransition == transition else { return }
+			activeSizeTransition = nil
+			updateBottomButton()
+			finishBootAfterRotationIfReady()
 		}
 	}
 
@@ -218,11 +227,12 @@ public class PreferencesViewController: UIViewController {
 		finishBootAfterRotationIfReady()
 	}
 
-	private func finishBootAfterRotationIfReady(afterTransition: Bool = false) {
+	private func finishBootAfterRotationIfReady() {
+		// Layout can reach landscape during rotation even when transitionCoordinator is nil.
 		guard let pendingBoot,
+			  activeSizeTransition == nil,
 			  view.window?.windowScene?.interfaceOrientation.isLandscape == true,
-			  view.bounds.width > view.bounds.height,
-			  afterTransition || transitionCoordinator == nil else { return }
+			  view.bounds.width > view.bounds.height else { return }
 		self.pendingBoot = nil
 		// Leave UIKit's layout callback before removing the preferences window.
 		DispatchQueue.main.async(execute: pendingBoot)
@@ -322,9 +332,7 @@ public class PreferencesViewController: UIViewController {
 			let bootBlock = { [weak self] in
 				guard let self else { return }
 
-				PreferencesManager.shared.writePreferences()
-				objc_set_emulation_orientation(MonitorResolutionManager.shared.willLaunchInPortraitMode)
-				DiskManager.shared.reportWillBoot()
+				Self.writePreferences()
 
 				removeFromParent()
 				prefsWindow.rootViewController = nil
@@ -480,6 +488,27 @@ public class PreferencesViewController: UIViewController {
 	public static func resetPrefsWindow() {
 		prefsWindow.rootViewController = nil
 		prefsWindow.isHidden = true
+	}
+
+	static func writePreferences() {
+		PreferencesManager.shared.writePreferences()
+		objc_set_emulation_orientation(MonitorResolutionManager.shared.willLaunchInPortraitMode)
+		DiskManager.shared.reportWillBoot()
+	}
+
+	@objc
+	public static func writePreferencesIfEligible() -> Bool {
+		let model = PreferencesModel(mode: .startup)
+
+		do {
+			try model.validate()
+		} catch {
+			return false
+		}
+
+		writePreferences()
+
+		return true
 	}
 }
 
